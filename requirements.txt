@@ -1,3 +1,8 @@
-# Alfred runtime (Python 3.11+). Only the UI for now; the AI and indexing backends add more later.
-PySide6-Essentials>=6.10,<7
-Pillow>=12,<13
+# Alfred runtime (Python 3.11+).
+PySide6-Essentials>=6.10,<7   # the UI
+Pillow>=12,<13                # images
+numpy>=2,<3                   # vector search
+PyMuPDF>=1.26                 # PDF text and page images
+rapidocr>=3.10,<4             # local OCR models (bundled, no download)
+onnxruntime>=1.23             # runs the OCR models on the CPU
+imageio-ffmpeg>=0.6,<1        # ffmpeg for reading video frames

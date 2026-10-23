@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
@@ -25,7 +26,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                                QWidget)
 
 from . import APP_NAME, REPO, __version__, ai, config, knowledge, paths, rag, startup
-from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, video_frame_png
+from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
 from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, blurred_backdrop, fallback_backdrop, icon, icon_pixmap, logo_pixmap,
                      paint_glass, paint_glow, paint_shadow, palette_for, sparkle_pixmap, stylesheet, HotkeyFilter)
@@ -659,17 +660,13 @@ class SearchView(QWidget):
             self.stack.setCurrentIndex(0)
             self.win.update_height()
             return
-        root = self.win.settings.root
         items, seen = [], set()
         results = [r for r in results if not (r['path'] in seen or seen.add(r['path']))]
 
         def row(result):
-            absolute = root / result['path']
-            folder = str(Path(result['path']).parent).replace('\\', '/')
-            return ('row', dict(result, kind_row='file', title=result['filename'], pixmap=FileIcons.get(absolute),
+            return ('row', dict(result, kind_row='file', title=result['filename'], pixmap=FileIcons.get(result['path']),
                                 rounded=Path(result['path']).suffix.lower() in IMAGE_SUFFIXES,
-                                subtitle=f"{result['location']} — {result['snippet']}",
-                                right='' if folder == '.' else folder))
+                                subtitle=f"{result['location']} — {result['snippet']}", right=result.get('folder', '')))
         items.append(('header', 'Top Hit'))
         items.append(row(results[0]))
         grouped = {}
@@ -705,8 +702,7 @@ class SearchView(QWidget):
             return
         for widget in (self.open_button, self.reveal_button, self.ask_button):
             widget.setVisible(True)
-        root = self.win.settings.root
-        absolute = root / item['path']
+        absolute = Path(item['path'])
         self.big_icon.setPixmap(FileIcons.get(absolute, 52))
         self.p_title.setText(item['filename'])
         size = item.get('size') or 0
@@ -740,7 +736,7 @@ class SearchView(QWidget):
         query, index = self.query, self.win.index
         run_job(lambda s: index.read_excerpt(item['path'], segment_id=item.get('segment_id'), max_chars=2400),
                 lambda ex: self.list.item() is item and self.excerpt.setHtml(_highlight(ex['excerpt'], query, self.win.pal)),
-                lambda error: self.excerpt.setPlainText(f'Preview unavailable: {error}'))
+                lambda error: self.list.item() is item and self.excerpt.setPlainText(f'Preview unavailable: {error}'))
         fade_in(self.pane)
 
     def activate(self):
@@ -758,7 +754,7 @@ class SearchView(QWidget):
         item = self.list.item()
         if not item or item.get('kind_row') != 'file':
             return None
-        return paths.resolve_within(self.win.settings.root, item['path'])
+        return self.win.index.resolve(item['path'])
 
     def open_current(self):
         try:
@@ -931,7 +927,7 @@ class SourceRow(QWidget):
             text += '   ⚠ instructions withheld'
         self.chip = button(text, self.toggle, 'source', 'Show the supporting excerpt')
         self.chip.setProperty('used', 'true' if used else 'false')
-        self.chip.setIcon(QIcon(FileIcons.get(self.win.settings.root / item['path'], 16)))
+        self.chip.setIcon(QIcon(FileIcons.get(item['path'], 16)))
         layout.addWidget(self.chip)
         self.box = QFrame()
         box = QVBoxLayout(self.box)
@@ -960,7 +956,7 @@ class SourceRow(QWidget):
         self.height_spring.to(self.box.sizeHint().height() if opening else 0)
 
     def target(self):
-        return paths.resolve_within(self.win.settings.root, self.item['path'])
+        return self.win.index.resolve(self.item['path'])
 
     def open_file(self):
         try:
@@ -1168,7 +1164,7 @@ class AskView(QWidget):
         self.scope = rel
         name = Path(rel).name
         self.scope_chip.setText(f'Only from: {name}   ✕')
-        self.scope_chip.setIcon(QIcon(FileIcons.get(self.win.settings.root / rel, 16)))
+        self.scope_chip.setIcon(QIcon(FileIcons.get(rel, 16)))
         self.scope_chip.show()
         fade_in(self.scope_chip)
         self.win.search.setPlaceholderText(f'Ask about {name}…')
@@ -1481,6 +1477,323 @@ class NoteSheet(QWidget):
         self.win.toast(f"Saved {saved['path']}", 'green', ('Open in Obsidian', lambda: QDesktopServices.openUrl(QUrl(saved['uri']))), 8)
 
 
+def folder_icon(path, size=28):
+    """The folder's own Windows shell icon (Downloads arrow, Pictures, …)."""
+    from PySide6.QtCore import QFileInfo
+    FileIcons.provider = FileIcons.provider or QFileIconProvider()
+    return FileIcons.provider.icon(QFileInfo(str(path))).pixmap(QSize(size, size), 2.0)
+
+
+def suggested_folders():
+    """Common Windows folders that exist on this PC, as (name, path)."""
+    from PySide6.QtCore import QStandardPaths
+    places = [('Downloads', QStandardPaths.DownloadLocation), ('Pictures', QStandardPaths.PicturesLocation),
+              ('Documents', QStandardPaths.DocumentsLocation), ('Desktop', QStandardPaths.DesktopLocation),
+              ('Videos', QStandardPaths.MoviesLocation)]
+    found = []
+    for name, place in places:
+        location = QStandardPaths.writableLocation(place)
+        if location and Path(location).is_dir() and Path(location) != Path.home():
+            found.append((name, Path(os.path.realpath(location))))
+    return found
+
+
+class Chevron(QWidget):
+    """A small chevron that springs between pointing right (closed) and down (open)."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self.setFixedSize(16, 16)
+        self.angle = Spring(0, 320, 0.82, lambda v: self.update())
+
+    def set_open(self, on):
+        self.angle.to(90 if on else 0)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.translate(8, 8)
+        p.rotate(self.angle.value)
+        p.drawPixmap(-7, -7, icon_pixmap('chevron', 14, self.win.pal['secondary']))
+
+
+class FolderRow(QWidget):
+    """One tracked folder: shell icon, name, short path, live status and an untrack button."""
+
+    def __init__(self, panel, folder):
+        super().__init__()
+        self.panel, self.win, self.folder = panel, panel.win, Path(folder)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 7, 0, 7)
+        row.setSpacing(11)
+        art = QLabel()
+        art.setFixedSize(30, 30)
+        art.setPixmap(folder_icon(self.folder, 28))
+        row.addWidget(art)
+        texts = QVBoxLayout()
+        texts.setSpacing(0)
+        texts.addWidget(label(self.folder.name or str(self.folder), 'name'))
+        place = label(paths.shorten(self.folder, 58), 'caption')
+        place.setToolTip(str(self.folder))
+        texts.addWidget(place)
+        row.addLayout(texts, 1)
+        self.status = label('', 'caption')
+        self.status.setTextFormat(Qt.RichText)
+        row.addWidget(self.status)
+        remove = button('', self.untrack, 'ghost', f'Stop tracking {self.folder.name} (its files leave the index; nothing is deleted)',
+                        icon('close', 12, self.win.pal['secondary']))
+        remove.setFixedSize(26, 26)
+        row.addWidget(remove)
+        self.opacity = None
+
+    def set_status(self, text, color='secondary'):
+        dot = f"<span style='color:{self.win.pal[color].name()}'>●</span>&nbsp; " if color != 'secondary' else ''
+        self.status.setText(dot + html.escape(text))
+
+    def untrack(self):
+        self.panel.untrack(self)
+
+    def fade_out(self, then):
+        if Motion.reduced:
+            then()
+            return
+        effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(effect)
+        self.opacity = Spring(1, 420, 1.0)
+
+        def change(value):
+            try:
+                effect.setOpacity(max(0.0, min(1.0, value)))
+            except RuntimeError:
+                return
+            if value <= 0.02:
+                self.opacity.on_change = None
+                then()
+        self.opacity.on_change = change
+        self.opacity.to(0)
+
+
+class TrackedFolders(QWidget):
+    """Settings → Tracked folders: track a folder (indexed at once, then watched), quick-add chips
+    for common folders, and a disclosure that springs open to list what is tracked."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self.rows, self.open = [], False
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(5)
+        outer.addWidget(label('TRACKED FOLDERS', 'section'))
+        card = QFrame()
+        card.setObjectName('group')
+        self.card = QVBoxLayout(card)
+        self.card.setContentsMargins(14, 6, 14, 6)
+        self.card.setSpacing(0)
+        outer.addWidget(card)
+        self.note = label('Alfred reads documents, PDFs, slides, spreadsheets, and the text in images and videos — all on this PC — '
+                          'and keeps up as files are added, changed or deleted.', 'caption', wrap=True)
+        outer.addWidget(self.note)
+
+        track = QWidget()
+        row = QHBoxLayout(track)
+        row.setContentsMargins(0, 7, 0, 7)
+        texts = QVBoxLayout()
+        texts.setSpacing(0)
+        texts.addWidget(label('Track a folder'))
+        texts.addWidget(label('Indexed right away, then watched for new files', 'caption'))
+        row.addLayout(texts, 1)
+        row.addWidget(button('Track folder…', self.win.choose_folder, 'primary', 'Choose any folder to search',
+                             icon('plus', 13, QColor('white'))))
+        self.card.addWidget(track)
+
+        self.chips_line, self.chips_holder = self._hairline(), QWidget()
+        self.chips = QHBoxLayout(self.chips_holder)
+        self.chips.setContentsMargins(0, 8, 0, 8)
+        self.chips.setSpacing(7)
+        self.card.addWidget(self.chips_line)
+        self.card.addWidget(self.chips_holder)
+
+        self.disclosure_line, self.disclosure = self._hairline(), QWidget()
+        self.disclosure.setCursor(Qt.PointingHandCursor)
+        self.disclosure.mousePressEvent = lambda event: self.set_open(not self.open)
+        row = QHBoxLayout(self.disclosure)
+        row.setContentsMargins(0, 9, 0, 9)
+        self.count_label = label('')
+        row.addWidget(self.count_label, 1)
+        self.summary = label('', 'caption')
+        self.summary.setTextFormat(Qt.RichText)
+        row.addWidget(self.summary)
+        self.chevron = Chevron(win)
+        row.addWidget(self.chevron)
+        self.card.addWidget(self.disclosure_line)
+        self.card.addWidget(self.disclosure)
+
+        self.body = QWidget()
+        self.body.setMaximumHeight(0)
+        self.list = QVBoxLayout(self.body)
+        self.list.setContentsMargins(0, 0, 0, 0)
+        self.list.setSpacing(0)
+        self.footer = QWidget()
+        foot = QHBoxLayout(self.footer)
+        foot.setContentsMargins(40, 2, 0, 8)
+        foot.setSpacing(2)
+        foot.addWidget(button('Rescan now', lambda: self.win.start_index(), 'link', 'Check every tracked folder for changes'))
+        foot.addWidget(label('·', 'caption'))
+        foot.addWidget(button('Rebuild index', lambda: self.win.start_index(force=True), 'link', 'Read every file again from scratch'))
+        foot.addStretch()
+        self.list.addWidget(self.footer)
+        self.card.addWidget(self.body)
+        self.height = Spring(0, 300, 0.86, self._height)
+
+        self.auto_line = self._hairline()
+        self.card.addWidget(self.auto_line)
+        auto = QWidget()
+        row = QHBoxLayout(auto)
+        row.setContentsMargins(0, 7, 0, 7)
+        texts = QVBoxLayout()
+        texts.setSpacing(0)
+        texts.addWidget(label('Index new files automatically'))
+        texts.addWidget(label('Alfred watches tracked folders while it runs (also from the tray)', 'caption'))
+        row.addLayout(texts, 1)
+        self.auto_index = Toggle(lambda: self.win.pal)
+        row.addWidget(self.auto_index, 0, Qt.AlignRight | Qt.AlignVCenter)
+        self.card.addWidget(auto)
+
+    def _hairline(self):
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setObjectName('hairline')
+        return line
+
+    # ------------------------------------------------------------- content
+    def load(self):
+        """Rebuild rows and chips from settings (when Settings opens)."""
+        for row in self.rows:
+            row.setParent(None)
+            row.deleteLater()
+        self.rows = []
+        for number, folder in enumerate(self.win.settings.folders):
+            self._add_row(folder, delay=None)
+        self.fill_chips()
+        self.refresh()
+        self._snap_height()
+
+    def _add_row(self, folder, delay=0):
+        row = FolderRow(self, folder)
+        self.list.insertWidget(len(self.rows), row)
+        self.rows.append(row)
+        if delay is not None:
+            row.hide()
+            QTimer.singleShot(0 if Motion.reduced else delay, lambda r=row: (r.show(), fade_in(r), self._retarget()))
+        return row
+
+    def fill_chips(self):
+        while self.chips.count():
+            item = self.chips.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        tracked = [paths.canonical(f) for f in self.win.settings.folders]
+        free = [(name, path) for name, path in suggested_folders()
+                if not any(paths.is_within(t, path) for t in tracked) and not any(paths.is_within(path, t) for t in tracked)]
+        if free:
+            self.chips.addWidget(label('Suggested', 'caption'))
+        for name, path in free:
+            chip = button(name, lambda _=False, p=path: self.win.track_folder(p), 'chip', f'Track {paths.shorten(path)}')
+            chip.setIcon(QIcon(folder_icon(path, 16)))
+            chip.setIconSize(QSize(16, 16))
+            self.chips.addWidget(chip)
+        self.chips.addStretch()
+        self.chips_holder.setVisible(bool(free))
+        self.chips_line.setVisible(bool(free))
+
+    def refresh(self, state=None):
+        """Update the count, the summary and each folder's live status."""
+        folders = self.win.settings.folders
+        stats = getattr(self.win, 'folder_stats', {}) or {}
+        self.disclosure.setVisible(bool(folders))
+        self.disclosure_line.setVisible(bool(folders))
+        self.count_label.setText(f'{len(folders)} folder{"s" * (len(folders) != 1)} tracked')
+        total = sum(s.get('files', 0) for s in stats.values())
+        busy_root = state.get('root') if state else None
+        for row in self.rows:
+            key = str(Path(os.path.realpath(row.folder)))
+            info = stats.get(key, {'files': 0, 'skipped': 0})
+            if not row.folder.is_dir():
+                row.set_status('Folder missing', 'red')
+            elif self.win.indexing and busy_root and paths.canonical(busy_root) == paths.canonical(row.folder):
+                phase = state.get('phase')
+                if phase == 'scanning':
+                    row.set_status('Looking for files…', 'accent')
+                elif phase == 'reading video':
+                    row.set_status(f"Reading video {state.get('frame', 0)}/{state.get('frames', 0)}", 'accent')
+                else:
+                    row.set_status(f"Indexing {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
+            elif self.win.indexing and key not in stats:
+                row.set_status('Waiting…')
+            else:
+                text = f"{info['files']:,} file{'s' * (info['files'] != 1)}"
+                row.set_status(text + ' · up to date' if self.win.status.get('initialized') else text, 'green' if info['files'] else 'secondary')
+        if self.win.indexing:
+            phase = (state or {}).get('phase')
+            text = f"Learning meaning {state.get('done', 0)}/{state.get('total', 0)}" if phase == 'embedding' else 'Indexing…'
+            self.summary.setText(f"<span style='color:{self.win.pal['accent'].name()}'>●</span>&nbsp; {text}")
+        else:
+            self.summary.setText(f'{total:,} searchable file{"s" * (total != 1)}' if folders else '')
+
+    # ------------------------------------------------------------- motion
+    def set_open(self, on):
+        self.open = on
+        self.chevron.set_open(on)
+        self.height.snap(self.body.maximumHeight())
+        self.height.to(self.body.sizeHint().height() if on else 0)
+        if on:
+            for number, row in enumerate(self.rows):
+                row.hide()
+                QTimer.singleShot(0 if Motion.reduced else 40 + 45 * number, lambda r=row: (r.show(), fade_in(r), self._retarget()))
+
+    def _retarget(self):
+        if self.open:
+            self.height.to(self.body.sizeHint().height())
+
+    def _snap_height(self):
+        self.chevron.angle.snap(90 if self.open else 0)
+        self.height.snap(self.body.sizeHint().height() if self.open else 0)
+
+    def _height(self, value):
+        try:
+            self.body.setMaximumHeight(max(0, int(value)))
+        except RuntimeError:
+            pass
+
+    # ------------------------------------------------------------- actions
+    def added(self, folder):
+        """A folder was just tracked: open the list and slide its row in."""
+        self.fill_chips()
+        if not self.open:
+            self.open = True
+            self.chevron.set_open(True)
+        self._add_row(folder, delay=60)
+        self.refresh()
+        self.height.snap(self.body.maximumHeight())
+        self._retarget()
+
+    def untrack(self, row):
+        def gone():
+            if row in self.rows:
+                self.rows.remove(row)
+            row.setParent(None)
+            row.deleteLater()
+            self.fill_chips()
+            self.refresh()
+            self._retarget()
+            if not self.rows:
+                self.set_open(False)
+        self.win.untrack_folder(row.folder)
+        row.fade_out(gone)
+
+
 class SettingsView(QWidget):
     def __init__(self, win):
         super().__init__()
@@ -1499,20 +1812,11 @@ class SettingsView(QWidget):
         layout.addWidget(scroll)
         pal = lambda: self.win.pal
 
-        g = Group(win, 'SEARCH FOLDER', 'Alfred searches exactly one folder. Changing it replaces the index on the next Rescan — folders are never combined.')
-        self.root = label('', 'secondary', selectable=True)
-        g.row('Folder', self.root)
-        row = QHBoxLayout()
-        row.addWidget(button('Choose…', self.win.choose_root))
-        row.addWidget(button('Use demo_data', self.reset_root))
-        row.addWidget(button('Rescan', lambda: self.win.start_index(), 'primary'))
-        row.addWidget(button('Rebuild', lambda: self.win.start_index(force=True)))
-        g.row('Index', row)
-        self.auto_index = Toggle(pal)
-        g.row('Index new files automatically', self.auto_index, 'Alfred watches the folder while it runs (also from the tray)')
+        self.tracked = TrackedFolders(win)
+        self.auto_index = self.tracked.auto_index
+        body.addWidget(self.tracked)
         self.index_info = label('', 'caption', wrap=True, selectable=True)
-        g.outer.addWidget(self.index_info)
-        body.addWidget(g)
+        body.addWidget(self.index_info)
 
         g = Group(win, 'AI MODEL', 'Ollama runs models on this PC and uses your GPU when available. Claude runs on Anthropic’s servers with your API key. '
                                    'OpenAI-compatible URLs can be local (LM Studio, llama-server) or a cloud API.')
@@ -1561,7 +1865,8 @@ class SettingsView(QWidget):
         g.outer.addWidget(self.location)
         body.addWidget(g)
 
-        g = Group(win, 'SEMANTIC SEARCH', 'EmbeddingGemma 2 finds passages by meaning. Keyword search always works.')
+        g = Group(win, 'SEARCH BY MEANING', 'EmbeddingGemma 2 runs in Ollama on this PC and finds passages by meaning, not just matching words. '
+                                         'Keyword search always works, even when Ollama is off.')
         self.embed_enabled = Toggle(pal)
         self.embed_model, self.embed_url = QLineEdit(), QLineEdit()
         self.embed_device = QComboBox()
@@ -1577,22 +1882,15 @@ class SettingsView(QWidget):
         g.row('Batch size', self.embed_batch, 'Lower it if the GPU runs out of memory')
         body.addWidget(g)
 
-        g = Group(win, 'IMAGE UNDERSTANDING', 'A local vision model reads text in screenshots and charts and describes diagrams, photos, scanned PDF pages '
-                                              'and what’s on screen in videos, so they become searchable. Descriptions are labelled as AI-generated.')
-        self.vision_enabled = Toggle(pal)
-        self.vision_model = QLineEdit()
-        self.vision_model.setMinimumWidth(300)
-        self.vision_device = QComboBox()
-        self.vision_device.addItems(['Auto (GPU when available)', 'CPU only'])
-        self.vision_device.setMinimumWidth(300)
-        g.row('Read images', self.vision_enabled)
-        g.row('Vision model', self.vision_model, 'e.g. gemma3:4b  ·  ollama pull gemma3:4b')
-        g.row('Device', self.vision_device)
+        g = Group(win, 'IMAGES & VIDEOS', 'A local OCR model (RapidOCR) reads the text in photos, screenshots, scanned PDF pages and video frames, '
+                                          'so they become searchable. It runs on this PC and needs no internet.')
+        self.ocr_enabled = Toggle(pal)
+        g.row('Read text in images and videos', self.ocr_enabled)
         self.video_interval = QSpinBox()
         self.video_interval.setRange(2, 120)
         self.video_interval.setSuffix(' s')
         g.row('Video: one frame every', self.video_interval,
-              'Plus a frame at each scene change. Identical frames (a still slide) are described once. Long videos are capped at 120 moments.')
+              'Frames that look the same (a still slide) are read once. Long videos are capped at 120 frames.')
         body.addWidget(g)
 
         g = Group(win, 'DIAGNOSTICS', 'A detected GPU is not the same as an accelerated model. Device facts come from nvidia-smi and from Ollama’s own report — nothing is inferred.')
@@ -1616,14 +1914,6 @@ class SettingsView(QWidget):
         g.row('Notes folder', self.folder)
         body.addWidget(g)
 
-        g = Group(win, 'CLAUDE CODE (MCP)', 'The repository ships .mcp.json — start Claude Code in the Alfred folder and approve “alfred”. It uses these settings and the same index.')
-        row = QHBoxLayout()
-        row.addWidget(button('Test MCP server', self.test_mcp))
-        g.row('alfred_* tools', row)
-        self.mcp_result = label('', 'caption', wrap=True)
-        g.outer.addWidget(self.mcp_result)
-        body.addWidget(g)
-
         g = Group(win, 'APPEARANCE')
         self.theme = QComboBox()
         self.theme.addItems(['Match Windows', 'Dark', 'Light'])
@@ -1633,7 +1923,7 @@ class SettingsView(QWidget):
         self.start_login = Toggle(pal)
         self.start_login.toggled.connect(self.change_start_login)
         g.row('Start Alfred when you sign in', self.start_login,
-              'Starts hidden in the tray, so the shortcut works right away; it also starts Ollama and loads the models')
+              'Starts hidden in the tray, so the shortcut works right away; it also starts Ollama for search by meaning')
         self.hotkey_edit = QKeySequenceEdit()
         self.hotkey_edit.setMaximumSequenceLength(1)
         self.hotkey_edit.setFixedWidth(170)
@@ -1649,15 +1939,15 @@ class SettingsView(QWidget):
         body.addStretch()
 
         self.save_timer = QTimer(self, singleShot=True, timeout=self.save)
-        for widget in (self.base_url, self.api_key, self.embed_model, self.embed_url, self.vision_model, self.folder):
+        for widget in (self.base_url, self.api_key, self.embed_model, self.embed_url, self.folder):
             widget.textEdited.connect(lambda _: self.save_timer.start(600))
-        for widget in (self.provider, self.device, self.embed_device, self.vision_device, self.theme, self.effort):
+        for widget in (self.provider, self.device, self.embed_device, self.theme, self.effort):
             widget.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
         self.model.currentTextChanged.connect(lambda _: self.save_timer.start(600))
         self.embed_batch.valueChanged.connect(lambda _: self.save_timer.start(600))
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
         self.keep_minutes.valueChanged.connect(lambda _: self.save_timer.start(600))
-        for toggle in (self.embed_enabled, self.vision_enabled, self.reduce_motion, self.auto_index, self.autostart, self.web_search):
+        for toggle in (self.embed_enabled, self.ocr_enabled, self.reduce_motion, self.auto_index, self.autostart, self.web_search):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
         self.loading = False
         guard_wheel(self)
@@ -1667,7 +1957,6 @@ class SettingsView(QWidget):
         s = self.win.settings
         for widget in self.findChildren(QWidget):
             widget.blockSignals(True)
-        self.root.setText(str(s.root))
         self.provider.setCurrentIndex({'none': 0, 'ollama': 1, 'openai': 2, 'anthropic': 3, 'claude_code': 4}.get(s.get('provider'), 0))
         self.load_provider_fields()
         self.device.setCurrentIndex(1 if s.get('device') == 'cpu' else 0)
@@ -1676,9 +1965,7 @@ class SettingsView(QWidget):
         self.embed_url.setText(s.get('embed_base_url') or '')
         self.embed_device.setCurrentIndex(1 if s.get('embed_device') == 'cpu' else 0)
         self.embed_batch.setValue(int(s.get('embed_batch') or 16))
-        self.vision_enabled.setChecked(bool(s.get('vision_enabled')))
-        self.vision_model.setText(s.get('vision_model') or '')
-        self.vision_device.setCurrentIndex(1 if s.get('vision_device') == 'cpu' else 0)
+        self.ocr_enabled.setChecked(bool(s.get('ocr_enabled', True)))
         self.video_interval.setValue(int(s.get('video_interval') or 10))
         self.vault.setText(s.get('vault_path') or 'Not set')
         self.folder.setText(s.get('notes_folder') or 'Alfred')
@@ -1694,11 +1981,15 @@ class SettingsView(QWidget):
         self.load_effort()
         self.show_hotkey()
         run_job(lambda s: startup.enabled(), self.show_start_login)
+        self.tracked.load()
+        self.show_index_info()
+        self.loading = False
+
+    def show_index_info(self):
         st = self.win.status
         self.index_info.setText(f"{st['files']} files indexed · {st['segments']} passages · {st['vectors']} embeddings · "
                                 f"{st['errors']} failed · {st['unsupported']} unsupported · last indexed {st['last_indexed'] or 'never'}"
                                 + ''.join(f"\n{p['status']}: {p['path']} — {p['error']}" for p in self.win.index.problems(6)))
-        self.loading = False
 
     def load_provider_fields(self):
         """Show the saved server/model/key for the provider selected in the drop-down."""
@@ -1815,14 +2106,6 @@ class SettingsView(QWidget):
             self.win.toast(f'{text}: {error}', 'red', seconds=6)
         self.show_hotkey()
 
-    def reset_root(self):
-        self.win.settings['search_root'] = 'demo_data'
-        self.win.settings.save()
-        self.win.watch_root()
-        self.win.refresh_status()
-        self.activated()
-        self.win.start_index()
-
     def save(self):
         if self.loading:
             return
@@ -1832,7 +2115,7 @@ class SettingsView(QWidget):
         except knowledge.VaultError as error:
             self.win.toast(str(error), 'red')
             return
-        before = (s.get('embed_enabled'), s.get('embed_model'), s.get('vision_enabled'), s.get('vision_model'), s.get('video_interval'))
+        before = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'))
         kind = ['none', 'ollama', 'openai', 'anthropic', 'claude_code'][self.provider.currentIndex()]
         before_model = (s.get('provider'), s.get('model'), s.get('claude_model'), s.get('claude_code_model'))
         if kind == 'claude_code':
@@ -1846,26 +2129,26 @@ class SettingsView(QWidget):
         s.update({'provider': kind, 'device': 'cpu' if self.device.currentIndex() else 'auto',
                   'embed_enabled': self.embed_enabled.isChecked(), 'embed_model': self.embed_model.text().strip(),
                   'embed_base_url': self.embed_url.text().strip(), 'embed_device': 'cpu' if self.embed_device.currentIndex() else 'auto',
-                  'embed_batch': self.embed_batch.value(), 'vision_enabled': self.vision_enabled.isChecked(),
-                  'vision_model': self.vision_model.text().strip(), 'vision_device': 'cpu' if self.vision_device.currentIndex() else 'auto',
+                  'embed_batch': self.embed_batch.value(), 'ocr_enabled': self.ocr_enabled.isChecked(),
                   'video_interval': self.video_interval.value(),
                   'notes_folder': self.folder.text().strip() or 'Alfred', 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
                   'reduce_motion': self.reduce_motion.isChecked(), 'auto_index': self.auto_index.isChecked(),
                   'ollama_autostart': self.autostart.isChecked(), 'keep_alive_minutes': self.keep_minutes.value(),
                   'web_search': self.web_search.isChecked()})
         s.save()
-        self.win.watch_root()
+        self.win.watch_folders()
         Motion.detect(s)
         self.win.apply_theme()
         self.win.refresh_status()
         if (s.get('provider'), s.get('model'), s.get('claude_model'), s.get('claude_code_model')) != before_model:
             self.load_effort()
             self.provider_changed(save=False)
-        after = (s.get('embed_enabled'), s.get('embed_model'), s.get('vision_enabled'), s.get('vision_model'), s.get('video_interval'))
+        after = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'))
         if after != before:
-            self.win.toast('Saved. Rescan to apply to your files.', 'green', ('Rescan now', self.win.start_index), 8)
+            self.win.toast('Saved · updating your index', 'green', seconds=4)
+            self.win.start_index(quiet=True)
         else:
-            self.win.toast('Settings saved · shared with the MCP server', 'green', seconds=2)
+            self.win.toast('Settings saved', 'green', seconds=2)
 
     def refresh_models(self):
         settings = dict(self.win.settings)
@@ -1911,18 +2194,6 @@ class SettingsView(QWidget):
             self.diag.setText('  \n'.join(lines))
         run_job(lambda s: ai.diagnostics(settings, probe), done, lambda e: (self.win.thinking(False), self.diag.setText(f'Failed: {e}')))
 
-    def test_mcp(self):
-        self.mcp_result.setText('Starting the MCP server over stdio…')
-
-        def work(s):
-            sys.path.insert(0, str(REPO / 'tests'))
-            from mcp_probe import session
-            replies, _, code = session([('alfred_status', {})])
-            return [t['name'] for t in replies[2]['result']['tools']], json.loads(replies[10]['result']['content'][0]['text'])
-
-        run_job(work, lambda v: self.mcp_result.setText(f"✓ Connected · {len(v[0])} tools: {', '.join(v[0])} · sees {v[1]['index']['indexed_files']} indexed files (same index)"),
-                lambda e: self.mcp_result.setText(f'MCP test failed: {e}'))
-
 
 # ------------------------------------------------------------------ window
 class AlfredWindow(QWidget):
@@ -1935,7 +2206,7 @@ class AlfredWindow(QWidget):
         Motion.detect(self.settings)
         self.pal = palette_for(self.settings.get('theme'))
         self.index = Index(self.settings)
-        self.status, self.root_files = self.index.status(), 0
+        self.status, self.folder_stats = self.index.status(), {}
         self.indexing, self.progress, self.mode, self.hiding = False, None, SEARCH, False
         self.active_hotkey = ''
         self.tray, self.reindex_pending = None, False
@@ -1992,7 +2263,7 @@ class AlfredWindow(QWidget):
         self.toast_timer = QTimer(self, singleShot=True, timeout=self.end_toast)
         self.toasting = False
         self._height(BAR)
-        self.watch_root()
+        self.watch_folders()
         self.apply_theme()
         self.refresh_status()
         self.set_mode(SEARCH, animate=False)
@@ -2255,16 +2526,22 @@ class AlfredWindow(QWidget):
     # ---------------------------------------------------------------- state
     def problem_state(self):
         st = self.status
+        if not st['folders']:
+            suggestions = [(f'Track {name}', lambda _=False, p=path: self.track_folder(p)) for name, path in suggested_folders()[:1]]
+            return ('Track a folder to start searching',
+                    'Alfred searches the folders you track — like Downloads or Pictures — including the text inside documents, '
+                    'images and videos, and keeps up with new files automatically.',
+                    [('Track folder…', self.choose_folder)] + suggestions, 'folder')
         if not st['root_exists']:
-            return ('Search folder not found', str(self.settings.root),
-                    [('Create folder', self.create_root), ('Choose another…', self.choose_root)], 'folder')
-        if self.root_files == 0:
-            return ('Your search folder is empty', f'Add PDFs, Office documents, text files or images to {self.settings.root.name}/, then Rescan.',
-                    [('Open folder', lambda: open_path(self.settings.root)), ('Rescan', self.start_index)], 'folder')
-        if st.get('stale_root'):
-            return ('The index belongs to another folder', 'Rescan to index the configured folder.', [('Rescan now', self.start_index)], 'refresh')
-        if not st['files'] and not self.indexing:
-            return (f'{self.root_files} files waiting', 'Press Rescan to index them.', [('Rescan', self.start_index)], 'refresh')
+            return ('Your tracked folders are missing', 'They may have been moved, renamed or be on a drive that isn’t connected.',
+                    [('Open Settings', lambda: self.set_mode(SETTINGS)), ('Track folder…', self.choose_folder)], 'folder')
+        if not st['files']:
+            if self.indexing:
+                return ('Reading your files…', 'Results appear here as soon as the first files are indexed.', [], 'refresh')
+            if st['initialized']:
+                return ('Nothing searchable yet', 'Alfred reads documents, PDFs, slides, spreadsheets, text files, images and videos. '
+                        'Add some to a tracked folder, or track another folder.', [('Track folder…', self.choose_folder)], 'folder')
+            return ('Your folders haven’t been indexed yet', 'Index them now to start searching.', [('Index now', self.start_index)], 'refresh')
         return None
 
     def warm_up(self, on_ready=None, retry=True):
@@ -2333,10 +2610,10 @@ class AlfredWindow(QWidget):
         if self.open_action is not None:
             self.open_action.setText(f'Open Alfred\t{text}')
 
-    def watch_root(self):
-        """(Re)start watching the search folder when auto-indexing is on."""
-        if self.settings.get('auto_index', True) and self.settings.root.is_dir():
-            self.watcher.set_root(self.settings.root)
+    def watch_folders(self):
+        """(Re)start watching the tracked folders when auto-indexing is on."""
+        if self.settings.get('auto_index', True) and self.settings.folders:
+            self.watcher.set_roots(self.settings.folders)
         else:
             self.watcher.stop()
 
@@ -2355,34 +2632,32 @@ class AlfredWindow(QWidget):
         elif self.tray is not None:
             self.tray.showMessage('Alfred', text, QIcon(logo_pixmap(32)), 5000)
 
-    def create_root(self):
-        self.settings.root.mkdir(parents=True, exist_ok=True)
-        self.watch_root()
-        self.refresh_status()
-        self.search_view.show_problem_or_collapse()
-
     def refresh_status(self):
         self.status = self.index.status()
-        self.root_files = self.index.root_file_count() if self.status['root_exists'] else 0
+        self.folder_stats = self.index.folder_stats()
         if not self.toasting:
             self.status_label.setText(self.status_text())
         if self.mode == SEARCH:
             self.search_view.show_problem_or_collapse()
+        if self.mode == SETTINGS:
+            self.settings_view.tracked.refresh()
+            self.settings_view.show_index_info()
 
     def status_text(self):
         st, pal = self.status, self.pal
         dot = lambda color: f"<span style='color:{pal[color].name()}'>●</span>&nbsp; "
         if self.indexing:
             return dot('accent') + 'Indexing…'
+        if not st['folders']:
+            return dot('orange') + 'No folders tracked yet'
         if not st['root_exists']:
-            return dot('red') + 'Search folder missing'
+            return dot('red') + 'Tracked folders missing'
         if not st['files']:
-            return dot('orange') + f'Not indexed · {self.root_files} files in folder'
-        info = ai.ChatProvider(self.settings).describe()
-        model = (f" · {info.get('name', info['model'])} {'on this PC' if info.get('location') == 'local' else '(your Claude plan)' if info['provider'] == 'claude_code' else '(Claude API)' if info['provider'] == 'anthropic' else '(remote)'}"
-                 if info['configured'] else ' · AI off')
-        live = ' · watching folder' if self.watcher.active else ''
-        return dot('green') + f"{st['files']} files · {st['vectors'] or 'no'} embeddings{model}{live}"
+            return dot('orange') + 'Nothing indexed yet'
+        meaning = ' · search by meaning on' if st['vectors'] else ' · keyword search'
+        live = ' · watching for changes' if self.watcher.active else ''
+        folders = f"{st['folders']} folder{'s' * (st['folders'] != 1)}"
+        return dot('green') + f"{st['files']:,} files in {folders}{meaning}{live}"
 
     def toast(self, text, color='green', action=None, seconds=4):
         self.toasting = True
@@ -2408,36 +2683,48 @@ class AlfredWindow(QWidget):
         self.update_hints()
         fade_in(self.status_label)
 
-    def start_index(self, force=False, quiet=False, auto=False):
+    def start_index(self, force=False, quiet=False, auto=False, roots=None):
         if self.indexing:
-            self.reindex_pending = self.reindex_pending or auto
+            self.reindex_pending = True  # picked up right after the current run
             return
-        if not self.settings.root.is_dir():
-            self.toast('The search folder does not exist.', 'orange')
+        if not self.settings.folders:
+            if not quiet:
+                self.toast('Track a folder first', 'orange', ('Track folder…', self.choose_folder))
             return
-        self.indexing, self.progress = True, None
+        self.indexing, self.progress, self.live_refresh = True, None, time.monotonic()
         self.shimmer.start()
         self.status_label.setText(self.status_text())
         index, settings = self.index, self.settings
+        tracked = self.settings_view.tracked
 
         def progress(state):
             total, done = state.get('total', 0), state.get('done', 0)
             self.progress = done / total if total else None
-            phase = {'scanning': 'Scanning', 'indexing': 'Reading', 'embedding': 'Embedding', 'reading images': 'Reading images', 'reading video': 'Reading video',
+            phase = {'scanning': 'Looking for files', 'indexing': 'Reading', 'embedding': 'Learning meaning', 'reading video': 'Reading video',
                      'done': 'Finishing'}.get(state.get('phase'), state.get('phase'))
             if not self.toasting:
-                self.status_label.setText(f"<span style='color:{self.pal['accent'].name()}'>●</span>&nbsp; {phase} {done}/{total}" +
-                                          (f" · {html.escape(Path(state['current']).name)}" if state.get('current') else ''))
+                where = f" · {html.escape(Path(state['current']).name)}" if state.get('current') else ''
+                count = f' {done}/{total}' if total else ''
+                self.status_label.setText(f"<span style='color:{self.pal['accent'].name()}'>●</span>&nbsp; {phase}{count}{where}")
+            now = time.monotonic()
+            if now - self.live_refresh > 2:  # files become searchable as they are read: keep counts live
+                self.live_refresh = now
+                self.status, self.folder_stats = index.status(), index.folder_stats()
+                if self.mode == SEARCH and not self.search.text().strip():
+                    self.search_view.show_problem_or_collapse()
+            if self.mode == SETTINGS:
+                tracked.refresh(state)
             self.update()
 
         def done(summary):
             self.indexing = False
             self.shimmer.stop()
-            logging.getLogger('alfred').info('Indexed: %s', {k: summary.get(k) for k in ('found', 'indexed', 'removed', 'errors', 'embedded', 'warnings')})
+            logging.getLogger('alfred').info('Indexed: %s', {k: summary.get(k) for k in ('found', 'indexed', 'removed', 'errors', 'unsupported',
+                                                                                        'embedded', 'seconds', 'warnings')})
             self.refresh_status()
             changed = summary['indexed'] + summary['removed'] + summary['errors']
             text = (f"Indexed {summary['indexed']} · {summary['unchanged']} unchanged · {summary['removed']} removed"
-                    + (f" · {summary['errors']} failed" if summary['errors'] else '') + (f" · {summary['embedded']} embedded" if summary['embedded'] else ''))
+                    + (f" · {summary['errors']} couldn’t be read" if summary['errors'] else ''))
             if summary['warnings']:
                 text += ' · ' + summary['warnings'][0]
             color = 'orange' if summary['warnings'] or summary['errors'] else 'green'
@@ -2445,7 +2732,7 @@ class AlfredWindow(QWidget):
                 parts = [f"{summary['indexed']} new or changed file{'s' * (summary['indexed'] != 1)} indexed"] if summary['indexed'] else []
                 parts += [f"{summary['removed']} removed"] if summary['removed'] else []
                 parts += [f"{summary['errors']} could not be read"] if summary['errors'] else []
-                self.notify('Folder updated · ' + ' · '.join(parts), color)
+                self.notify('Folders updated · ' + ' · '.join(parts), color)
             elif not quiet or changed:
                 self.toast(text, color, seconds=6)
             if self.mode == SEARCH and self.search.text().strip():
@@ -2457,22 +2744,21 @@ class AlfredWindow(QWidget):
             self.indexing = False
             self.shimmer.stop()
             self.refresh_status()
-            if auto:
-                self.notify(f'Indexing failed: {error}', 'red')
-            else:
-                self.toast(f'Indexing failed: {error}', 'red', seconds=8)
+            if not isinstance(error, IndexBusy):
+                (self.notify if auto else lambda text, color: self.toast(text, color, seconds=8))(f'Indexing failed: {error}', 'red')
             self.after_index()
+
         def work(signals):
-            if settings.get('ollama_autostart', True):
-                for enabled, url in ((settings.get('embed_enabled'), settings.get('embed_base_url')),
-                                     (settings.get('vision_enabled'), settings.get('vision_base_url'))):
-                    if enabled:
-                        try:
-                            ai.ensure_ollama(url)
-                        except ai.ProviderError:
-                            pass  # indexing still works; the summary reports what was skipped
-            return (index.rebuild if force else index.update)(signals.progress.emit, ai.Embedder.from_settings(settings),
-                                                                vision=ai.Vision.from_settings(settings))
+            embedder = ai.Embedder.from_settings(settings)
+            if embedder is not None and embedder.local and settings.get('ollama_autostart', True):
+                try:
+                    ai.ensure_ollama(embedder.base)
+                except ai.ProviderError as error:
+                    logging.getLogger('alfred').warning('Indexing without search by meaning: %s', error)
+                    embedder = None  # keyword search still works; meaning catches up on the next run
+            if embedder is not None and not ai.ollama_running(embedder.base, 1.5):
+                embedder = None
+            return index.update(signals.progress.emit, embedder, force=force, roots=roots)
         run_job(work, done, failed, progress=progress)
 
     def after_index(self):
@@ -2480,37 +2766,60 @@ class AlfredWindow(QWidget):
             self.reindex_pending = False
             QTimer.singleShot(400, lambda: self.start_index(quiet=True, auto=True))
 
-    def choose_root(self):
-        folder = QFileDialog.getExistingDirectory(self, 'Choose the one folder Alfred should search', str(self.settings.root))
-        if not folder:
-            return
-        resolved = Path(folder).resolve()
-        home = Path.home().resolve()
-        if resolved in [home, home / 'Desktop', home / 'Documents', home / 'Downloads', Path(resolved.anchor)]:
-            QMessageBox.warning(self, 'Folder too broad', 'For privacy, Alfred will not index your whole home, Desktop, Documents, '
-                                                          'Downloads or a drive root. Choose a dedicated folder.')
-            return
+    def choose_folder(self):
+        start = next((str(path) for _, path in suggested_folders()), str(Path.home()))
+        folder = QFileDialog.getExistingDirectory(self, 'Choose a folder for Alfred to track', start)
+        if folder:
+            self.track_folder(folder)
+
+    def track_folder(self, folder):
+        """Track a folder: index it right away, then watch it for changes."""
+        folder = Path(os.path.realpath(folder))
+        reason = paths.forbidden_reason(folder, self.settings.home)
+        if reason:
+            self.toast(reason, 'orange', seconds=8)
+            return False
+        tracked = self.settings.folders
+        parent = next((t for t in tracked if paths.is_within(t, folder)), None)
+        if parent is not None:
+            self.toast(f'{folder.name} is already tracked as part of {parent.name}', 'orange', seconds=6)
+            return False
         vault = (self.settings.get('vault_path') or '').strip()
-        if vault and (paths.is_within(vault, resolved) or paths.is_within(resolved, vault)):
-            QMessageBox.warning(self, 'Folder overlaps the vault', 'Keep the search folder and the Obsidian vault separate.')
-            return
-        try:
-            stored = paths.relative_to_root(REPO, resolved)
-        except ValueError:
-            stored = str(resolved)
-        self.settings['search_root'] = stored
+        if vault and (paths.is_within(vault, folder) or paths.is_within(folder, vault)):
+            self.toast('Keep your Obsidian vault separate from tracked folders', 'orange', seconds=6)
+            return False
+        inside = [t for t in tracked if paths.is_within(folder, t)]
+        self.settings['tracked_folders'] = [str(t) for t in tracked if t not in inside] + [str(folder)]
         self.settings.save()
-        self.watch_root()
+        self.watch_folders()
+        if self.mode == SETTINGS:
+            if inside:
+                self.settings_view.tracked.load()
+            else:
+                self.settings_view.tracked.added(folder)
+        merged = f" (it includes {', '.join(t.name for t in inside)})" if inside else ''
+        self.toast(f'Tracking {folder.name}{merged} · indexing now', 'green', seconds=5)
         self.refresh_status()
-        self.settings_view.activated()
-        self.start_index()  # a new folder replaces the index
+        self.start_index(quiet=True, roots=[folder])
+        return True
+
+    def untrack_folder(self, folder):
+        """Stop tracking a folder; its files leave the index (nothing on disk is touched)."""
+        key = paths.canonical(folder)
+        self.settings['tracked_folders'] = [str(t) for t in self.settings.folders if paths.canonical(t) != key]
+        self.settings.save()
+        self.watch_folders()
+        index = self.index
+        run_job(lambda s: index.remove_root(folder), lambda _: self.refresh_status(),
+                lambda error: self.toast(f'Couldn’t remove {Path(folder).name} from the index: {error}', 'red'))
+        self.toast(f'Stopped tracking {Path(folder).name}', 'green', seconds=4)
 
     def choose_vault(self):
         folder = QFileDialog.getExistingDirectory(self, 'Choose your Obsidian vault folder', self.settings.get('vault_path') or str(Path.home()))
         if not folder:
             return False
-        if paths.is_within(self.settings.root, folder) or paths.is_within(folder, self.settings.root):
-            QMessageBox.warning(self, 'Vault overlaps the search folder', 'Keep the Obsidian vault separate from the search folder.')
+        if any(paths.is_within(t, folder) or paths.is_within(folder, t) for t in self.settings.folders):
+            QMessageBox.warning(self, 'Vault overlaps a tracked folder', 'Keep the Obsidian vault separate from tracked folders.')
             return False
         self.settings['vault_path'] = str(Path(folder).resolve())
         self.settings.save()
@@ -2523,9 +2832,70 @@ class AlfredWindow(QWidget):
 
 # ------------------------------------------------------------------ app
 INSTANCE = 'alfred-desktop-' + os.environ.get('USERNAME', 'user')
+NEWLINE = b'\n'  # ends each command and reply on the instance socket
+
+
+def send_command(message, reply=True, timeout_ms=60000):
+    """Send one command to the running Alfred over its local socket. None when Alfred isn't running;
+    otherwise its JSON reply (or {} when no reply is wanted)."""
+    socket = QLocalSocket()
+    socket.connectToServer(INSTANCE)
+    if not socket.waitForConnected(300):
+        return None
+    socket.write(json.dumps(message).encode('utf-8') + NEWLINE)
+    socket.flush()
+    socket.waitForBytesWritten(1000)
+    if not reply:
+        return {}
+    data = b''
+    while not data.endswith(NEWLINE) and socket.waitForReadyRead(timeout_ms):
+        data += bytes(socket.readAll())
+    return json.loads(data or b'{}')
+
+
+def serve_command(socket, window):
+    """Handle one command from send_command: show, track <folder>, search <query>, status."""
+    if socket is None:
+        return
+    buffer = bytearray()
+
+    def answer(value):
+        try:
+            socket.write(json.dumps(value, default=str).encode('utf-8') + NEWLINE)
+            socket.flush()
+            socket.disconnectFromServer()
+        except RuntimeError:
+            pass
+
+    def received():
+        buffer.extend(bytes(socket.readAll()))
+        if not buffer.endswith(NEWLINE) and buffer.strip() != b'show':
+            return
+        try:
+            message = json.loads(bytes(buffer)) if buffer.strip() != b'show' else {'cmd': 'show'}
+        except ValueError:
+            message = {'cmd': 'show'}
+        cmd, arg = message.get('cmd'), message.get('arg')
+        if cmd == 'track':
+            answer({'ok': bool(window.track_folder(arg)), 'tracked': window.settings.get('tracked_folders')})
+        elif cmd == 'search':
+            settings, index = window.settings, window.index
+            run_job(lambda s: index.search(arg, limit=int(message.get('limit') or 10), embedder=ai.Embedder.from_settings(settings)),
+                    answer, lambda error: answer({'error': str(error)}))
+        elif cmd == 'status':
+            answer({'status': window.index.status(), 'folders': window.index.folder_stats(), 'indexing': window.indexing,
+                    'hotkey': window.active_hotkey, 'settings_file': str(window.settings.path)})
+        else:
+            window.show_panel()
+            answer({})
+    socket.readyRead.connect(received)
+    if socket.bytesAvailable():
+        received()
 
 
 def run():
+    if startup.sandboxed() and startup.relaunch_outside():
+        return 0  # Windows Explorer starts the real Alfred; this redirected copy just exits
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     if os.name == 'nt':
         try:
@@ -2543,19 +2913,16 @@ def run():
     app.setQuitOnLastWindowClosed(False)
     app.setStyle('Fusion')
     # Single instance: a second launch just shows the running Alfred.
-    probe = QLocalSocket()
-    probe.connectToServer(INSTANCE)
-    if probe.waitForConnected(300):
-        probe.write(b'show')
-        probe.flush()
-        probe.waitForBytesWritten(300)
+    if send_command({'cmd': 'show'}, reply=False) is not None:
         return 0
     QLocalServer.removeServer(INSTANCE)
     server = QLocalServer()
     server.listen(INSTANCE)
     window = AlfredWindow()
     startup.first_run(window.settings)
-    server.newConnection.connect(lambda: (server.nextPendingConnection(), window.show_panel()))
+    # On quit, stop indexing at the next file and let background work finish before Python shuts down.
+    app.aboutToQuit.connect(lambda: (window.index.cancel.set(), QThreadPool.globalInstance().waitForDone(5000)))
+    server.newConnection.connect(lambda: serve_command(server.nextPendingConnection(), window))
 
     hotkey_error = ''
     try:
@@ -2593,11 +2960,9 @@ def run():
     window.tray = tray
     at_sign_in = '--startup' in sys.argv
     if at_sign_in:
-        # Started with Windows: stay hidden in the tray. Give Windows, the GPU driver and Ollama's own
-        # start-up a moment, then make sure Ollama runs and the models are loaded, then catch up the index.
+        # Started with Windows: stay hidden in the tray. Give Windows and the GPU driver a moment,
+        # then run the sign-in tasks (start Ollama, catch up the index).
         logging.getLogger('alfred').info('Started at sign-in (hidden in the tray)')
-        QTimer.singleShot(20000, window.warm_up)
-        QTimer.singleShot(25000, lambda: window.start_index(quiet=True))
         QTimer.singleShot(startup.TASK_DELAY_MS, lambda: startup.run_tasks(window))
     else:
         window.show_panel()

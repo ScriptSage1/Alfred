@@ -79,6 +79,11 @@ QPushButton#primary:hover {{ background: {rgba(p['accent'].lighter(112))}; }}
 QPushButton#primary:disabled {{ background: {fs}; color: {rgba(p['tertiary'])}; }}
 QPushButton#link {{ background: transparent; border: none; color: {acc}; padding: 2px 4px; }}
 QPushButton#link:hover {{ text-decoration: underline; }}
+QPushButton#chip {{ background: {f}; border: 1px solid {sep}; border-radius: 13px; padding: 4px 11px 4px 8px; }}
+QPushButton#chip:hover {{ background: {fs}; border-color: {acc}; }}
+QPushButton#ghost {{ background: transparent; border: none; border-radius: 13px; padding: 0; }}
+QPushButton#ghost:hover {{ background: {fs}; }}
+QLabel#name {{ font-weight: 600; }}
 QPushButton#source {{ background: {f}; border: 1px solid {sep}; border-radius: 9px; padding: 6px 10px; text-align: left; }}
 QPushButton#source:hover {{ background: {fs}; }}
 QPushButton#source[used="false"] {{ color: {s}; }}
@@ -236,6 +241,7 @@ SVG = {
     'chevron': '<path d="M9 6l6 6-6 6" fill="none" stroke="C" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>',
     'warning': '<path d="M12 3 22 20H2Z" fill="C"/><path d="M12 9v5" stroke="#000" stroke-opacity=".7" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17" r="1.2" fill="#000" fill-opacity=".7"/>',
     'refresh': '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" fill="none" stroke="C" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>',
+    'close': '<path d="M6 6l12 12M18 6L6 18" stroke="C" stroke-width="2.4" stroke-linecap="round"/>',
     'plus': '<path d="M12 5v14M5 12h14" stroke="C" stroke-width="2.2" stroke-linecap="round"/>',
     'note': '<path d="M6 3h8l5 5v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" fill="C"/><path d="M8.5 12h7M8.5 15.5h7" stroke="#000" stroke-opacity=".35" stroke-width="1.5" stroke-linecap="round"/>',
 }

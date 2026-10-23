@@ -1,14 +1,25 @@
-"""PLACEHOLDER: the AI backend (Ollama, Claude, OpenAI-compatible servers) is not part of Alfred yet.
+"""Local models through Ollama: EmbeddingGemma 2 embeddings for semantic search,
+plus starting Ollama and reporting which device it runs on.
 
-Same names and return shapes as the real module will have, so ui.py runs unchanged. Every
-provider reports "not configured"; anything that would talk to a model raises NotConfigured.
-Replace this file with the real backend later.
+Answer generation (Ask Alfred) is still a PLACEHOLDER: ChatProvider reports
+"not configured" and raises NotConfigured until the chat backend is added.
 """
+import json
+import os
+import shutil
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlparse
+
 OLLAMA_DEFAULT = 'http://127.0.0.1:11434'
 ANTHROPIC_DEFAULT = 'https://api.anthropic.com'
 CLAUDE_MODELS = [('claude-sonnet-5-5', 'Claude Sonnet 5.5'), ('claude-opus-5-5', 'Claude Opus 5.5')]
 CLAUDE_PLAN_MODELS = [('sonnet', 'Claude Sonnet'), ('opus', 'Claude Opus'), ('haiku', 'Claude Haiku')]
-NOT_READY = 'AI answers are not set up in this version of Alfred yet.'
+NOT_READY = 'AI answers are not set up in this version of Alfred yet. Search works, including search by meaning.'
+NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
 class ProviderError(RuntimeError):
@@ -19,12 +30,31 @@ class NotConfigured(ProviderError):
     pass
 
 
+# ------------------------------------------------------------------- http
+def _json(url, payload=None, timeout=30):
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode('utf-8', 'replace')[:300]
+        raise ProviderError(f'HTTP {error.code}: {detail}') from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
+        raise ProviderError(f'Cannot reach {urlparse(url).netloc}: {getattr(error, "reason", error)}') from None
+
+
 def is_local_url(url):
-    host = (url or '').split('//')[-1].split('/')[0].split(':')[0].lower()
-    return host in ('127.0.0.1', 'localhost', '::1', '[::1]')
+    host = (urlparse(url if '//' in (url or '') else f'http://{url}').hostname or '').lower()
+    return host in ('127.0.0.1', 'localhost', '::1')
+
+
+def _ollama_base(url):
+    return (url or OLLAMA_DEFAULT).rstrip('/').removesuffix('/api')
 
 
 def keep_alive(settings):
+    """How long Ollama keeps a model loaded after its last use (never under 5 minutes)."""
     try:
         minutes = int(settings.get('keep_alive_minutes', 5))
     except (TypeError, ValueError):
@@ -32,6 +62,208 @@ def keep_alive(settings):
     return f'{max(5, min(minutes, 24 * 60))}m'
 
 
+def _options(device):
+    return {'num_gpu': 0} if device == 'cpu' else {}
+
+
+# -------------------------------------------------------------- embeddings
+class Embedder:
+    """EmbeddingGemma (or another Ollama embedding model) with its prompt format."""
+
+    def __init__(self, settings):
+        self.kind = 'ollama'
+        self.model = (settings.get('embed_model') or 'embeddinggemma-2').strip()
+        self.base = _ollama_base(settings.get('embed_base_url'))
+        self.device = settings.get('embed_device', 'auto')
+        self.batch = max(1, min(int(settings.get('embed_batch') or 16), 128))
+        self.keep_alive = keep_alive(settings)
+        name = self.model.lower()
+        self.family = 'gemma' if 'embeddinggemma' in name else 'nomic' if 'nomic' in name else 'plain'
+        # Cosine similarity below which a meaning-only match is noise (measured on EmbeddingGemma 2:
+        # related passages score about 0.70+, unrelated ones 0.58–0.65).
+        self.min_similarity = 0.66 if self.family == 'gemma' else 0.5
+
+    @classmethod
+    def from_settings(cls, settings):
+        return cls(settings) if settings.get('embed_enabled') and settings.get('embed_model') else None
+
+    @property
+    def local(self):
+        return is_local_url(self.base)
+
+    def signature(self):
+        """Changes whenever stored vectors would no longer be comparable (model or prompt format)."""
+        return f'ollama:{self.model}:prompt-v1'
+
+    def document_prompt(self, title, text):
+        if self.family == 'gemma':
+            return f'title: {title or "none"} | text: {text}'
+        if self.family == 'nomic':
+            return f'search_document: {title}: {text}'
+        return f'{title}: {text}' if title else text
+
+    def query_prompt(self, text):
+        if self.family == 'gemma':
+            return f'task: search result | query: {text}'
+        if self.family == 'nomic':
+            return f'search_query: {text}'
+        return text
+
+    def _embed(self, texts):
+        payload = {'model': self.model, 'input': texts, 'truncate': True, 'keep_alive': self.keep_alive, 'options': _options(self.device)}
+        try:
+            result = _json(self.base + '/api/embed', payload, timeout=180)
+        except ProviderError as error:
+            if 'HTTP 404' in str(error):
+                raise ProviderError(f'The embedding model “{self.model}” is not installed. Run: ollama pull {self.model}') from None
+            raise
+        vectors = result.get('embeddings')
+        if not vectors or len(vectors) != len(texts):
+            raise ProviderError('Ollama returned an unexpected embedding response')
+        return vectors
+
+    def embed_documents(self, texts, titles=None):
+        titles = titles or [''] * len(texts)
+        try:
+            return self._embed([self.document_prompt(title, text[:6000]) for title, text in zip(titles, texts)])
+        except ProviderError as error:
+            if 'memory' in str(error).lower() and len(texts) > 1:  # out of (V)RAM: smaller batches
+                half = len(texts) // 2
+                return self.embed_documents(texts[:half], titles[:half]) + self.embed_documents(texts[half:], titles[half:])
+            raise
+
+    def embed_query(self, text):
+        return self._embed([self.query_prompt(text[:2000])])[0]
+
+
+class Vision:
+    """Image understanding now uses local OCR (alfred.ocr); no vision model is involved."""
+
+    @classmethod
+    def from_settings(cls, settings):
+        return None
+
+
+# ------------------------------------------------------------------ ollama
+def find_ollama():
+    found = shutil.which('ollama')
+    if found:
+        return found
+    for candidate in (Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Ollama' / 'ollama.exe',
+                      Path(os.environ.get('ProgramFiles', '')) / 'Ollama' / 'ollama.exe'):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def ollama_running(base=OLLAMA_DEFAULT, timeout=0.8):
+    try:
+        with urllib.request.urlopen(_ollama_base(base) + '/api/version', timeout=timeout) as response:
+            return bool(json.load(response).get('version'))
+    except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError, OSError):
+        return False
+
+
+def ensure_ollama(base=OLLAMA_DEFAULT, wait=25.0):
+    """Start ``ollama serve`` hidden in the background if it isn't running (local URLs only).
+    Returns {'started': bool, 'seconds': float}; raises ProviderError when it can't."""
+    base = _ollama_base(base)
+    if not is_local_url(base) or ollama_running(base):
+        return {'started': False, 'seconds': 0.0}
+    exe = find_ollama()
+    if not exe:
+        raise ProviderError('Ollama is not installed (https://ollama.com) — searching by keyword only.')
+    # Detached and windowless; the server keeps running after Alfred closes.
+    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+    env = dict(os.environ, OLLAMA_HOST=urlparse(base).netloc or '127.0.0.1:11434')
+    started = time.time()
+    try:
+        subprocess.Popen([exe, 'serve'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=flags, close_fds=True, env=env)
+    except OSError as error:
+        raise ProviderError(f'Could not start Ollama: {error}') from None
+    while time.time() - started < wait:
+        if ollama_running(base, timeout=0.5):
+            return {'started': True, 'seconds': round(time.time() - started, 1)}
+        time.sleep(0.25)
+    raise ProviderError(f'Ollama did not start within {int(wait)} s')
+
+
+def warm_up(settings, progress=lambda text: None):
+    """Make sure Ollama runs and the embedding model is loaded (restarts its keep-alive timer)."""
+    embedder = Embedder.from_settings(settings)
+    report = {'started': False, 'loaded': [], 'keep_alive': keep_alive(settings)}
+    if embedder is None or not embedder.local:
+        return report
+    if not ollama_running(embedder.base):
+        progress('Starting Ollama…')
+        report['started'] = ensure_ollama(embedder.base)['started']
+    progress('Loading the search model…')
+    _json(embedder.base + '/api/embed', {'model': embedder.model, 'input': 'warm up', 'keep_alive': embedder.keep_alive,
+                                         'options': _options(embedder.device)}, timeout=180)
+    report['loaded'].append(embedder.model)
+    return report
+
+
+def ollama_runtime(base=OLLAMA_DEFAULT):
+    """Version and the models Ollama has loaded, with how much of each sits in VRAM."""
+    base = _ollama_base(base)
+    try:
+        version = _json(base + '/api/version', timeout=2).get('version')
+        loaded = []
+        for model in _json(base + '/api/ps', timeout=3).get('models', []):
+            size, vram = model.get('size') or 0, model.get('size_vram') or 0
+            share = round(100 * vram / size) if size else 0
+            loaded.append({'model': model.get('name', ''), 'size_mib': size // 2 ** 20, 'vram_mib': vram // 2 ** 20, 'gpu_share_percent': share,
+                           'device': 'GPU' if share >= 99 else f'{share}% GPU / {100 - share}% CPU' if share else 'CPU'})
+        return {'running': True, 'version': version, 'loaded': loaded}
+    except ProviderError as error:
+        return {'running': False, 'error': f'Ollama is not running ({error})', 'loaded': []}
+
+
+def detect_gpus():
+    exe = shutil.which('nvidia-smi')
+    if not exe:
+        return {'available': False, 'gpus': [], 'note': 'no NVIDIA driver found (nvidia-smi missing)'}
+    try:
+        out = subprocess.run([exe, '--query-gpu=name,memory.total,memory.used,driver_version', '--format=csv,noheader,nounits'],
+                             capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW)
+        gpus = []
+        for line in out.stdout.strip().splitlines():
+            name, total, used, driver = [part.strip() for part in line.split(',')]
+            gpus.append({'name': name, 'vram_total_mib': int(total), 'vram_used_mib': int(used), 'driver': driver})
+        return {'available': bool(gpus), 'gpus': gpus, 'note': '' if gpus else 'nvidia-smi reported no GPUs'}
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return {'available': False, 'gpus': [], 'note': f'nvidia-smi failed: {error}'}
+
+
+def diagnostics(settings, probe=False):
+    embedder = Embedder.from_settings(settings)
+    report = {'checked_at': time.strftime('%H:%M:%S'), 'gpu': detect_gpus(), 'chat': ChatProvider(settings).describe(),
+              'embeddings': {'enabled': embedder is not None}, 'vision': {'enabled': False}, 'errors': []}
+    if embedder is None:
+        return report
+    report['embeddings'].update(provider='ollama', model=embedder.model, location='local' if embedder.local else 'remote')
+    if probe:
+        try:
+            embedder.embed_query('diagnostic probe')
+        except ProviderError as error:
+            report['errors'].append(f'Embedding test failed: {error}')
+    runtime = ollama_runtime(embedder.base)
+    report['ollama'] = runtime
+    if not runtime['running']:
+        report['errors'].append(runtime['error'])
+    match = next((m for m in runtime['loaded'] if m['model'].split(':')[0] == embedder.model.split(':')[0]), None)
+    if match:
+        report['embeddings']['execution'] = f"{match['device']} — {match['vram_mib']} MiB of {match['size_mib']} MiB in VRAM (reported by Ollama)"
+        report['embeddings']['gpu_active'] = match['gpu_share_percent'] > 0
+    else:
+        report['embeddings']['execution'] = 'Model not loaded right now — run the test, then check again.'
+        report['embeddings']['gpu_active'] = None
+    return report
+
+
+# ---------------------------------------------- answers (PLACEHOLDER for now)
 class ChatProvider:
     def __init__(self, settings):
         self.settings = settings
@@ -48,18 +280,6 @@ class ChatProvider:
 
     def list_models(self):
         raise NotConfigured(NOT_READY)
-
-
-class Embedder:
-    @classmethod
-    def from_settings(cls, settings):
-        return None
-
-
-class Vision:
-    @classmethod
-    def from_settings(cls, settings):
-        return None
 
 
 def find_claude_code(settings=None):
@@ -80,20 +300,3 @@ def effort_options(settings):
 
 def available_models(settings):
     return []
-
-
-def ollama_running(base, timeout=0.8):
-    return False
-
-
-def ensure_ollama(base, wait=25.0):
-    raise ProviderError(NOT_READY)
-
-
-def warm_up(settings, progress=lambda text: None):
-    return {'started': False, 'loaded': [], 'keep_alive': keep_alive(settings)}
-
-
-def diagnostics(settings, probe=False):
-    return {'chat': ChatProvider(settings).describe(), 'embeddings': {'enabled': False}, 'vision': {'enabled': False},
-            'gpu': [], 'errors': [NOT_READY]}

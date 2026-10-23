@@ -1,10 +1,24 @@
-"""Root-confinement checks shared by indexing and the UI."""
+"""Path safety shared by indexing, watching and the UI.
+
+Alfred only reads files inside folders the user tracks. Symlinks, junctions,
+hidden/system entries, dot-folders and files that look like credentials are
+never indexed, and folders that would expose the whole system (a drive root,
+the user profile itself, Windows, Program Files, AppData) cannot be tracked.
+"""
 import os
-from pathlib import Path, PureWindowsPath
+import re
+from pathlib import Path
+
+REPARSE = 0x400          # FILE_ATTRIBUTE_REPARSE_POINT (symlinks, junctions)
+HIDDEN_SYSTEM = 0x2 | 0x4
+SKIP_DIRS = {'node_modules', '__pycache__', '$recycle.bin', 'system volume information', 'appdata'}
+SECRET_SUFFIXES = {'.pem', '.key', '.pfx', '.p12', '.kdbx', '.keychain', '.ovpn', '.gpg', '.asc', '.jks', '.keystore', '.ppk'}
+SECRET_NAMES = re.compile(r'(^id_(rsa|dsa|ecdsa|ed25519)\b)|(^\.?env(\..*)?$)|(^\.(netrc|npmrc|pypirc|git-credentials)$)'
+                          r'|password|passwd|secret|credential|private[_-]?key|api[_-]?key|token', re.I)
 
 
 class PathError(ValueError):
-    """A path is outside the permitted root or otherwise unsafe."""
+    """A path is outside the tracked folders or otherwise unsafe."""
 
 
 def canonical(path):
@@ -18,31 +32,65 @@ def is_within(root, path):
 
 
 def resolve_within(root, candidate, must_exist=True):
-    """Return the real path of ``candidate`` inside ``root`` or raise PathError.
-
-    ``candidate`` must be relative. Absolute paths, drive-qualified paths, UNC
-    paths, ``..`` components and anything resolving (through a symlink or
-    junction) outside ``root`` are rejected.
-    """
-    if not isinstance(candidate, str) or not candidate.strip() or len(candidate) > 1024:
-        raise PathError('Provide a relative path inside the permitted folder')
-    if '\x00' in candidate:
-        raise PathError('Invalid character in path')
-    pure = PureWindowsPath(candidate.replace('/', '\\'))
-    if pure.is_absolute() or pure.drive or pure.root or candidate.startswith(('\\\\', '//')):
-        raise PathError('Absolute paths are not accepted; use a path relative to the permitted folder')
-    if '..' in pure.parts:
-        raise PathError('Path traversal is not allowed')
-    root_real = Path(os.path.realpath(root))
-    if not root_real.is_dir():
-        raise PathError('The permitted folder does not exist')
-    target = Path(os.path.realpath(root_real.joinpath(*pure.parts)))
-    if not is_within(root_real, target):
-        raise PathError('Path resolves outside the permitted folder')
+    """Real path of ``candidate`` (relative, or absolute inside ``root``) or PathError."""
+    if not isinstance(candidate, str) or not candidate.strip() or len(candidate) > 2048 or '\x00' in candidate:
+        raise PathError('Invalid path')
+    target = Path(os.path.realpath(Path(root) / candidate))
+    if not is_within(root, target):
+        raise PathError('Path is outside the permitted folder')
     if must_exist and not target.exists():
-        raise PathError('File not found inside the permitted folder')
+        raise PathError('File not found')
     return target
 
 
 def relative_to_root(root, path):
     return Path(os.path.realpath(path)).relative_to(Path(os.path.realpath(root))).as_posix()
+
+
+def looks_secret(name):
+    """True for file names that typically hold keys, passwords or tokens."""
+    lowered = name.lower()
+    return Path(lowered).suffix in SECRET_SUFFIXES or bool(SECRET_NAMES.search(lowered))
+
+
+def skip_dir(name):
+    return name.startswith('.') or name.lower() in SKIP_DIRS
+
+
+def _known_folder(name):
+    path = {'windows': os.environ.get('SystemRoot') or os.environ.get('WINDIR'),
+            'program_files': os.environ.get('ProgramFiles'), 'program_files_x86': os.environ.get('ProgramFiles(x86)'),
+            'program_data': os.environ.get('ProgramData')}.get(name)
+    return Path(path) if path else None
+
+
+def forbidden_reason(folder, data_home=None):
+    """Why ``folder`` may not be tracked, or None when it is fine."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return 'That folder does not exist.'
+    real = Path(os.path.realpath(folder))
+    if real.parent == real:
+        return 'For privacy, Alfred won’t track a whole drive. Choose a folder such as Downloads or Documents.'
+    home = Path(os.path.realpath(Path.home()))
+    if canonical(real) == canonical(home):
+        return 'For privacy, Alfred won’t track your whole user folder. Choose Downloads, Documents, Pictures or another folder.'
+    blocked = [home / 'AppData'] + [p for p in (_known_folder(n) for n in ('windows', 'program_files', 'program_files_x86', 'program_data')) if p]
+    if data_home:
+        blocked.append(Path(data_home))
+    for place in blocked:
+        if is_within(place, real):
+            return f'Alfred can’t track system or app folders ({place.name}). Choose a folder with your own files.'
+    return None
+
+
+def shorten(path, width=48):
+    """C:\\Users\\me\\Downloads\\Reports → ~\\Downloads\\Reports, ellipsised in the middle if still long."""
+    text = str(path)
+    home = str(Path.home())
+    if os.path.normcase(text).startswith(os.path.normcase(home)):
+        text = '~' + text[len(home):]
+    if len(text) <= width:
+        return text
+    keep = (width - 1) // 2
+    return text[:keep] + '…' + text[-(width - 1 - keep):]

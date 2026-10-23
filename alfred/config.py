@@ -6,16 +6,17 @@ ALFRED_API_KEY / ALFRED_EMBED_API_KEY / ALFRED_ANTHROPIC_API_KEY environment
 variables. Secrets are never returned by ``public()``.
 """
 import json
+import logging
 import os
+import shutil
 import threading
+import time
 from pathlib import Path
 
-from . import REPO
-
 DEFAULTS = {
-    # Searchable corpus: exactly one folder. Empty = %LOCALAPPDATA%\Alfred\Search; relative paths resolve from the repo.
-    'search_root': '',
-    'auto_index': True,          # watch the folder and index new/changed files automatically
+    # Folders Alfred indexes and watches (absolute paths), added under Settings → Tracked folders.
+    'tracked_folders': [],
+    'auto_index': True,          # watch tracked folders and index new/changed files automatically
     # AI generation: 'none' | 'ollama' | 'openai' | 'claude_code' | 'anthropic'. Off until the AI backend is added.
     'provider': 'none',
     'claude_code_model': 'sonnet',
@@ -24,7 +25,7 @@ DEFAULTS = {
     'model': '',
     'api_key': '',
     'device': 'auto',            # ollama only: 'auto' (GPU when available) | 'cpu'
-    'ollama_autostart': True,    # start Ollama (headless) and warm models when Alfred opens
+    'ollama_autostart': True,    # start Ollama (headless) and warm the models when Alfred starts
     'keep_alive_minutes': 5,
     'gpu_layers': -1,
     'temperature': 0.2,
@@ -34,20 +35,17 @@ DEFAULTS = {
     'anthropic_api_key': '',
     'anthropic_base_url': '',
     'top_k': 6,
-    # Embeddings for semantic search (optional; keyword search always works).
-    'embed_enabled': False,
-    'embed_provider': 'ollama',  # 'ollama' | 'openai'
+    # Semantic search: EmbeddingGemma 2 through a local Ollama. Keyword search always works.
+    'embed_enabled': True,
+    'embed_provider': 'ollama',
     'embed_base_url': 'http://127.0.0.1:11434',
     'embed_model': 'embeddinggemma-2',
     'embed_api_key': '',
     'embed_device': 'auto',
     'embed_batch': 16,
-    # Image understanding with a local vision model.
-    'vision_enabled': False,
-    'vision_base_url': 'http://127.0.0.1:11434',
-    'vision_model': 'gemma3:4b',
-    'vision_device': 'auto',
-    'video_interval': 10,
+    # Text in images, scanned PDF pages and video frames, read by a local OCR model.
+    'ocr_enabled': True,
+    'video_interval': 10,        # seconds between sampled video frames
     # Obsidian
     'vault_path': '',
     'notes_folder': 'Alfred',
@@ -60,6 +58,7 @@ DEFAULTS = {
     'start_with_windows_configured': False,
 }
 SECRETS = ('api_key', 'embed_api_key', 'anthropic_api_key')
+LEGACY_FILES = ('settings.json', 'alfred.sqlite', 'alfred.sqlite-wal', 'alfred.sqlite-shm', 'claude-code-runs')
 _lock = threading.Lock()
 
 
@@ -70,13 +69,35 @@ def data_home():
     return path
 
 
+def retire_legacy(home):
+    """Move an earlier Alfred's settings and index aside (once), so they can't leak into this one."""
+    settings = home / 'settings.json'
+    try:
+        stored = json.loads(settings.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return
+    if 'start_with_windows_configured' in stored:
+        return
+    backup = home / 'old-app-backup'
+    if backup.exists():
+        backup = home / f'old-app-backup-{time.strftime("%Y%m%d-%H%M%S")}'
+    backup.mkdir(parents=True)
+    for name in LEGACY_FILES:
+        if (home / name).exists():
+            shutil.move(str(home / name), str(backup / name))
+    logging.getLogger('alfred').info('Moved an earlier Alfred’s settings and index to %s', backup)
+
+
 class Settings(dict):
     """Dict of settings; ``save()`` persists atomically."""
 
     def __init__(self, home=None):
         super().__init__(DEFAULTS)
+        self['tracked_folders'] = []
         self.home = Path(home) if home else data_home()
+        self.home.mkdir(parents=True, exist_ok=True)
         self.path = self.home / 'settings.json'
+        retire_legacy(self.home)
         if self.path.exists():
             try:
                 loaded = json.loads(self.path.read_text(encoding='utf-8-sig'))
@@ -96,18 +117,13 @@ class Settings(dict):
             temp.replace(self.path)
 
     @property
-    def root(self):
-        raw = str(self.get('search_root') or '').strip()
-        if not raw:
-            default = self.home / 'Search'
-            default.mkdir(parents=True, exist_ok=True)
-            return default.resolve()
-        configured = Path(os.path.expandvars(raw))
-        return (configured if configured.is_absolute() else REPO / configured).resolve()
+    def folders(self):
+        """Tracked folders as Paths, in the order they were added."""
+        return [Path(p) for p in self.get('tracked_folders') or []]
 
     @property
     def db_path(self):
-        return self.home / 'alfred.sqlite'
+        return self.home / 'index.sqlite'
 
     def public(self):
         """Settings safe to show: secrets reduced to a boolean."""
