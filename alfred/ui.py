@@ -531,6 +531,72 @@ class EmptyState(QWidget):
 
 
 # ------------------------------------------------------------------ views
+class DescriptionCard(QFrame):
+    """A picture's AI description under its preview: caption, description, tags and the model,
+    with any text OCR found in a separate block. Shows a shimmer while the description is pending."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self.setObjectName('group')
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 11)
+        layout.setSpacing(5)
+        self.pending = ShimmerLabel(win, 'Describing this picture…')
+        self.caption = label('', 'name', wrap=True, selectable=True)
+        self.text = label('', 'secondary', wrap=True, selectable=True)
+        self.tags = QWidget()
+        self.tag_rows = QVBoxLayout(self.tags)
+        self.tag_rows.setContentsMargins(0, 3, 0, 1)
+        self.tag_rows.setSpacing(5)
+        self.source = label('', 'caption')
+        self.ocr_title = label('TEXT IN IMAGE', 'section')
+        self.ocr = label('', 'secondary', wrap=True, selectable=True)
+        self.description_parts = (self.caption, self.text, self.tags, self.source)
+        for widget in (self.pending,) + self.description_parts + (self.ocr_title, self.ocr):
+            layout.addWidget(widget)
+
+    def _tags(self, tags, width):
+        while self.tag_rows.count():
+            row = self.tag_rows.takeAt(0).layout()
+            while row is not None and row.count():
+                item = row.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+        row, used = None, width
+        for tag in tags:
+            chip = label(tag, 'tag')
+            needed = chip.sizeHint().width() + 5
+            if row is None or used + needed > width:
+                row, used = QHBoxLayout(), 0
+                row.setSpacing(5)
+                row.addStretch()
+                self.tag_rows.addLayout(row)
+            row.insertWidget(row.count() - 1, chip)
+            used += needed
+
+    def show_state(self, vision=None, ocr_text='', pending=False, width=300):
+        """vision: {'caption', 'description', 'tags', 'model'} or None. Hides itself when there's nothing to show."""
+        has_ocr = bool(ocr_text.strip())
+        self.pending.setVisible(pending and not vision)
+        self.pending.set('Describing this picture…', pending and not vision)
+        for widget in self.description_parts:
+            widget.setVisible(bool(vision))
+        if vision:
+            self.caption.setText(vision.get('caption') or '')
+            self.text.setText(vision.get('description') or '')
+            self.text.setVisible(bool(vision.get('description')))
+            self._tags(vision.get('tags') or [], width - 28)
+            self.tags.setVisible(bool(vision.get('tags')))
+            self.source.setText(f"AI description · {vision.get('model') or 'local vision model'} · on this PC")
+        self.ocr_title.setVisible(has_ocr)
+        self.ocr.setVisible(has_ocr)
+        self.ocr.setText(ocr_text.strip()[:900])
+        self.setVisible(bool(vision) or has_ocr or pending)
+        if vision or has_ocr:
+            fade_in(self)
+
+
 class SearchView(QWidget):
     def __init__(self, win):
         super().__init__()
@@ -580,6 +646,20 @@ class SearchView(QWidget):
         self.image.setAlignment(Qt.AlignCenter)
         self.image.hide()
         pane.addWidget(self.image)
+        self.card = DescriptionCard(win)
+        self.card.hide()
+        holder = QWidget()
+        holder.setObjectName('clear')
+        stack = QVBoxLayout(holder)
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.addWidget(self.card)
+        stack.addStretch()
+        self.card_area = QScrollArea()  # a long description scrolls instead of being clipped
+        self.card_area.setWidgetResizable(True)
+        self.card_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.card_area.setWidget(holder)
+        self.card_area.hide()
+        pane.addWidget(self.card_area, 1)
         self.excerpt = QTextBrowser()
         self.excerpt.setObjectName('excerpt')
         self.excerpt.setOpenLinks(False)
@@ -690,7 +770,10 @@ class SearchView(QWidget):
             return
         if item.get('kind_row') == 'ask':
             self.big_icon.setPixmap(sparkle_pixmap(52))
-            self.p_title.setText('Ask Alfred')
+            self.set_title('Ask Alfred')
+            self.card.hide()
+            self.card_area.hide()
+            self.excerpt.show()
             self.p_meta.setText(f"{ai.ChatProvider(self.win.settings).describe()['summary']}")
             self.image.hide()
             self.excerpt.setHtml(f"<p style='font-size:11pt'>Alfred searches your indexed files for “{html.escape(self.query)}”, "
@@ -704,7 +787,7 @@ class SearchView(QWidget):
             widget.setVisible(True)
         absolute = Path(item['path'])
         self.big_icon.setPixmap(FileIcons.get(absolute, 52))
-        self.p_title.setText(item['filename'])
+        self.set_title(item['filename'])
         size = item.get('size') or 0
         nice = f'{size / 1024:.0f} KB' if size >= 1024 else f'{size} bytes'
         self.p_meta.setText(f"{item['file_type'].upper()} · {nice} · {item['location']} · modified {item['modified']}")
@@ -733,11 +816,46 @@ class SearchView(QWidget):
         else:
             self.image.hide()
         self.excerpt.setHtml('')
-        query, index = self.query, self.win.index
-        run_job(lambda s: index.read_excerpt(item['path'], segment_id=item.get('segment_id'), max_chars=2400),
-                lambda ex: self.list.item() is item and self.excerpt.setHtml(_highlight(ex['excerpt'], query, self.win.pal)),
-                lambda error: self.list.item() is item and self.excerpt.setPlainText(f'Preview unavailable: {error}'))
+        media = Path(item['path']).suffix.lower() in IMAGE_SUFFIXES | VIDEO_SUFFIXES
+        picture = Path(item['path']).suffix.lower() in IMAGE_SUFFIXES
+        self.card.setVisible(False)
+        self.excerpt.setVisible(not picture)  # a picture's text goes in the card
+        self.card_area.setVisible(media)
+        self.card_area.verticalScrollBar().setValue(0)
+        self.load_details(item, media, picture)
         fade_in(self.pane)
+
+    def load_details(self, item, media, picture, attempt=0):
+        query, index = self.query, self.win.index
+
+        def show(ex):
+            if self.list.item() is not item:
+                return
+            if not picture:
+                self.excerpt.setHtml(_highlight(ex['excerpt'], query, self.win.pal) if ex['excerpt'] else '')
+            if media:
+                self.card.show_state(ex.get('vision'), ex.get('ocr_text', '') if picture else '', ex.get('description_pending'),
+                                     self.pane.width() - 46)
+                if ex.get('description_pending') and attempt < 60:  # check back until the description arrives
+                    QTimer.singleShot(3000, lambda: self.list.item() is item and self.load_details(item, media, picture, attempt + 1))
+        run_job(lambda s: index.read_excerpt(item['path'], segment_id=item.get('segment_id'), max_chars=2400), show,
+                lambda error: self.list.item() is item and self.excerpt.setPlainText(f'Preview unavailable: {error}'))
+
+    def set_title(self, name):
+        """The file name on at most two lines, broken at a natural point and elided in the middle;
+        the full name is in the tooltip."""
+        metrics, width = self.p_title.fontMetrics(), max(180, self.pane.width() - 24 - 22 - 56 - 14)
+        self.p_title.setToolTip(name)
+        self.p_title.setWordWrap(False)
+        if metrics.horizontalAdvance(name) <= width:
+            self.p_title.setText(name)
+            return
+        cut = len(name)
+        while cut > 1 and metrics.horizontalAdvance(name[:cut]) > width:
+            cut -= 1
+        breaks = [i + 1 for i in range(max(1, cut // 2), cut) if name[i] in ' -_.,']
+        cut = breaks[-1] if breaks else cut
+        self.p_title.setText(name[:cut].rstrip() + '\n' + metrics.elidedText(name[cut:].lstrip(), Qt.ElideMiddle, width))
 
     def activate(self):
         item = self.list.item()
@@ -1726,6 +1844,8 @@ class TrackedFolders(QWidget):
                 phase = state.get('phase')
                 if phase == 'scanning':
                     row.set_status('Looking for files…', 'accent')
+                elif phase == 'describing':
+                    row.set_status(f"Describing pictures {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
                 elif phase == 'reading video':
                     row.set_status(f"Reading video {state.get('frame', 0)}/{state.get('frames', 0)}", 'accent')
                 else:
@@ -1882,10 +2002,16 @@ class SettingsView(QWidget):
         g.row('Batch size', self.embed_batch, 'Lower it if the GPU runs out of memory')
         body.addWidget(g)
 
-        g = Group(win, 'IMAGES & VIDEOS', 'A local OCR model (RapidOCR) reads the text in photos, screenshots, scanned PDF pages and video frames, '
-                                          'so they become searchable. It runs on this PC and needs no internet.')
+        g = Group(win, 'IMAGES & VIDEOS', 'A local OCR model (RapidOCR) reads the text in photos, screenshots, scanned PDF pages and video frames. '
+                                          'A local vision model in Ollama describes what pictures show, so “kid on a bench in autumn” finds the photo. '
+                                          'Both run on this PC; descriptions are labelled as AI-written.')
         self.ocr_enabled = Toggle(pal)
         g.row('Read text in images and videos', self.ocr_enabled)
+        self.vision_enabled = Toggle(pal)
+        g.row('Describe images with AI', self.vision_enabled, 'A caption, description and tags for each picture and one frame of each video')
+        self.vision_model = QLineEdit()
+        self.vision_model.setMinimumWidth(220)
+        g.row('Vision model', self.vision_model, 'An Ollama vision model, e.g. gemma3:4b  ·  ollama pull gemma3:4b')
         self.video_interval = QSpinBox()
         self.video_interval.setRange(2, 120)
         self.video_interval.setSuffix(' s')
@@ -1939,7 +2065,7 @@ class SettingsView(QWidget):
         body.addStretch()
 
         self.save_timer = QTimer(self, singleShot=True, timeout=self.save)
-        for widget in (self.base_url, self.api_key, self.embed_model, self.embed_url, self.folder):
+        for widget in (self.base_url, self.api_key, self.embed_model, self.embed_url, self.vision_model, self.folder):
             widget.textEdited.connect(lambda _: self.save_timer.start(600))
         for widget in (self.provider, self.device, self.embed_device, self.theme, self.effort):
             widget.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
@@ -1947,7 +2073,7 @@ class SettingsView(QWidget):
         self.embed_batch.valueChanged.connect(lambda _: self.save_timer.start(600))
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
         self.keep_minutes.valueChanged.connect(lambda _: self.save_timer.start(600))
-        for toggle in (self.embed_enabled, self.ocr_enabled, self.reduce_motion, self.auto_index, self.autostart, self.web_search):
+        for toggle in (self.embed_enabled, self.ocr_enabled, self.vision_enabled, self.reduce_motion, self.auto_index, self.autostart, self.web_search):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
         self.loading = False
         guard_wheel(self)
@@ -1966,6 +2092,8 @@ class SettingsView(QWidget):
         self.embed_device.setCurrentIndex(1 if s.get('embed_device') == 'cpu' else 0)
         self.embed_batch.setValue(int(s.get('embed_batch') or 16))
         self.ocr_enabled.setChecked(bool(s.get('ocr_enabled', True)))
+        self.vision_enabled.setChecked(bool(s.get('vision_enabled', True)))
+        self.vision_model.setText(s.get('vision_model') or 'gemma3:4b')
         self.video_interval.setValue(int(s.get('video_interval') or 10))
         self.vault.setText(s.get('vault_path') or 'Not set')
         self.folder.setText(s.get('notes_folder') or 'Alfred')
@@ -2115,7 +2243,7 @@ class SettingsView(QWidget):
         except knowledge.VaultError as error:
             self.win.toast(str(error), 'red')
             return
-        before = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'))
+        before = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'))
         kind = ['none', 'ollama', 'openai', 'anthropic', 'claude_code'][self.provider.currentIndex()]
         before_model = (s.get('provider'), s.get('model'), s.get('claude_model'), s.get('claude_code_model'))
         if kind == 'claude_code':
@@ -2130,6 +2258,7 @@ class SettingsView(QWidget):
                   'embed_enabled': self.embed_enabled.isChecked(), 'embed_model': self.embed_model.text().strip(),
                   'embed_base_url': self.embed_url.text().strip(), 'embed_device': 'cpu' if self.embed_device.currentIndex() else 'auto',
                   'embed_batch': self.embed_batch.value(), 'ocr_enabled': self.ocr_enabled.isChecked(),
+                  'vision_enabled': self.vision_enabled.isChecked(), 'vision_model': self.vision_model.text().strip() or 'gemma3:4b',
                   'video_interval': self.video_interval.value(),
                   'notes_folder': self.folder.text().strip() or 'Alfred', 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
                   'reduce_motion': self.reduce_motion.isChecked(), 'auto_index': self.auto_index.isChecked(),
@@ -2143,7 +2272,7 @@ class SettingsView(QWidget):
         if (s.get('provider'), s.get('model'), s.get('claude_model'), s.get('claude_code_model')) != before_model:
             self.load_effort()
             self.provider_changed(save=False)
-        after = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'))
+        after = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'))
         if after != before:
             self.win.toast('Saved · updating your index', 'green', seconds=4)
             self.win.start_index(quiet=True)
@@ -2701,6 +2830,7 @@ class AlfredWindow(QWidget):
             total, done = state.get('total', 0), state.get('done', 0)
             self.progress = done / total if total else None
             phase = {'scanning': 'Looking for files', 'indexing': 'Reading', 'embedding': 'Learning meaning', 'reading video': 'Reading video',
+                     'describing': 'Describing pictures',
                      'done': 'Finishing'}.get(state.get('phase'), state.get('phase'))
             if not self.toasting:
                 where = f" · {html.escape(Path(state['current']).name)}" if state.get('current') else ''
@@ -2720,7 +2850,7 @@ class AlfredWindow(QWidget):
             self.indexing = False
             self.shimmer.stop()
             logging.getLogger('alfred').info('Indexed: %s', {k: summary.get(k) for k in ('found', 'indexed', 'removed', 'errors', 'unsupported',
-                                                                                        'embedded', 'seconds', 'warnings')})
+                                                                                        'embedded', 'described', 'seconds', 'warnings')})
             self.refresh_status()
             changed = summary['indexed'] + summary['removed'] + summary['errors']
             text = (f"Indexed {summary['indexed']} · {summary['unchanged']} unchanged · {summary['removed']} removed"
@@ -2758,7 +2888,10 @@ class AlfredWindow(QWidget):
                     embedder = None  # keyword search still works; meaning catches up on the next run
             if embedder is not None and not ai.ollama_running(embedder.base, 1.5):
                 embedder = None
-            return index.update(signals.progress.emit, embedder, force=force, roots=roots)
+            vision = ai.Vision.from_settings(settings)
+            if vision is not None and not ai.ollama_running(vision.base, 1.5):
+                vision = None  # described on a later run, once Ollama is up
+            return index.update(signals.progress.emit, embedder, force=force, roots=roots, vision=vision)
         run_job(work, done, failed, progress=progress)
 
     def after_index(self):

@@ -84,6 +84,7 @@ QPushButton#chip:hover {{ background: {fs}; border-color: {acc}; }}
 QPushButton#ghost {{ background: transparent; border: none; border-radius: 13px; padding: 0; }}
 QPushButton#ghost:hover {{ background: {fs}; }}
 QLabel#name {{ font-weight: 600; }}
+QLabel#tag {{ background: {fs}; border-radius: 9px; padding: 2px 9px; color: {s}; font-size: 8.5pt; }}
 QPushButton#source {{ background: {f}; border: 1px solid {sep}; border-radius: 9px; padding: 6px 10px; text-align: left; }}
 QPushButton#source:hover {{ background: {fs}; }}
 QPushButton#source[used="false"] {{ color: {s}; }}

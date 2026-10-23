@@ -391,6 +391,8 @@ def clock(seconds):
 
 
 def location_label(kind, loc):
+    if kind == 'vision' or loc.get('ai'):
+        return 'AI description' + (f' at {clock(loc["seconds"])}' if 'seconds' in loc else '')
     ocr_note = ' (text read from image)' if loc.get('ocr') else ''
     if 'seconds' in loc:
         return f'at {clock(loc["seconds"])}{ocr_note}'

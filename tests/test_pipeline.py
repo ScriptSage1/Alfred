@@ -283,6 +283,77 @@ class IndexTests(Base):
             self.index.resolve(str(outside))
 
 
+class FakeVision:
+    """Stands in for the Ollama vision model; records what it was asked to describe."""
+    model = 'fake-vision'
+
+    def __init__(self, name='v1'):
+        self.name, self.calls = name, []
+
+    def signature(self):
+        return f'fake:{self.name}'
+
+    def describe(self, image):
+        self.calls.append(image.size)
+        return {'caption': 'A child sits on a wooden park bench in autumn.',
+                'description': 'A small child in a dark sweater and jeans sits on a bench. Golden trees fill the background.',
+                'tags': ['child', 'bench', 'park', 'autumn', 'trees']}
+
+
+class VisionTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.settings['vision_enabled'] = True
+        from PIL import Image
+        Image.new('RGB', (640, 480), (200, 150, 60)).save(self.folder / 'IMG_1234.jpg')
+
+    def test_parse_cleans_model_json(self):
+        from alfred import ai
+        parsed = ai.Vision.parse('{"caption": " A dog  runs. ", "description": "On grass.", "tags": ["Dog", "dog", "#Grass", "", "x"]}')
+        self.assertEqual(parsed, {'caption': 'A dog runs.', 'description': 'On grass.', 'tags': ['dog', 'grass', 'x']})
+        with self.assertRaises(ai.ProviderError):
+            ai.Vision.parse('not json')
+
+    def test_description_is_indexed_once_and_searchable(self):
+        vision = FakeVision()
+        summary = self.index.update(embedder=FakeEmbedder(), vision=vision)
+        self.assertEqual((summary['described'], len(vision.calls)), (1, 1))
+        result = self.index.search('kid on a bench in autumn')[0]
+        self.assertEqual((result['filename'], result['location']), ('IMG_1234.jpg', 'AI description'))
+        excerpt = self.index.read_excerpt(result['path'])
+        self.assertEqual(excerpt['vision']['tags'], ['child', 'bench', 'park', 'autumn', 'trees'])
+        self.assertEqual(excerpt['vision']['model'], 'fake-vision')
+        self.assertFalse(excerpt['description_pending'])
+        self.index.update(vision=vision)
+        self.assertEqual(len(vision.calls), 1)  # cached: not described again
+
+    def test_changed_picture_or_new_model_is_described_again(self):
+        vision = FakeVision()
+        self.index.update(vision=vision)
+        time.sleep(0.02)
+        from PIL import Image
+        Image.new('RGB', (640, 480), (20, 50, 160)).save(self.folder / 'IMG_1234.jpg')
+        self.index.update(vision=vision)
+        self.assertEqual(len(vision.calls), 2)
+        other = FakeVision('v2')
+        self.index.update(vision=other)
+        self.assertEqual(len(other.calls), 1)
+        self.assertEqual(len([r for r in self.index.search('bench') if r['kind'] == 'vision']), 1)  # old one replaced
+
+    def test_unavailable_model_falls_back_quietly(self):
+        from alfred import ai
+
+        class Offline(FakeVision):
+            def describe(self, image):
+                raise ai.ProviderError('Cannot reach 127.0.0.1:11434: refused')
+        summary = self.index.update(vision=Offline())
+        self.assertEqual(summary['described'], 0)
+        self.assertTrue(any('paused' in w for w in summary['warnings']))
+        path = str(self.folder / 'IMG_1234.jpg')
+        self.assertTrue(self.index.read_excerpt(path)['description_pending'])
+        self.assertTrue(self.index.search('IMG_1234'))  # still findable by name
+
+
 class PathSafetyTests(unittest.TestCase):
     def test_refuses_drive_root_profile_and_system_folders(self):
         home = Path.home()

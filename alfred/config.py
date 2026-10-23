@@ -46,6 +46,11 @@ DEFAULTS = {
     # Text in images, scanned PDF pages and video frames, read by a local OCR model.
     'ocr_enabled': True,
     'video_interval': 10,        # seconds between sampled video frames
+    # Captions, descriptions and tags for pictures (and one frame per video) from a local Ollama vision model.
+    'vision_enabled': True,
+    'vision_model': 'gemma3:4b',
+    'vision_base_url': '',       # empty = the same Ollama as embeddings
+    'vision_device': 'auto',
     # Obsidian
     'vault_path': '',
     'notes_folder': 'Alfred',

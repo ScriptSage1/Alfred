@@ -137,11 +137,77 @@ class Embedder:
 
 
 class Vision:
-    """Image understanding now uses local OCR (alfred.ocr); no vision model is involved."""
+    """A local Ollama vision model (gemma3:4b by default) that describes pictures for search.
+
+    It answers in strict JSON (caption, description, tags); text in the picture is left to OCR.
+    """
+    PROMPT = ('You describe photos and pictures for a private, offline file search. Look at the image and answer in JSON with: '
+              '"caption": one short sentence saying what the picture shows; '
+              '"description": 2-3 plain sentences about the people (how many, what they are doing), objects, setting, season, '
+              'colours and mood; "tags": 3-8 short lowercase keywords (objects, setting, people count, season, colours). '
+              'Describe only what is visible. Do not guess names or identities, and do not transcribe text.')
+    SCHEMA = {'type': 'object', 'required': ['caption', 'description', 'tags'],
+              'properties': {'caption': {'type': 'string'}, 'description': {'type': 'string'},
+                             'tags': {'type': 'array', 'items': {'type': 'string'}}}}
+    MAX_SIDE = 896  # Gemma 3's vision encoder works at 896×896
+
+    def __init__(self, settings):
+        self.model = (settings.get('vision_model') or 'gemma3:4b').strip()
+        self.base = _ollama_base(settings.get('vision_base_url') or settings.get('embed_base_url'))
+        self.device = settings.get('vision_device', 'auto')
+        self.keep_alive = keep_alive(settings)
 
     @classmethod
     def from_settings(cls, settings):
-        return None
+        return cls(settings) if settings.get('vision_enabled') and settings.get('vision_model') else None
+
+    @property
+    def local(self):
+        return is_local_url(self.base)
+
+    def signature(self):
+        """Changes when stored descriptions should be redone (model or prompt)."""
+        return f'ollama:{self.model}:describe-v1'
+
+    @classmethod
+    def jpeg(cls, image):
+        """Base64 JPEG of a PIL image, bounded to MAX_SIDE."""
+        import base64
+        import io
+        picture = image.convert('RGB')
+        picture.thumbnail((cls.MAX_SIDE, cls.MAX_SIDE))
+        buffer = io.BytesIO()
+        picture.save(buffer, 'JPEG', quality=88)
+        return base64.b64encode(buffer.getvalue()).decode('ascii')
+
+    def describe(self, image):
+        """{'caption', 'description', 'tags'} for a PIL image; raises ProviderError."""
+        payload = {'model': self.model, 'prompt': self.PROMPT, 'images': [self.jpeg(image)], 'stream': False, 'format': self.SCHEMA,
+                   'keep_alive': self.keep_alive, 'options': dict(_options(self.device), temperature=0.2, num_predict=400)}
+        try:
+            result = _json(self.base + '/api/generate', payload, timeout=240)
+        except ProviderError as error:
+            if 'HTTP 404' in str(error):
+                raise ProviderError(f'The vision model “{self.model}” is not installed. Run: ollama pull {self.model}') from None
+            raise
+        return self.parse(result.get('response', ''))
+
+    @staticmethod
+    def parse(text):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            raise ProviderError('The vision model did not return a description') from None
+        clean = lambda value: ' '.join(str(value or '').split())
+        caption, description = clean(data.get('caption')), clean(data.get('description'))
+        tags = []
+        for tag in data.get('tags') or []:
+            tag = clean(tag).lower().strip('#.,')
+            if tag and tag not in tags and len(tag) <= 30:
+                tags.append(tag)
+        if not caption and not description:
+            raise ProviderError('The vision model returned an empty description')
+        return {'caption': caption or description.split('. ')[0], 'description': description, 'tags': tags[:8]}
 
 
 # ------------------------------------------------------------------ ollama
@@ -238,28 +304,31 @@ def detect_gpus():
 
 
 def diagnostics(settings, probe=False):
-    embedder = Embedder.from_settings(settings)
+    embedder, vision = Embedder.from_settings(settings), Vision.from_settings(settings)
     report = {'checked_at': time.strftime('%H:%M:%S'), 'gpu': detect_gpus(), 'chat': ChatProvider(settings).describe(),
-              'embeddings': {'enabled': embedder is not None}, 'vision': {'enabled': False}, 'errors': []}
-    if embedder is None:
+              'embeddings': {'enabled': embedder is not None}, 'vision': {'enabled': vision is not None}, 'errors': []}
+    models = [(key, model) for key, model in (('embeddings', embedder), ('vision', vision)) if model is not None]
+    if not models:
         return report
-    report['embeddings'].update(provider='ollama', model=embedder.model, location='local' if embedder.local else 'remote')
-    if probe:
+    for key, model in models:
+        report[key].update(provider='ollama', model=model.model, location='local' if model.local else 'remote')
+    if probe and embedder is not None:
         try:
             embedder.embed_query('diagnostic probe')
         except ProviderError as error:
             report['errors'].append(f'Embedding test failed: {error}')
-    runtime = ollama_runtime(embedder.base)
+    runtime = ollama_runtime(models[0][1].base)
     report['ollama'] = runtime
     if not runtime['running']:
         report['errors'].append(runtime['error'])
-    match = next((m for m in runtime['loaded'] if m['model'].split(':')[0] == embedder.model.split(':')[0]), None)
-    if match:
-        report['embeddings']['execution'] = f"{match['device']} — {match['vram_mib']} MiB of {match['size_mib']} MiB in VRAM (reported by Ollama)"
-        report['embeddings']['gpu_active'] = match['gpu_share_percent'] > 0
-    else:
-        report['embeddings']['execution'] = 'Model not loaded right now — run the test, then check again.'
-        report['embeddings']['gpu_active'] = None
+    for key, model in models:
+        match = next((m for m in runtime['loaded'] if m['model'].split(':')[0] == model.model.split(':')[0]), None)
+        if match:
+            report[key]['execution'] = f"{match['device']} — {match['vram_mib']} MiB of {match['size_mib']} MiB in VRAM (reported by Ollama)"
+            report[key]['gpu_active'] = match['gpu_share_percent'] > 0
+        else:
+            report[key]['execution'] = 'Not loaded right now (Ollama loads it when needed).'
+            report[key]['gpu_active'] = None
     return report
 
 
