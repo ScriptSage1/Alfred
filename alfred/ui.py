@@ -26,10 +26,11 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconPr
                                QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
                                QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, ai, chats, config, paths, rag, startup
+from . import APP_NAME, __version__, ai, chats, config, keys, paths, picker, providers, rag, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
-from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, blurred_backdrop, fallback_backdrop, icon, icon_pixmap, logo_pixmap,
+from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, blurred_backdrop, brand_pixmap, dot_pixmap, fallback_backdrop, icon, icon_pixmap,
+                     logo_pixmap,
                      paint_glass, paint_glow, paint_shadow, palette_for, sparkle_pixmap, stylesheet, HotkeyFilter)
 
 W, BAR, MAXH, M, R, FOOT = 780, 62, 600, 46, 26, 34
@@ -1007,10 +1008,12 @@ class Turn(QWidget):
         self.text = result['answer'] or self.text
         self.render()
         self.body.show()
-        model = result.get('provider', {}).get('model') or ''
+        info = result.get('provider', {})
+        model = info.get('name') or info.get('model') or ''
+        where = f"via {info['group']}" if info.get('cloud') else 'on this PC'
         used = result.get('used') or []
         if result.get('grounded'):
-            status = f"From {len(used)} source{'s' * (len(used) != 1)} in your files · {model} on this PC"
+            status = f"From {len(used)} source{'s' * (len(used) != 1)} in your files · {model} {where}"
         elif not result.get('citations'):
             status = f'Not found in your files · {model}'
         else:
@@ -1358,7 +1361,9 @@ class AskView(QWidget):
         self.scope_chip = button('', self.clear_scope, 'source', 'Ask about all your files again')
         self.scope_chip.hide()
         bar.addWidget(self.scope_chip)
-        self.model_pill = button('Choose a model', self.show_model_menu, 'pill', 'The chat model that writes answers (runs on this PC)')
+        self.model_pill = picker.ModelButton(win)
+        self.model_pill.clicked.connect(lambda: self.show_model_menu(self.model_pill))
+        self.popover = None
         bar.addWidget(self.model_pill)
         layout.addLayout(bar)
         body = QHBoxLayout()
@@ -1428,43 +1433,59 @@ class AskView(QWidget):
         if self.scope:
             self.win.search.setPlaceholderText(f'Ask about {Path(self.scope).name}…')
         settings = dict(self.win.settings)
-        run_job(lambda s: ai.available_models(settings), self.models_loaded)
+        run_job(lambda s: providers.catalog(settings), self.models_loaded)
 
     @property
     def saving(self):
         return bool(self.win.settings.get('save_chat_history', True))
 
-    def models_loaded(self, models):
-        self.models, self.models_known = models, True
+    def models_loaded(self, entries):
+        self.models, self.models_known = entries, True
         self.refresh_intro()
 
+    def chat_model(self):
+        """(provider, its description) for the model Ask Alfred will use."""
+        provider = providers.for_settings(self.win.settings)
+        info = provider.describe()
+        if provider.kind == 'claude_code':
+            info['name'] = dict(providers.CLAUDE_PLAN_MODELS).get(provider.model, provider.model)
+        elif provider.kind == 'anthropic':
+            info['name'] = dict(providers.CLAUDE_MODELS).get(provider.model, provider.model)
+        return provider, info
+
     def refresh_intro(self):
-        model = (self.win.settings.get('model') or '').strip()
-        installed = [m['model'] for m in self.models]
-        self.model_pill.setText(f'{model}  ▾' if model else 'Choose a model  ▾')
+        provider, info = self.chat_model()
+        chosen = info['configured']
+        name = info.get('name') or ''
+        self.model_pill.set_model(provider.kind if chosen else None, name if chosen else 'Choose a model', animate=self.isVisible())
+        where = 'runs on this PC' if not provider.cloud else f'answers {provider.via}'
         folders = self.win.settings.folders
-        if not model:
+        if not chosen:
+            local = next((e for e in self.models if e['kind'] == 'ollama'), None)
             self.intro_title.setText('Choose a model to chat with your files')
-            lead = 'Alfred answers from the folders you track, using a chat model that runs on this PC through Ollama.'
-            self.intro_text.setText(lead if installed or not self.models_known else f'{lead} Install one first, e.g.  ollama pull gemma3:4b')
+            lead = ('Use a model on this PC through Ollama, or Claude or ChatGPT with your subscription or an API key. '
+                    'Alfred answers from the folders you track.')
+            missing = self.models_known and local is not None and not local['models']
+            self.intro_text.setText(f'{lead} (No local chat models yet — e.g. ollama pull gemma3:4b)' if missing else lead)
             self.intro_button.setText('Choose a model')
             self.intro_button.show()
             self.suggestions.hide()
         elif not folders:
             self.intro_title.setText('Track a folder to chat with it')
-            self.intro_text.setText(f'{model} answers from the folders you track. Track one, like Downloads or Documents, to begin.')
+            self.intro_text.setText(f'{name} answers from the folders you track. Track one, like Downloads or Documents, to begin.')
             self.intro_button.setText('Track folder…')
             self.intro_button.show()
             self.suggestions.hide()
         else:
             names = ', '.join(f.name for f in folders[:3]) + (f' and {len(folders) - 3} more' if len(folders) > 3 else '')
             self.intro_title.setText('Ask anything about your files')
-            self.intro_text.setText(f'Answers come from {names}, with the sources they used. {model} runs on this PC.')
+            privacy = '' if not provider.cloud else ' Your files stay on this PC; only your questions and the passages found for them are sent.'
+            self.intro_text.setText(f'Answers come from {names}, with the sources they used. {name} {where}.{privacy}')
             self.intro_button.hide()
             self.suggestions.show()
 
     def intro_action(self):
-        if not (self.win.settings.get('model') or '').strip():
+        if not self.chat_model()[1]['configured']:
             self.show_model_menu()
         else:
             self.win.choose_folder()
@@ -1475,39 +1496,54 @@ class AskView(QWidget):
         self.title.setToolTip(title if self.chat else '')
 
     # ---------------------------------------------------------------- model
-    def show_model_menu(self):
+    def show_model_menu(self, anchor=None):
+        """Open the model picker under ``anchor`` (the model button here, or the one in Settings)."""
+        anchor = anchor or self.model_pill
+        if self.popover is not None:
+            return
         settings = dict(self.win.settings)
-        run_job(lambda s: (ai.available_models(settings), ai.effort_options(settings)), self._model_menu)
 
-    def _model_menu(self, value):
-        self.models, (efforts, _) = value
-        menu = QMenu(self)
-        current = self.win.settings.get('model') or ''
-        if not self.models:
-            empty = menu.addAction('No chat models installed — run: ollama pull gemma3:4b')
-            empty.setEnabled(False)
-        for model in self.models:
-            extra = '  ·  reads images' if model['vision'] else ''
-            action = menu.addAction(f"{model['model']}   {model['size_gb']} GB{extra}", lambda m=model['model']: self.choose_model(m))
-            action.setCheckable(True)
-            action.setChecked(model['model'] == current)
-        if efforts:
-            menu.addSeparator()
-            thinking = menu.addMenu('Thinking')
-            for value, text in efforts:
-                action = thinking.addAction(text, lambda v=value, t=text: self.choose_effort(v, t))
-                action.setCheckable(True)
-                action.setChecked(value == self.win.settings.get('effort'))
-        menu.addSeparator()
-        menu.addAction('AI settings…', lambda: self.win.set_mode(SETTINGS))
-        menu.exec(self.model_pill.mapToGlobal(QPoint(self.model_pill.width() - menu.sizeHint().width(), self.model_pill.height() + 4)))
+        def opened(value):
+            entries, (efforts, _) = value
+            self.models, self.models_known = entries, True
+            current = (settings.get('provider') or 'ollama', settings.get('model') or '')
+            items = picker.model_items(entries, current, efforts, settings.get('effort'))
+            self.popover = popover = picker.Popover(self.win, items)
+            popover.chosen.connect(self.picked)
+            popover.closed.connect(lambda: (anchor.set_open(False), setattr(self, 'popover', None)))
+            anchor.set_open(True)
+            popover.open_at(anchor)
+        run_job(lambda s: (picker.catalog_with_details(settings), providers.for_settings(settings).effort_options()), opened)
 
-    def choose_model(self, model):
-        self.win.settings['model'] = model
-        self.win.settings.save()
+    def picked(self, item):
+        if item.get('action') == 'settings':
+            self.win.set_mode(SETTINGS)
+        elif item.get('action') == 'effort':
+            self.choose_effort(item['value'], item['title'])
+        else:
+            self.choose_model(item['kind'], item['model'], item.get('cloud', False))
+        if self.win.mode == SETTINGS:
+            self.win.settings_view.load_models()
+            self.win.settings_view.load_effort()
+
+    def choose_model(self, kind, model, cloud=False):
+        settings = self.win.settings
+        if cloud and kind not in (settings.get('cloud_ok') or []):
+            group = providers.GROUPS[kind]
+            answer = QMessageBox.question(self, f'Use {group}?',
+                                          f'Answers will come from {group}, so your questions — and, once Alfred answers from your documents, '
+                                          'the few passages it finds for each question — are sent to that service. '
+                                          'Your files themselves stay on this PC, and indexing and search stay local.',
+                                          QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+            if answer != QMessageBox.Ok:
+                return
+            settings['cloud_ok'] = list(settings.get('cloud_ok') or []) + [kind]
+        settings.update(provider=kind, model=model)
+        settings.save()
         self.refresh_intro()
         self.win.refresh_status()
-        self.win.toast(f'Chatting with {model} on this PC', 'green', seconds=3)
+        provider, info = self.chat_model()
+        self.win.toast(f"Chatting with {info.get('name')} {provider.via}", 'green', seconds=3)
 
     def choose_effort(self, value, text):
         self.win.settings['effort'] = value
@@ -1608,12 +1644,13 @@ class AskView(QWidget):
 
     def record(self, question, scope, reply):
         """Add one exchange to the current chat and save it (when chat history is on)."""
-        model = self.win.settings.get('model') or ''
+        provider, info = self.chat_model()
+        model = info.get('name') or provider.model
         if self.chat is None:
             self.chat = chats.ChatStore.new_chat(question, model)
-        self.chat['model'] = model
+        self.chat.update(model=model, provider=provider.kind)
         self.chat['messages'] += [{'role': 'user', 'content': question, 'time': time.time(), 'scope': scope},
-                                  dict(reply, role='assistant', time=time.time(), model=model)]
+                                  dict(reply, role='assistant', time=time.time(), model=model, provider=provider.kind)]
         self.show_title()
         if not self.saving:
             return
@@ -1701,6 +1738,17 @@ class Group(QFrame):
         if note:
             self.outer.addWidget(label(note, 'caption', wrap=True))
         self.count = 0
+
+    def add(self, widget):
+        """Add a custom row (with the hairline above it, like row())."""
+        if self.count:
+            line = QFrame()
+            line.setFixedHeight(1)
+            line.setObjectName('hairline')
+            self.rows.addWidget(line)
+        self.count += 1
+        self.rows.addWidget(widget)
+        return widget
 
     def row(self, title, widget=None, caption=None):
         line = None
@@ -2072,18 +2120,42 @@ class SettingsView(QWidget):
         self.index_info = label('', 'caption', wrap=True, selectable=True)
         body.addWidget(self.index_info)
 
-        g = Group(win, 'AI MODEL', 'Ask Alfred uses a chat model that runs in Ollama on this PC, so your questions and files never leave it.')
-        self.model = QComboBox()
-        self.model.setMinimumWidth(260)
-        self.model.setToolTip('Installed Ollama models that can chat')
+        g = Group(win, 'AI MODEL', 'Indexing, OCR, picture descriptions and search always run on this PC. Only the chat model can be in the cloud.')
+        self.model = picker.ModelButton(win, compact=False)
+        self.model.setMinimumWidth(300)
+        self.model.clicked.connect(lambda: self.win.ask_view.show_model_menu(self.model))
         models = QHBoxLayout()
         models.addWidget(self.model)
-        models.addWidget(button('', self.refresh_models, None, 'Refresh the list of installed models', icon('refresh', 14, QColor(140, 140, 150))))
-        g.row('Chat model', models, 'Get more with ollama pull, e.g. ollama pull llama3.2')
+        models.addWidget(button('', self.refresh_models, None, 'Check accounts and refresh the model list', icon('refresh', 14, QColor(140, 140, 150))))
+        g.row('Chat model', models, 'Also in the model button at the top of Ask Alfred')
         self.effort = QComboBox()
-        self.effort.setMinimumWidth(260)
+        self.effort.setMinimumWidth(300)
         self.effort_note = label('', 'caption', wrap=True)
         self.effort_row = g.row('Thinking', self.effort)
+        self.location = label('', 'caption', wrap=True)
+        g.outer.addWidget(self.location)
+        g.outer.addWidget(self.effort_note)
+        body.addWidget(g)
+
+        g = Group(win, 'ACCOUNTS', 'Use Claude or ChatGPT with your subscription (through their official command-line tools, which you sign in to '
+                                   'yourself) or with an API key. Keys are kept in Windows Credential Manager, never in Alfred’s files.')
+        self.account_status, self.account_dot, self.account_button = {}, {}, {}
+        rows = [('claude_code', 'Claude', 'Your Pro or Max plan', 'Sign in…'), ('codex', 'ChatGPT', 'Your Plus or Pro plan', 'Sign in…'),
+                ('anthropic', 'Claude API', 'Pay as you go with an API key', 'Add key…'),
+                ('openai', 'OpenAI API', 'Pay as you go with an API key', 'Add key…')]
+        for kind, title, plan, action in rows:
+            g.add(self.account_row(kind, title, plan, action))
+        g.add(self.account_row('compatible', 'Custom server', 'Any OpenAI-compatible API: OpenRouter, Groq, LM Studio, llama.cpp…', 'Key…'))
+        self.compatible_url = QLineEdit()
+        self.compatible_url.setPlaceholderText('Server address, e.g. https://openrouter.ai/api/v1 or http://localhost:1234/v1')
+        holder = QWidget()
+        line = QHBoxLayout(holder)
+        line.setContentsMargins(36, 0, 0, 9)
+        line.addWidget(self.compatible_url)
+        g.rows.addWidget(holder)
+        body.addWidget(g)
+
+        g = Group(win, 'OLLAMA', 'Runs local models: chat models you pick, plus the search and picture models.')
         self.device = QComboBox()
         self.device.addItems(['Auto (GPU when available)', 'CPU only'])
         self.device.setMinimumWidth(260)
@@ -2097,7 +2169,6 @@ class SettingsView(QWidget):
         self.keep_minutes.setRange(5, 240)
         self.keep_minutes.setSuffix(' min')
         g.row('Keep models loaded', self.keep_minutes, 'After the last use; then Ollama unloads them and frees GPU memory')
-        g.outer.addWidget(self.effort_note)
         body.addWidget(g)
 
         g = Group(win, 'CHATS', 'Chats are saved as files on this PC, so you can reopen them from the history panel (Ctrl+H) in Ask Alfred. '
@@ -2183,9 +2254,9 @@ class SettingsView(QWidget):
         body.addStretch()
 
         self.save_timer = QTimer(self, singleShot=True, timeout=self.save)
-        for widget in (self.base_url, self.embed_model, self.embed_url, self.vision_model):
+        for widget in (self.base_url, self.embed_model, self.embed_url, self.vision_model, self.compatible_url):
             widget.textEdited.connect(lambda _: self.save_timer.start(600))
-        for widget in (self.model, self.device, self.embed_device, self.theme, self.effort):
+        for widget in (self.device, self.embed_device, self.theme, self.effort):
             widget.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
         self.embed_batch.valueChanged.connect(lambda _: self.save_timer.start(600))
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
@@ -2201,6 +2272,7 @@ class SettingsView(QWidget):
         for widget in self.findChildren(QWidget):
             widget.blockSignals(True)
         self.base_url.setText(s.get('base_url') or ai.OLLAMA_DEFAULT)
+        self.compatible_url.setText(s.get('compatible_base_url') or '')
         self.device.setCurrentIndex(1 if s.get('device') == 'cpu' else 0)
         self.embed_enabled.setChecked(bool(s.get('embed_enabled')))
         self.embed_model.setText(s.get('embed_model') or '')
@@ -2235,33 +2307,147 @@ class SettingsView(QWidget):
                                 + ''.join(f"\n{p['status']}: {p['path']} — {p['error']}" for p in self.win.index.problems(6)))
 
     def load_models(self, announce=False):
-        """Fill the chat-model list with installed Ollama models; keep the current choice."""
+        """Check every account and show the current chat model."""
+        settings = dict(self.win.settings)
+        if announce:
+            providers.forget_status()
+
+        def done(entries):
+            provider, info = self.win.ask_view.chat_model()
+            chosen = info['configured']
+            self.model.set_model(provider.kind if chosen else None,
+                                 f"{info.get('name')} · {picker.SUBTITLES.get(provider.kind, 'On this PC')}" if chosen else 'Choose a model',
+                                 animate=self.isVisible())
+            self.show_accounts(entries)
+            self.show_location()
+            if announce:
+                ready = sum(len(e['models']) for e in entries)
+                self.win.toast(f'{ready} chat model{"s" * (ready != 1)} ready', 'green' if ready else 'orange', seconds=4)
+        run_job(lambda s: providers.catalog(settings), done)
+
+    def account_row(self, kind, title, plan, action):
+        """Logo, name (with an Experimental badge for subscriptions), a drawn status dot and text, and the action."""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 9, 0, 9)
+        layout.setSpacing(12)
+        art = QLabel()
+        art.setFixedSize(24, 24)
+        art.setPixmap(brand_pixmap(picker.LOGOS[kind], 24, self.win.pal['text']))
+        art.kind = kind
+        self.account_logos = getattr(self, 'account_logos', []) + [art]
+        layout.addWidget(art)
+        texts = QVBoxLayout()
+        texts.setSpacing(1)
+        top = QHBoxLayout()
+        top.setSpacing(7)
+        top.addWidget(label(title, 'name'))
+        if kind in picker.EXPERIMENTAL:
+            badge = label('Experimental', 'badge')
+            badge.setToolTip('Uses the provider’s official command-line tool with your subscription; it can change when they update it')
+            top.addWidget(badge)
+        top.addStretch()
+        texts.addLayout(top)
+        status = QHBoxLayout()
+        status.setSpacing(6)
+        dot = QLabel()
+        dot.setFixedSize(8, 8)
+        dot.hide()
+        status.addWidget(dot)
+        text = label(plan, 'caption')
+        text.plan = plan
+        status.addWidget(text)
+        status.addStretch()
+        texts.addLayout(status)
+        layout.addLayout(texts, 1)
+        act = button(action, lambda _=False, k=kind: self.account_action(k))
+        layout.addWidget(act, 0, Qt.AlignVCenter)
+        self.account_status[kind], self.account_dot[kind], self.account_button[kind] = text, dot, act
+        return row
+
+    def show_accounts(self, entries):
+        for art in getattr(self, 'account_logos', []):  # re-tint for the current theme
+            art.setPixmap(brand_pixmap(picker.LOGOS[art.kind], 24, self.win.pal['text']))
+        for entry in entries:
+            kind, state = entry['kind'], entry['status']['state']
+            if kind == 'ollama':
+                continue
+            color = {'ready': 'green', 'signed_out': 'orange', 'unreachable': 'red'}.get(state)
+            dot = self.account_dot[kind]
+            dot.setVisible(color is not None)
+            if color:
+                dot.setPixmap(dot_pixmap(self.win.pal[color], 8))
+            detail = entry['status']['detail'] or ''
+            if state in ('no_key', 'missing'):
+                note = {'missing': 'not installed', 'no_key': 'no address yet' if kind == 'compatible' else 'no key yet'}[state]
+                detail = f"{self.account_status[kind].plan} · {note}"
+            self.account_status[kind].setText(detail)
+            if kind in ('claude_code', 'codex'):
+                self.account_button[kind].setText({'ready': 'Re-check', 'missing': 'How to install'}.get(state, 'Sign in…'))
+            elif kind in ('anthropic', 'openai'):
+                self.account_button[kind].setText('Remove key' if state == 'ready' else 'Add key…')
+            else:
+                self.account_button[kind].setText('Remove key' if keys.has('compatible') else 'Key…')
+
+    def show_location(self):
+        provider = providers.for_settings(self.win.settings)
+        if not provider.describe()['configured']:
+            self.location.setText('Choose a chat model to use Ask Alfred.')
+        elif provider.cloud:
+            self.location.setText(f'Answers come {provider.via}: your questions (and the passages Alfred finds for them) are sent there. '
+                                  'Your files stay on this PC.')
+        else:
+            self.location.setText('Answers are written on this PC — nothing leaves it.')
+
+    def account_action(self, kind):
+        provider = providers.for_settings(self.win.settings, kind, '')
+        names = {'anthropic': ('Claude API key', 'Paste your Anthropic API key (from console.anthropic.com).'),
+                 'openai': ('OpenAI API key', 'Paste your OpenAI API key (from platform.openai.com).'),
+                 'compatible': ('Custom server key', 'Paste the API key for your custom server (leave empty if it needs none).')}
+        if kind in ('claude_code', 'codex'):
+            state = provider.status()['state']
+            if state == 'missing':
+                self.win.toast(provider.install_hint, 'orange', seconds=10)
+            elif state == 'ready':
+                self.load_models(announce=True)
+            else:
+                try:
+                    provider.sign_in()
+                    self.win.toast('Finish signing in in the window that opened, then press Re-check', 'green', seconds=10)
+                except ai.ProviderError as error:
+                    self.win.toast(str(error), 'red', seconds=8)
+            return
+        if keys.has(kind) and self.account_button[kind].text() == 'Remove key':
+            keys.delete(kind)
+            self.win.toast('Key removed from Windows Credential Manager', 'green')
+            self.load_models()
+            return
+        title, prompt = names[kind]
+        from PySide6.QtWidgets import QInputDialog
+        value, ok = QInputDialog.getText(self, title, prompt + '\nIt’s stored in Windows Credential Manager.', QLineEdit.Password)
+        if not ok or not value.strip():
+            return
+        try:
+            keys.put(kind, value)
+        except RuntimeError as error:
+            self.win.toast(str(error), 'red', seconds=8)
+            return
         settings = dict(self.win.settings)
 
-        def done(models):
-            current = settings.get('model') or ''
-            self.model.blockSignals(True)
-            self.model.clear()
-            self.model.addItem('Choose a model…' if models else 'No chat models installed', '')
-            for model in models:
-                note = ' · reads images' if model['vision'] else ''
-                self.model.addItem(f"{model['model']}  ({model['size_gb']} GB{note})", model['model'])
-            if current and self.model.findData(current) < 0:
-                self.model.addItem(f'{current}  (not installed)', current)
-            self.model.setCurrentIndex(max(0, self.model.findData(current)))
-            self.model.blockSignals(False)
-            if announce:
-                self.win.toast(f'{len(models)} chat model{"s" * (len(models) != 1)} installed' if models else
-                               'No chat models found — install one with: ollama pull gemma3:4b', 'green' if models else 'orange', seconds=5)
-        run_job(lambda s: ai.available_models(settings), done)
+        def checked(models):
+            self.win.toast(f'Key saved · {len(models)} models available' if models else 'Key saved, but no models came back — check the key',
+                           'green' if models else 'orange', seconds=6)
+            self.load_models()
+        run_job(lambda s: providers.for_settings(settings, kind, '').models(), checked)
 
     def load_effort(self):
         settings = dict(self.win.settings)
+
         def show(value):
             fill_effort(self.effort, self.effort_note, value[0], value[1], settings.get('effort'))
             for widget in (self.effort_row, self.effort_row.hairline):
                 widget.setVisible(bool(value[0]))  # only for models that can think
-        run_job(lambda s: ai.effort_options(settings), show)
+        run_job(lambda s: providers.for_settings(settings).effort_options(), show)
 
     def show_chats_info(self):
         store = self.win.ask_view.store
@@ -2361,8 +2547,8 @@ class SettingsView(QWidget):
             return
         s = self.win.settings
         before = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'))
-        before_model = s.get('model')
-        s.update(model=self.model.currentData() or '', base_url=self.base_url.text().strip() or ai.OLLAMA_DEFAULT)
+        before_model = (s.get('provider'), s.get('model'))
+        s.update(base_url=self.base_url.text().strip() or ai.OLLAMA_DEFAULT, compatible_base_url=self.compatible_url.text().strip())
         if self.effort.isEnabled() and self.effort.currentData() is not None:
             s['effort'] = self.effort.currentData()
         s.update({'device': 'cpu' if self.device.currentIndex() else 'auto',
@@ -2380,8 +2566,9 @@ class SettingsView(QWidget):
         self.win.apply_theme()
         self.win.refresh_status()
         self.win.ask_view.chats_changed()
-        if s.get('model') != before_model:
+        if (s.get('provider'), s.get('model')) != before_model:
             self.load_effort()
+            self.show_location()
         after = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'))
         if after != before:
             self.win.toast('Saved · updating your index', 'green', seconds=4)

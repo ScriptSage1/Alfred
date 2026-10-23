@@ -15,9 +15,12 @@ DEFAULTS = {
     # Folders Alfred indexes and watches (absolute paths), added under Settings → Tracked folders.
     'tracked_folders': [],
     'auto_index': True,          # watch tracked folders and index new/changed files automatically
-    # Chat (Ask Alfred): a model running in Ollama on this PC. Empty until you choose one.
+    # Chat (Ask Alfred): which provider writes answers (see alfred.providers) and its model. Empty until you choose.
+    'provider': 'ollama',        # ollama | claude_code | codex | anthropic | openai | compatible
     'model': '',
-    'base_url': 'http://127.0.0.1:11434',
+    'compatible_base_url': '',   # an OpenAI-compatible server, e.g. https://openrouter.ai/api/v1
+    'cloud_ok': [],              # cloud providers whose privacy notice you've accepted
+    'base_url': 'http://127.0.0.1:11434',  # Ollama
     'device': 'auto',            # 'auto' (GPU when available) | 'cpu'
     'effort': 'off',             # thinking, for models that support it: off | on (gpt-oss: low | medium | high)
     'temperature': 0.2,

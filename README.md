@@ -57,9 +57,23 @@ reciprocal-rank fusion.
 
 ## Ask Alfred and chat history
 
-Ask Alfred (Ctrl+2 or Tab) chats with a model that runs in Ollama on your PC — pick any installed
-chat model from the model button at the top right (e.g. `gemma3:4b`, `llama3.2`). Answers from your
-documents are the next feature; until then Ask Alfred says so.
+Ask Alfred (Ctrl+2 or Tab) can use any of these — pick one from the model button at the top right,
+or under **Settings → AI model**:
+
+| Provider | How it connects | Set up |
+|---|---|---|
+| On this PC (Ollama) | local models, e.g. `gemma3:4b`, `llama3.2` | `ollama pull <model>` |
+| Claude · your Pro/Max plan | the Claude Code CLI (bundled with the Claude desktop app, or `npm i -g @anthropic-ai/claude-code`) | Settings → Accounts → Sign in |
+| ChatGPT · your Plus/Pro plan | the Codex CLI (bundled with the Codex app, or `npm i -g @openai/codex`) | Settings → Accounts → Sign in |
+| Claude API / OpenAI API | the providers' APIs | Settings → Accounts → Add key |
+| Custom server | any OpenAI-compatible API (OpenRouter, Groq, LM Studio, llama.cpp …) | Settings → Accounts → address (+ key) |
+
+The CLIs are run locked down: print mode, every tool off, no MCP servers or project settings, an empty
+working folder. API keys are stored in Windows Credential Manager, never in Alfred's files. Indexing,
+OCR, picture descriptions and search always stay on your PC; with a cloud model only your questions
+(and, once Alfred answers from your documents, the passages found for them) are sent — Alfred asks
+once per provider before it does. Answers from your documents are the next feature; until then Ask
+Alfred says so.
 
 Chats are saved as one JSON file each in `%LOCALAPPDATA%\Alfred\Chats` (change the folder, open it,
 or delete all chats under **Settings → Chats**). The history panel (Ctrl+H) lists them by day; hover a

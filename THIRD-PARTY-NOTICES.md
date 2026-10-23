@@ -26,3 +26,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Provider logos
+
+`alfred/assets/logos/` holds the Claude, Anthropic, OpenAI and Ollama marks as SVGs from
+[Simple Icons](https://simpleicons.org) (simple-icons 13.21.0, CC0 1.0). The logos are trademarks of their
+respective owners and are used only to identify which provider answers in Alfred; no endorsement is implied.

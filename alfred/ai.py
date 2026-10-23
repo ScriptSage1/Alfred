@@ -1,7 +1,7 @@
 """Local models through Ollama: EmbeddingGemma 2 embeddings for semantic search,
 plus starting Ollama and reporting which device it runs on.
 
-Chat (Ask Alfred) also runs in Ollama: ChatProvider streams answers from a local model.
+Chat providers (Ollama, Claude, ChatGPT, APIs) live in alfred.providers.
 """
 import json
 import os
@@ -360,81 +360,7 @@ def available_models(settings):
     return sorted(models, key=lambda m: m['model'])
 
 
-def effort_options(settings):
-    """[(value, label)] thinking choices the selected chat model supports, plus a short explanation."""
-    chat = ChatProvider(settings)
-    if not chat.configured:
-        return [], 'Choose a chat model first.'
-    if 'thinking' not in model_capabilities(chat.base, chat.model):
-        return [], f'{chat.model} answers directly (it has no thinking mode).'
-    if 'gpt-oss' in chat.model:
-        return [('low', 'Low'), ('medium', 'Medium'), ('high', 'High')], 'How long the model thinks before answering.'
-    return [('off', 'Off'), ('on', 'On')], 'Thinking first gives better answers to hard questions, but takes longer.'
-
-
-class ChatProvider:
-    """A chat model running in Ollama on this PC (the only kind Alfred uses for now)."""
-
-    def __init__(self, settings):
-        self.settings = settings
-        self.kind = 'ollama'
-        self.model = (settings.get('model') or '').strip().removesuffix(':latest')
-        self.base = _ollama_base(settings.get('base_url'))
-        self.device = settings.get('device', 'auto')
-        self.effort = (settings.get('effort') or 'off').lower()
-        self.temperature = settings.get('temperature', 0.2)
-        self.keep_alive = keep_alive(settings)
-
-    @property
-    def configured(self):
-        return bool(self.model)
-
-    @property
-    def local(self):
-        return is_local_url(self.base)
-
-    def describe(self):
-        if not self.configured:
-            return {'configured': False, 'provider': 'ollama', 'model': '', 'summary': 'No chat model chosen'}
-        where = 'on this PC' if self.local else f'at {urlparse(self.base).netloc}'
-        return {'configured': True, 'provider': 'ollama', 'model': self.model, 'name': self.model, 'location': 'local' if self.local else 'remote',
-                'host': urlparse(self.base).netloc, 'effort': self.effort, 'summary': f'{self.model} · {where}'}
-
-    def require(self):
-        if not self.configured:
-            raise NotConfigured('Choose a chat model first (the model button at the top of Ask Alfred, or Settings → AI model).')
-
-    def list_models(self):
-        return [m['model'] for m in available_models(self.settings)]
-
-    def stream(self, messages, on_token=lambda t: None, cancel=None, on_status=lambda text: None):
-        """Stream a chat answer from Ollama; returns the full text. Raises ProviderError."""
-        self.require()
-        payload = {'model': self.model, 'messages': messages, 'stream': True, 'keep_alive': self.keep_alive,
-                   'options': dict(_options(self.device), temperature=self.temperature)}
-        if 'thinking' in model_capabilities(self.base, self.model):
-            payload['think'] = self.effort if 'gpt-oss' in self.model else self.effort != 'off'
-        request = urllib.request.Request(self.base + '/api/chat', data=json.dumps(payload).encode(),
-                                         headers={'Content-Type': 'application/json'})
-        parts = []
-        try:
-            with urllib.request.urlopen(request, timeout=300) as response:
-                for raw in response:
-                    if cancel is not None and cancel.is_set():
-                        break
-                    event = json.loads(raw.decode('utf-8', 'replace') or '{}')
-                    if event.get('error'):
-                        raise ProviderError(event['error'])
-                    message = event.get('message') or {}
-                    if message.get('thinking') and not parts:
-                        on_status('Thinking…')
-                    if message.get('content'):
-                        parts.append(message['content'])
-                        on_token(message['content'])
-                    if event.get('done'):
-                        break
-        except urllib.error.HTTPError as error:
-            raise ProviderError(f'HTTP {error.code}: {error.read().decode("utf-8", "replace")[:300]}') from None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
-            raise ProviderError(f'Cannot reach Ollama: {getattr(error, "reason", error)}') from None
-        return ''.join(parts)
+def ChatProvider(settings):
+    """The chat provider chosen in settings (see alfred.providers)."""
+    from .providers import for_settings
+    return for_settings(settings)

@@ -6,3 +6,4 @@ PyMuPDF>=1.26                 # PDF text and page images
 rapidocr>=3.10,<4             # local OCR models (bundled, no download)
 onnxruntime>=1.23             # runs the OCR models on the CPU
 imageio-ffmpeg>=0.6,<1        # ffmpeg for reading video frames
+keyring>=25                   # API keys in Windows Credential Manager

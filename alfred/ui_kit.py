@@ -84,6 +84,7 @@ QPushButton#chip:hover {{ background: {fs}; border-color: {acc}; }}
 QPushButton#ghost {{ background: transparent; border: none; border-radius: 13px; padding: 0; }}
 QPushButton#ghost:hover {{ background: {fs}; }}
 QLabel#name {{ font-weight: 600; }}
+QLabel#badge {{ background: {fs}; border-radius: 7px; padding: 1px 7px; color: {s}; font-size: 7.5pt; font-weight: 600; }}
 QLabel#bubble {{ background: {rgba(p['accent'], .20)}; border-radius: 14px; padding: 8px 13px; font-size: 10.5pt; }}
 QPushButton#pill {{ background: {f}; border: 1px solid {sep}; border-radius: 14px; padding: 5px 13px; }}
 QPushButton#pill:hover {{ background: {fs}; }}
@@ -248,6 +249,9 @@ SVG = {
     'close': '<path d="M6 6l12 12M18 6L6 18" stroke="C" stroke-width="2.4" stroke-linecap="round"/>',
     'sidebar': '<rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="C" stroke-width="1.9"/><path d="M9 5.5v13" stroke="C" stroke-width="1.9"/>',
     'pencil': '<path d="M5 19l1-4L16 5l3 3L9 18Z" fill="none" stroke="C" stroke-width="2" stroke-linejoin="round"/>',
+    'server': '<rect x="4" y="4" width="16" height="6.5" rx="2" fill="none" stroke="C" stroke-width="1.9"/><rect x="4" y="13.5" width="16" height="6.5" rx="2" fill="none" stroke="C" stroke-width="1.9"/><circle cx="8" cy="7.25" r="1.2" fill="C"/><circle cx="8" cy="16.75" r="1.2" fill="C"/>',
+    'check': '<path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="C" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>',
+    'chevron_down': '<path d="M6 9l6 6 6-6" fill="none" stroke="C" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>',
     'plus': '<path d="M12 5v14M5 12h14" stroke="C" stroke-width="2.2" stroke-linecap="round"/>',
     'note': '<path d="M6 3h8l5 5v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" fill="C"/><path d="M8.5 12h7M8.5 15.5h7" stroke="#000" stroke-opacity=".35" stroke-width="1.5" stroke-linecap="round"/>',
 }
@@ -274,6 +278,68 @@ def icon_pixmap(name, size, color, dpr=2.0):
 
 def icon(name, size, color, dpr=2.0):
     return QIcon(icon_pixmap(name, size, color, dpr))
+
+
+# --------------------------------------------------------------------- logos
+LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'logos')
+# Brand colours that stay as they are; every other mark is tinted to the theme's text colour.
+BRAND_COLOURS = {'claude': '#D97757'}
+_logo_cache = {}
+
+
+def screen_dpr():
+    """Render scale for crisp vector art: at least 2x, and the real screen ratio on high-DPI displays."""
+    from PySide6.QtGui import QGuiApplication
+    screen = QGuiApplication.primaryScreen()
+    return max(2.0, math.ceil((screen.devicePixelRatio() if screen else 1.0) * 2) / 2 + 0.5)
+
+
+def brand_pixmap(name, size, color, dpr=None):
+    """A provider logo from assets/logos/<name>.svg, drawn from its vector at the screen's resolution
+    (never scaled from a bitmap). Falls back to a neutral server glyph when the file is missing."""
+    dpr = dpr or screen_dpr()
+    key = (name, size, color.rgba(), dpr)
+    if key in _logo_cache:
+        return _logo_cache[key]
+    path = os.path.join(LOGO_DIR, f'{name}.svg')
+    renderer = QSvgRenderer(path) if os.path.isfile(path) else None
+    if renderer is None or not renderer.isValid():
+        _logo_cache[key] = icon_pixmap('server', size, color, dpr)
+        return _logo_cache[key]
+    side = int(round(size * dpr))
+    image = QImage(side, side, QImage.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+    box = renderer.viewBoxF()
+    scale = side / max(box.width(), box.height(), 1)
+    w, h = box.width() * scale, box.height() * scale
+    renderer.render(painter, QRectF((side - w) / 2, (side - h) / 2, w, h))
+    tint = QColor(BRAND_COLOURS.get(name) or color)
+    painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    painter.fillRect(image.rect(), tint)
+    painter.end()
+    pixmap = QPixmap.fromImage(image)
+    pixmap.setDevicePixelRatio(dpr)
+    _logo_cache[key] = pixmap
+    return pixmap
+
+
+def dot_pixmap(color, size=8, dpr=None):
+    """A small status dot, drawn (not a text character)."""
+    dpr = dpr or screen_dpr()
+    side = int(round(size * dpr))
+    image = QImage(side, side, QImage.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(color)
+    painter.drawEllipse(QRectF(0.5, 0.5, side - 1, side - 1))
+    painter.end()
+    pixmap = QPixmap.fromImage(image)
+    pixmap.setDevicePixelRatio(dpr)
+    return pixmap
 
 
 def sparkle_pixmap(size, dpr=2.0):
