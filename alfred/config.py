@@ -27,6 +27,13 @@ DEFAULTS = {
     'top_k': 6,
     'ollama_autostart': True,    # start Ollama (headless) and warm the search model when Alfred starts
     'keep_alive_minutes': 5,
+    'ollama_context': 10240,     # tokens a local chat model reads at once (passages + chat so far + answer)
+    # Answers from your files (alfred.rag).
+    'answer_beyond_files': True, # the model may add general knowledge, clearly labelled, after what your files say
+    'rerank_enabled': True,      # reorder candidate passages with the local reranker once it's downloaded
+    'rerank_model': 'bge-reranker-v2-m3',
+    'contextual_chunks': False,  # a local model writes a line of context for every passage while indexing (slow, better recall)
+    'context_model': '',         # empty = the vision model (gemma3:4b)
     # Chat history: one JSON file per chat. Empty folder = %LOCALAPPDATA%\Alfred\Chats.
     'save_chat_history': True,
     'chats_folder': '',

@@ -2,8 +2,10 @@
 PySide6-Essentials>=6.10,<7   # the UI
 Pillow>=12,<13                # images
 numpy>=2,<3                   # vector search
-PyMuPDF>=1.26                 # PDF text and page images
+PyMuPDF>=1.26,<2              # PDF text and page images
 rapidocr>=3.10,<4             # local OCR models (bundled, no download)
-onnxruntime>=1.23             # runs the OCR models on the CPU
+onnxruntime-directml>=1.23; sys_platform == 'win32'  # runs OCR and the reranker (the reranker on the GPU, via DirectML)
+onnxruntime>=1.23; sys_platform != 'win32'
 imageio-ffmpeg>=0.6,<1        # ffmpeg for reading video frames
 keyring>=25                   # API keys in Windows Credential Manager
+tokenizers>=0.20              # reads text for the local reranker (bge-reranker-v2-m3)

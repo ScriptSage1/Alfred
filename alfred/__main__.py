@@ -27,11 +27,13 @@ def main(argv=None):
     from .ui import send_command
     reply = send_command({'cmd': COMMANDS[command], 'arg': arg})
     if reply is None:
-        print('Alfred is not running. Start it first (Alfred.cmd).', file=sys.stderr)
+        print('Alfred is not running. Start it first (from the Start menu).', file=sys.stderr)
         return 1
     print(json.dumps(reply, indent=2, ensure_ascii=False))
     return 0 if not (isinstance(reply, dict) and reply.get('error')) else 1
 
 
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()  # a frozen Alfred.exe started as a PDF-table worker runs the worker, not Alfred
     sys.exit(main())

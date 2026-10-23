@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from . import REPO
+from .console import hidden
 
 NAME = 'Alfred.lnk'
 # Windows identifies Alfred's notifications by this ID; register_app() gives it the name "Alfred".
@@ -73,10 +74,19 @@ def sandboxed():
 
 
 def relaunch_outside():
-    """Ask Windows Explorer to start Alfred (Explorer runs it outside any package). True on success."""
-    target = Path(sys.executable) if FROZEN else REPO / 'Alfred.cmd'
-    if not target.is_file():
-        return False
+    """Ask Windows Explorer to start Alfred. True on success.
+
+    It has to be Explorer: a process started from inside a packaged app inherits that app's package identity, and with
+    it the redirected AppData, however it is started; Explorer starts programs outside any package. Explorer opens the
+    Start menu shortcut (pythonw, so no console window), or Alfred.exe for a frozen build."""
+    if FROZEN:
+        target = Path(sys.executable)
+    else:
+        try:
+            target = add_to_start_menu()
+        except (OSError, subprocess.SubprocessError) as error:
+            logging.getLogger('alfred').warning('Could not create the Start menu shortcut to restart through: %s', error)
+            return False
     try:
         subprocess.Popen(['explorer.exe', str(target)], close_fds=True)
         logging.getLogger('alfred').info('Started from a redirected (packaged) context; relaunched through Explorer')
@@ -125,16 +135,17 @@ def pythonw():
     return candidate if candidate.is_file() else Path(sys.executable)
 
 
-def command():
-    """(target, arguments) the shortcut launches."""
+def command(at_sign_in=True):
+    """(target, arguments) a shortcut launches: at sign-in Alfred starts hidden in the tray, otherwise it opens."""
+    flag = ' --startup' if at_sign_in else ''
     if FROZEN:
-        return Path(sys.executable), '--startup'
-    return pythonw(), '-m alfred --startup'
+        return Path(sys.executable), flag.strip()
+    return pythonw(), '-m alfred' + flag
 
 
 def _powershell(script):
     return subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', script], capture_output=True, text=True,
-                          timeout=30, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                          timeout=30, **hidden())
 
 
 def _quote(value):
@@ -151,18 +162,40 @@ def enabled(folder=None):
     return bool(target) and Path(target).resolve() == command()[0].resolve() and Path(workdir or '.').resolve() == REPO.resolve()
 
 
-def enable(folder=None):
-    folder = Path(folder or startup_folder())
-    folder.mkdir(parents=True, exist_ok=True)
-    link = folder / NAME
-    target, arguments = command()
+def _shortcut(link, target, arguments, description):
     script = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{_quote(link)}');"
               f"$s.TargetPath='{_quote(target)}'; $s.Arguments='{arguments}'; $s.WorkingDirectory='{_quote(REPO)}';"
               f"$s.IconLocation='{_quote(ASSETS / 'alfred.ico')},0';"
-              "$s.WindowStyle=7; $s.Description='Alfred (starts hidden in the tray)'; $s.Save()")
+              f"$s.WindowStyle=7; $s.Description='{_quote(description)}'; $s.Save()")
     out = _powershell(script)
     if out.returncode or not link.is_file():
-        raise OSError(f'Could not create the Startup shortcut: {(out.stderr or out.stdout).strip()[:200]}')
+        raise OSError(f'Could not create the shortcut {link.name}: {(out.stderr or out.stdout).strip()[:200]}')
+    return link
+
+
+def enable(folder=None):
+    folder = Path(folder or startup_folder())
+    folder.mkdir(parents=True, exist_ok=True)
+    target, arguments = command()
+    return _shortcut(folder / NAME, target, arguments, 'Alfred (starts hidden in the tray)')
+
+
+def start_menu_folder():
+    return Path(os.environ.get('APPDATA', str(Path.home()))) / 'Microsoft' / 'Windows' / 'Start Menu' / 'Programs'
+
+
+def add_to_start_menu():
+    """The Start menu shortcut that opens Alfred (the venv's pythonw, so no console window). Returns its path."""
+    folder = start_menu_folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    target, arguments = command(at_sign_in=False)
+    return _shortcut(folder / NAME, target, arguments, 'Alfred')
+
+
+def install(settings):
+    """Setup-Alfred.cmd: add Alfred to the Start menu, and to sign-in unless the user turned that off."""
+    link = add_to_start_menu()
+    first_run(settings)
     return link
 
 

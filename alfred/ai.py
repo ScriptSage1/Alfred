@@ -13,8 +13,9 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .console import hidden
+
 OLLAMA_DEFAULT = 'http://127.0.0.1:11434'
-NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
 class ProviderError(RuntimeError):
@@ -205,6 +206,40 @@ class Vision:
         return {'caption': caption or description.split('. ')[0], 'description': description, 'tags': tags[:8]}
 
 
+class Contextualizer:
+    """Optional "contextual retrieval": a local Ollama model (the vision model, gemma3:4b, by default)
+    writes one or two sentences situating a passage within its document, so a passage like
+    "Revenue grew 3%" is found as "ACME's Q2 2026 report: revenue grew 3%". Off unless turned on."""
+    PROMPT = ('<document title="{title}">\n{document}\n</document>\n\nHere is a passage from this document:\n<passage>\n{passage}\n</passage>\n\n'
+              'Write one or two short sentences that situate this passage within the document (what the document is, and which '
+              'part, topic, person, date or project the passage is about), to improve search retrieval of the passage. '
+              'Answer with only those sentences.')
+
+    def __init__(self, settings):
+        self.model = (settings.get('context_model') or settings.get('vision_model') or 'gemma3:4b').strip()
+        self.base = _ollama_base(settings.get('vision_base_url') or settings.get('embed_base_url'))
+        self.device = settings.get('vision_device', 'auto')
+        self.keep_alive = keep_alive(settings)
+
+    @classmethod
+    def from_settings(cls, settings):
+        return cls(settings) if settings.get('contextual_chunks') else None
+
+    def signature(self):
+        return f'ollama:{self.model}:context-v1'
+
+    def situate(self, title, document, passage):
+        payload = {'model': self.model, 'prompt': self.PROMPT.format(title=title, document=document[:12000], passage=passage[:3000]),
+                   'stream': False, 'keep_alive': self.keep_alive, 'options': dict(_options(self.device), temperature=0.0, num_predict=90)}
+        try:
+            result = _json(self.base + '/api/generate', payload, timeout=180)
+        except ProviderError as error:
+            if 'HTTP 404' in str(error):
+                raise ProviderError(f'The model “{self.model}” is not installed. Run: ollama pull {self.model}') from None
+            raise
+        return ' '.join((result.get('response') or '').split())[:400]
+
+
 # ------------------------------------------------------------------ ollama
 def find_ollama():
     found = shutil.which('ollama')
@@ -234,13 +269,15 @@ def ensure_ollama(base=OLLAMA_DEFAULT, wait=25.0):
     exe = find_ollama()
     if not exe:
         raise ProviderError('Ollama is not installed (https://ollama.com) — searching by keyword only.')
-    # Detached and windowless; the server keeps running after Alfred closes.
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+    # In its own process group, so it keeps running after Alfred closes. It gets a console without a window rather than
+    # no console at all (DETACHED_PROCESS): the model runners Ollama starts for each model share that hidden console,
+    # where without one every runner opened a console window of its own.
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
     env = dict(os.environ, OLLAMA_HOST=urlparse(base).netloc or '127.0.0.1:11434')
     started = time.time()
     try:
         subprocess.Popen([exe, 'serve'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         creationflags=flags, close_fds=True, env=env)
+                         close_fds=True, env=env, **hidden(flags))
     except OSError as error:
         raise ProviderError(f'Could not start Ollama: {error}') from None
     while time.time() - started < wait:
@@ -288,7 +325,7 @@ def detect_gpus():
         return {'available': False, 'gpus': [], 'note': 'no NVIDIA driver found (nvidia-smi missing)'}
     try:
         out = subprocess.run([exe, '--query-gpu=name,memory.total,memory.used,driver_version', '--format=csv,noheader,nounits'],
-                             capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW)
+                             capture_output=True, text=True, timeout=10, **hidden())
         gpus = []
         for line in out.stdout.strip().splitlines():
             name, total, used, driver = [part.strip() for part in line.split(',')]

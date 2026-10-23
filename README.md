@@ -11,15 +11,16 @@ text inside images and videos — by keyword and by meaning. Everything runs on 
 2. For search by meaning and picture descriptions, install [Ollama](https://ollama.com) and run
    `ollama pull embeddinggemma-2` and `ollama pull gemma3:4b`.
    Without it, keyword search still works.
-3. Double-click `Setup-Alfred.cmd`. It creates `.venv`, installs the requirements and starts Alfred.
+3. Double-click `Setup-Alfred.cmd`. It creates `.venv`, installs the requirements, adds Alfred to the Start menu
+   and starts it.
 
-On its first launch Alfred adds itself to your Windows Startup folder, so from then on it starts
+Setup (or Alfred's first launch) also adds Alfred to your Windows Startup folder, so from then on it starts
 hidden in the tray when you sign in (and starts Ollama in the background). No administrator rights
 are needed. Turn this off or back on under **Settings → Start Alfred when you sign in**; once you
 turn it off, Alfred leaves it off.
 
-Start Alfred by hand any time with `Alfred.cmd` (or `python -m alfred`). Starting it again while it
-runs just opens the panel.
+Start Alfred by hand any time from the Start menu (or with `.venv\Scripts\pythonw.exe -m alfred`). Starting it again
+while it runs just opens the panel.
 
 ## Tracking folders
 

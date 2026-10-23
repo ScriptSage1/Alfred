@@ -229,7 +229,7 @@ class Popover(QWidget):
             p.drawRoundedRect(QRectF(PAD, self.hy.value, self.WIDTH - 2 * PAD, self.hh.value), 9, 9)
         title_font, small = QFont(self.font()), QFont(self.font())
         title_font.setPointSizeF(10)
-        small.setPointSizeF(8.5)
+        small.setPointSizeF(9)
         header_font = QFont(small)
         header_font.setWeight(QFont.DemiBold)
         header_font.setCapitalization(QFont.AllUppercase)

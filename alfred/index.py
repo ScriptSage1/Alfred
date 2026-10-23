@@ -7,7 +7,12 @@
   dot product; vectors are cached per passage and rebuilt when the model changes.
 * Hybrid: reciprocal-rank fusion of both lists. Keyword search keeps working
   when Ollama is unavailable.
+* Enriched passages: both searches see each passage with a short header in front
+  (file, folder, slide title / sheet columns / section heading, place), and,
+  when turned on, a sentence or two of AI-written context situating it in its
+  document (Anthropic's "contextual retrieval"); the stored text stays as read.
 """
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +32,10 @@ log = logging.getLogger('alfred')
 RRF_K = 60
 DESCRIBE_EMBED_EVERY = 25  # embed new AI descriptions in batches while describing a large folder
 SEMANTIC_BAND = 0.06  # meaning matches must be this close to the best one (EmbeddingGemma cosine)
+ENRICH_VERSION = 'header-v1'  # bump when chunk headers change: search text is rebuilt and passages re-embedded
+PDF_READER = 'tables-v1'  # bump when PDF tables are read differently: every PDF's tables are read again
+REREAD_FOR_ENRICH = {'.docx', '.pptx', '.xlsx', '.md', '.markdown', '.txt'}  # their headings/titles are read since header-v1
+CONTEXT_KINDS = ('text', 'page', 'slide', 'sheet', 'ocr', 'video')
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, root TEXT, mtime_ns INTEGER, size INTEGER, status TEXT, error TEXT,
                                  passages INTEGER, indexed_at REAL);
@@ -37,6 +46,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(text, name, tokenize='unicode6
 CREATE TABLE IF NOT EXISTS vectors(segment_id INTEGER PRIMARY KEY, dim INTEGER, vector BLOB);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS descriptions(path TEXT PRIMARY KEY, signature TEXT, status TEXT, error TEXT, seconds REAL, described_at REAL);
+CREATE TABLE IF NOT EXISTS contexts(key TEXT PRIMARY KEY, signature TEXT, context TEXT);
+CREATE TABLE IF NOT EXISTS pdf_tables(path TEXT PRIMARY KEY, reader TEXT);
 '''
 
 
@@ -55,6 +66,16 @@ def connect(db_path):
 def name_terms(path):
     """File name words for the FTS name column: 'Q3_budget-final.xlsx' → 'Q3 budget final xlsx'."""
     return ' '.join(re.split(r'[\W_]+', Path(path).name))
+
+
+def context_key(path, text):
+    """Cache key of a passage's AI context: the same passage of the same file keeps it across re-reads."""
+    return hashlib.sha1(f'{path}\n{text}'.encode('utf-8', 'replace')).hexdigest()
+
+
+def enriched(header, context, text):
+    """What keyword and meaning search see for a passage."""
+    return '\n'.join(part for part in (header, context, text) if part)
 
 
 def discover(root):
@@ -120,6 +141,50 @@ class Index:
         rel = Path(path).parent.relative_to(root) if paths.is_within(root, Path(path).parent) else Path()
         return ' › '.join([root.name] + list(rel.parts))
 
+    # ------------------------------------------------------------ enrichment
+    def header(self, path, kind, loc):
+        return extract.chunk_header(path, self.display_folder(path), kind, loc)
+
+    def context_signature(self):
+        """Signature of the AI chunk contexts in use, or None when that setting is off."""
+        writer = ai.Contextualizer.from_settings(self.settings)
+        return writer.signature() if writer else None
+
+    def search_signature(self):
+        return f'{ENRICH_VERSION}|context:{self.context_signature() or "off"}'
+
+    @staticmethod
+    def vector_signature(embedder):
+        return f'{embedder.signature()}|{ENRICH_VERSION}'
+
+    def _context(self, con, path, text, signature):
+        if not signature:
+            return ''
+        row = con.execute('SELECT context FROM contexts WHERE key=? AND signature=?', (context_key(path, text), signature)).fetchone()
+        return row[0] if row else ''
+
+    def _search_text(self, con, path, kind, text, loc, signature):
+        if kind == 'file':
+            return text
+        return enriched(self.header(path, kind, loc), self._context(con, path, text, signature), text)
+
+    def _refresh_search_text(self, con):
+        """Rewrite what search sees for every passage (after the header format or the context setting
+        changed); passages whose search text changed lose their vector and are embedded again."""
+        signature = self.context_signature()
+        changed = 0
+        rows = list(con.execute('SELECT s.id, s.path, s.kind, s.text, s.location, f.text FROM segments s JOIN fts f ON f.rowid = s.id'))
+        with con:
+            for segment_id, path, kind, text, location, old in rows:
+                new = self._search_text(con, path, kind, text, json.loads(location or '{}'), signature)
+                if new != old:
+                    con.execute('UPDATE fts SET text=? WHERE rowid=?', (new, segment_id))
+                    con.execute('DELETE FROM vectors WHERE segment_id=?', (segment_id,))
+                    changed += 1
+            if changed:
+                con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('vectors_version', str(time.time())))
+        return changed
+
     # ---------------------------------------------------------------- status
     def status(self):
         con = connect(self.db_path)
@@ -137,7 +202,17 @@ class Index:
                 'files': counts.get('ok', 0), 'errors': counts.get('error', 0), 'unsupported': counts.get('unsupported', 0),
                 'segments': segments, 'vectors': vectors, 'last_indexed': meta.get('last_indexed'),
                 'described': described, 'describe_seconds': round(describe_seconds or 0, 2),
-                'embed_model': meta.get('embed_signature')}
+                'embed_model': meta.get('embed_signature'), 'contexts': self._context_count()}
+
+    def _context_count(self):
+        signature = self.context_signature()
+        if not signature:
+            return 0
+        con = connect(self.db_path)
+        try:
+            return con.execute('SELECT count(*) FROM contexts WHERE signature=?', (signature,)).fetchone()[0]
+        finally:
+            con.close()
 
     def folder_stats(self):
         """{root: {'files': searchable, 'skipped': unsupported or failed}} for each tracked folder."""
@@ -225,6 +300,8 @@ class Index:
         signature = f'ocr:{ocr_on}|video:{interval}'
         meta = dict(con.execute('SELECT key,value FROM meta'))
         reread_media = meta.get('media_signature') != signature
+        search_signature = self.search_signature()
+        reread_documents = (meta.get('search_signature') or '').split('|')[0] != ENRICH_VERSION
         roots = [r for r in tracked if only is None or any(paths.canonical(r) == paths.canonical(o) for o in only)]
         for root in roots:
             if self.cancel.is_set():
@@ -235,11 +312,12 @@ class Index:
             progress({'phase': 'scanning', 'done': 0, 'total': 0, 'root': str(root)})
             found = list(discover(root))
             known = {p: (m, s) for p, m, s in con.execute('SELECT path,mtime_ns,size FROM files WHERE root=?', (str(root),))}
-            if reread_media:
-                for p in list(known):
-                    suffix = Path(p).suffix.lower()
-                    if suffix in IMAGE_SUFFIXES or suffix in VIDEO_SUFFIXES or suffix == '.pdf':
-                        known[p] = None
+            for p in list(known):
+                suffix = Path(p).suffix.lower()
+                if reread_media and (suffix in IMAGE_SUFFIXES or suffix in VIDEO_SUFFIXES or suffix == '.pdf'):
+                    known[p] = None
+                if reread_documents and suffix in REREAD_FOR_ENRICH:
+                    known[p] = None  # read again for the headings and titles the chunk headers use
             present = {p for p, _ in found}
             removed = [p for p in known if p not in present]
             self._delete_files(con, removed)
@@ -259,23 +337,62 @@ class Index:
                 frame_progress = lambda done, total, state=state: progress(dict(state, phase='reading video', frame=done, frames=total))
                 self._index_file(con, root, path, st, ocr_on, interval, frame_progress, summary)
             progress({'phase': 'indexing', 'done': len(todo), 'total': len(todo), 'root': str(root)})
+        if meta.get('search_signature') != search_signature and not self.cancel.is_set():
+            self._refresh_search_text(con)
         if embedder is not None and not self.cancel.is_set():
             summary['embedded'] = self._embed_missing(con, embedder, progress, summary)
+        # PDFs are searchable by now (their text was read quickly); their tables are read row by row last.
+        if not self.cancel.is_set() and self._read_pdf_tables(con, ocr_on, progress, summary) and embedder is not None:
+            summary['embedded'] += self._embed_missing(con, embedder, progress, summary)
         if vision is not None and not self.cancel.is_set():
-            # Slowest step last, so files are searchable (by text and meaning) before pictures are described.
+            # Slowest steps last, so files are searchable (by text and meaning) before pictures are described.
             self._describe_missing(con, vision, embedder, progress, summary)
+        writer = ai.Contextualizer.from_settings(self.settings)
+        if writer is not None and not self.cancel.is_set():
+            self._contextualize_missing(con, writer, embedder, progress, summary)
         with con:
             con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('last_indexed', time.strftime('%Y-%m-%d %H:%M')))
             if not self.cancel.is_set():
                 con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('media_signature', signature))
+                if only is None or not reread_documents:  # documents of every folder were read with the new headers
+                    con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('search_signature', search_signature))
         summary['seconds'] = round(time.time() - started, 2)
         progress({'phase': 'done', 'done': 1, 'total': 1})
         return summary
 
-    def _index_file(self, con, root, path, st, ocr_on, interval, frame_progress, summary):
+    def _read_pdf_tables(self, con, ocr_on, progress, summary):
+        """Read the tables of PDFs indexed with the quick reader (or an older table reader). True if any changed."""
+        tracked = {str(r) for r in self.roots()}
+        todo = [(path, root) for path, root in con.execute(
+            "SELECT f.path, f.root FROM files f LEFT JOIN pdf_tables t ON t.path = f.path WHERE f.status='ok' "
+            "AND lower(f.path) LIKE '%.pdf' AND (t.reader IS NULL OR t.reader != ?)", (PDF_READER,)) if root in tracked]
+        changed = False
+        for number, (path, root) in enumerate(todo):
+            if self.cancel.is_set():
+                break
+            progress({'phase': 'reading tables', 'done': number, 'total': len(todo), 'current': path, 'root': root})
+            try:
+                import pymupdf
+                with pymupdf.open(path) as document:
+                    has_tables = bool(extract.table_pages(document))
+                st = os.stat(path)
+            except Exception as error:  # gone, locked or unreadable now: left for the next update to try again
+                log.warning('Could not read the tables of %s: %s', path, error)
+                continue
+            if has_tables:
+                before = {k: summary[k] for k in ('indexed', 'errors', 'unsupported')}
+                self._index_file(con, Path(root), path, st, ocr_on, 10, None, summary, pdf_tables=True)
+                summary.update(before)  # the same file again: not counted twice
+                changed = True
+            else:
+                with con:
+                    con.execute('INSERT OR REPLACE INTO pdf_tables VALUES(?,?)', (path, PDF_READER))
+        return changed
+
+    def _index_file(self, con, root, path, st, ocr_on, interval, frame_progress, summary, pdf_tables=False):
         status, error, passages = 'ok', '', []
         try:
-            passages = extract.extract(path, ocr_on, interval, frame_progress, self.cancel)
+            passages = extract.extract(path, ocr_on, interval, frame_progress, self.cancel, pdf_tables=pdf_tables)
             if not passages and Path(path).suffix.lower() in IMAGE_SUFFIXES | VIDEO_SUFFIXES:
                 # A photo or video without text is normal: keep it findable by its name.
                 passages = [('file', Path(path).stem, {'name_only': True})]
@@ -287,14 +404,27 @@ class Index:
             status, error = 'error', (str(exc) or type(exc).__name__)[:300]
             log.warning('Could not index %s: %s', path, error)
         with con:
+            # Passages that read the same as before keep their vectors: an edited file (or one read again by a
+            # newer reader) only re-embeds what changed.
+            kept = {text: (dim, vector) for text, dim, vector in con.execute(
+                'SELECT f.text, v.dim, v.vector FROM segments s JOIN fts f ON f.rowid = s.id '
+                'JOIN vectors v ON v.segment_id = s.id WHERE s.path=?', (path,))}
             self._delete_passages(con, [path])
             name = name_terms(path)
+            context_signature = self.context_signature()
             for order, (kind, text, loc) in enumerate(passages):
                 cursor = con.execute('INSERT INTO segments(path,ord,kind,text,location) VALUES(?,?,?,?,?)',
                                      (path, order, kind, text, json.dumps(loc)))
-                con.execute('INSERT INTO fts(rowid,text,name) VALUES(?,?,?)', (cursor.lastrowid, text, name))
+                search_text = self._search_text(con, path, kind, text, loc, context_signature)
+                con.execute('INSERT INTO fts(rowid,text,name) VALUES(?,?,?)', (cursor.lastrowid, search_text, name))
+                if search_text in kept:
+                    con.execute('INSERT OR REPLACE INTO vectors VALUES(?,?,?)', (cursor.lastrowid, *kept[search_text]))
             con.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?)',
                         (path, str(root), st.st_mtime_ns, st.st_size, status, error, len(passages), time.time()))
+            if pdf_tables:
+                con.execute('INSERT OR REPLACE INTO pdf_tables VALUES(?,?)', (path, PDF_READER))
+            else:
+                con.execute('DELETE FROM pdf_tables WHERE path=?', (path,))
         summary['indexed' if status == 'ok' else 'errors' if status == 'error' else 'unsupported'] += 1
 
     def remove_root(self, root):
@@ -326,6 +456,7 @@ class Index:
                 con.execute(f'DELETE FROM vectors WHERE segment_id IN ({marks})', batch)
             con.execute('DELETE FROM segments WHERE path=?', (path,))
             con.execute('DELETE FROM descriptions WHERE path=?', (path,))
+            con.execute('DELETE FROM pdf_tables WHERE path=?', (path,))
         con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('vectors_version', str(time.time())))
 
     def _describe_missing(self, con, vision, embedder, progress, summary):
@@ -368,7 +499,8 @@ class Index:
                     con.execute('DELETE FROM segments WHERE id=?', (old,))
                 cursor = con.execute('INSERT INTO segments(path,ord,kind,text,location) VALUES(?,?,?,?,?)',
                                      (path, -1, 'vision', text, json.dumps(location)))
-                con.execute('INSERT INTO fts(rowid,text,name) VALUES(?,?,?)', (cursor.lastrowid, text, name_terms(path)))
+                con.execute('INSERT INTO fts(rowid,text,name) VALUES(?,?,?)',
+                            (cursor.lastrowid, self._search_text(con, path, 'vision', text, location, None), name_terms(path)))
             self._record_description(con, path, signature, 'ok', '', time.time() - began)
             summary['described'] += 1
             pending_embeds += 1
@@ -411,14 +543,15 @@ class Index:
 
     def _embed_missing(self, con, embedder, progress, summary):
         """Embed passages that have no vector yet, in batches; re-embed everything after a model change."""
-        signature = embedder.signature()
+        signature = self.vector_signature(embedder)
         meta = dict(con.execute('SELECT key,value FROM meta'))
         if meta.get('embed_signature') != signature:
             with con:
                 con.execute('DELETE FROM vectors')
                 con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('embed_signature', signature))
-        rows = list(con.execute('SELECT s.id, s.path, s.text FROM segments s LEFT JOIN vectors v ON v.segment_id=s.id '
-                                'WHERE v.segment_id IS NULL'))
+        # Embed what keyword search sees too: the passage with its header (and AI context, when on).
+        rows = list(con.execute('SELECT s.id, s.path, f.text FROM segments s JOIN fts f ON f.rowid = s.id '
+                                'LEFT JOIN vectors v ON v.segment_id=s.id WHERE v.segment_id IS NULL'))
         done = 0
         for start in range(0, len(rows), embedder.batch):
             if self.cancel.is_set():
@@ -439,6 +572,106 @@ class Index:
             done += len(batch)
         return done
 
+    def _contextualize_missing(self, con, writer, embedder, progress, summary):
+        """Write a sentence or two situating each passage in its document (contextual retrieval), once
+        per passage text and model; the context joins the passage's search text and it is re-embedded."""
+        signature = writer.signature()
+        tracked = {str(r) for r in self.roots()}
+        marks = ','.join('?' * len(CONTEXT_KINDS))
+        rows = list(con.execute(f"SELECT s.id, s.path, s.ord, s.kind, s.text, s.location FROM segments s JOIN files f ON f.path = s.path "
+                                f"WHERE f.status='ok' AND s.kind IN ({marks}) ORDER BY s.path, s.ord", CONTEXT_KINDS))
+        known = {key for (key,) in con.execute('SELECT key FROM contexts WHERE signature=?', (signature,))}
+        todo = [row for row in rows if context_key(row[1], row[4]) not in known and self.root_of(row[1]) is not None
+                and str(self.root_of(row[1])) in tracked]
+        documents, pending = {}, 0
+        for number, (segment_id, path, order, kind, text, location) in enumerate(todo):
+            if self.cancel.is_set():
+                break
+            progress({'phase': 'adding context', 'done': number, 'total': len(todo), 'current': path})
+            if path not in documents:
+                documents[path] = [(o, t) for o, t in con.execute('SELECT ord, text FROM segments WHERE path=? AND ord >= 0 ORDER BY ord', (path,))]
+            try:
+                context = writer.situate(Path(path).name, _document_window(documents[path], order), text)
+            except ai.ProviderError as error:
+                summary['warnings'].append(f'Passage context paused: {error}')
+                break
+            loc = json.loads(location or '{}')
+            with con:
+                con.execute('INSERT OR REPLACE INTO contexts VALUES(?,?,?)', (context_key(path, text), signature, context))
+                con.execute('UPDATE fts SET text=? WHERE rowid=?', (enriched(self.header(path, kind, loc), context, text), segment_id))
+                con.execute('DELETE FROM vectors WHERE segment_id=?', (segment_id,))
+                con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('vectors_version', str(time.time())))
+            summary['contextualized'] = summary.get('contextualized', 0) + 1
+            pending += 1
+            if embedder is not None and pending >= DESCRIBE_EMBED_EVERY:
+                summary['embedded'] += self._embed_missing(con, embedder, lambda state: None, summary)
+                pending = 0
+        if embedder is not None and pending:
+            summary['embedded'] += self._embed_missing(con, embedder, lambda state: None, summary)
+
+    # ------------------------------------------------------------- retrieval
+    def retrieve(self, query, embedder=None, pool=40, keep=30, path=None, band=0.12):
+        """Candidate passages for answering ``query``: keyword (BM25) and meaning matches, ``pool`` of
+        each, fused by reciprocal rank to the best ``keep``. No per-file limit; file-name-only entries
+        are left out. Each: {'segment_id', 'path', 'ord', 'kind', 'text', 'loc', 'header', 'score', ...}."""
+        query = (query or '').strip()
+        if not query:
+            return []
+        con = connect(self.db_path)
+        try:
+            scope = self._scope_ids(con, path) if path else None  # a one-file chat searches only that file
+            keyword = self._keyword(con, query, pool, scope)
+            semantic, _ = self._semantic(con, query, pool, embedder, band, scope)
+            fused = {}
+            for channel, ranked in (('keyword', keyword), ('semantic', semantic)):
+                for rank, (segment_id, raw) in enumerate(ranked):
+                    item = fused.setdefault(segment_id, {'score': 0.0})
+                    item['score'] += 1.0 / (RRF_K + rank + 1)
+                    item[channel + '_rank'] = rank + 1
+                    item[channel + '_score'] = float(raw)
+            roots = self.roots()
+            found = []
+            for segment_id, info in sorted(fused.items(), key=lambda kv: -kv[1]['score']):
+                row = con.execute("SELECT s.path, s.ord, s.kind, s.text, s.location FROM segments s JOIN files f ON f.path = s.path "
+                                  "WHERE s.id=? AND f.status='ok'", (segment_id,)).fetchone()
+                if not row or row[2] == 'file':
+                    continue
+                file, order, kind, text, location = row
+                if path and paths.canonical(file) != paths.canonical(path):
+                    continue
+                if not any(paths.is_within(root, file) for root in roots):
+                    continue
+                loc = json.loads(location or '{}')
+                found.append(dict(info, segment_id=segment_id, path=file, ord=order, kind=kind, text=text, loc=loc,
+                                  header=self.header(file, kind, loc)))
+                if len(found) >= keep:
+                    break
+            return found
+        finally:
+            con.close()
+
+    def neighbours(self, path, order, radius=1):
+        """Passages next to passage ``order`` of ``path`` (same file, readable text only), in order."""
+        con = connect(self.db_path)
+        try:
+            rows = con.execute("SELECT id, ord, kind, text, location FROM segments WHERE path=? AND ord BETWEEN ? AND ? "
+                               "AND kind NOT IN ('vision', 'file') ORDER BY ord", (str(path), order - radius, order + radius)).fetchall()
+        finally:
+            con.close()
+        return [{'segment_id': sid, 'ord': o, 'kind': kind, 'text': text, 'loc': json.loads(loc or '{}')} for sid, o, kind, text, loc in rows]
+
+    def vectors_for(self, segment_ids):
+        """{segment_id: unit vector} for the passages that have one (for diversity among answers' sources)."""
+        con = connect(self.db_path)
+        try:
+            ids, matrix = self._matrix(con)
+        finally:
+            con.close()
+        if matrix is None or not len(ids):
+            return {}
+        where = {int(sid): number for number, sid in enumerate(ids)}
+        return {sid: matrix[where[sid]] for sid in segment_ids if sid in where}
+
     # ---------------------------------------------------------------- search
     def search(self, query, limit=10, mode='hybrid', embedder=None, per_file=2, path=None):
         """Ranked results across all tracked folders."""
@@ -449,10 +682,11 @@ class Index:
         con = connect(self.db_path)
         try:
             pool = max(limit * 4, 40)
-            keyword = self._keyword(con, query, pool) if mode in ('hybrid', 'keyword') else []
+            scope = self._scope_ids(con, path) if path else None
+            keyword = self._keyword(con, query, pool, scope) if mode in ('hybrid', 'keyword') else []
             semantic, note = ([], None)
             if mode in ('hybrid', 'semantic'):
-                semantic, note = self._semantic(con, query, pool, embedder)
+                semantic, note = self._semantic(con, query, pool, embedder, scope=scope)
             fused = {}
             for channel, ranked in (('keyword', keyword), ('semantic', semantic)):
                 for rank, (segment_id, raw) in enumerate(ranked):
@@ -495,7 +729,14 @@ class Index:
             con.close()
 
     @staticmethod
-    def _keyword(con, query, pool):
+    def _scope_ids(con, path):
+        """The passage ids of one file (matched the way paths are compared everywhere else)."""
+        target = paths.canonical(path)
+        files = [p for (p,) in con.execute('SELECT path FROM files') if paths.canonical(p) == target]
+        return [sid for file in files for (sid,) in con.execute('SELECT id FROM segments WHERE path=?', (file,))]
+
+    @staticmethod
+    def _keyword(con, query, pool, scope=None):
         tokens = _tokens(query)
         if not tokens:
             return []
@@ -504,12 +745,14 @@ class Index:
         quoted = ['"' + v.replace('"', '""') + '"' for v in variants]
         exact = ' OR '.join(quoted)
         prefix = ' OR '.join(q + '*' for q, v in zip(quoted, variants) if len(v) >= 3)
-        sql = 'SELECT rowid, bm25(fts, 1.0, 2.5) FROM fts WHERE fts MATCH ? ORDER BY bm25(fts, 1.0, 2.5) LIMIT ?'
+        within = ' AND rowid IN (SELECT value FROM json_each(?))' if scope is not None else ''
+        sql = f'SELECT rowid, bm25(fts, 1.0, 2.5) FROM fts WHERE fts MATCH ?{within} ORDER BY bm25(fts, 1.0, 2.5) LIMIT ?'
+        extra = (json.dumps(scope),) if scope is not None else ()
         try:
-            ranked = [(rowid, -rank) for rowid, rank in con.execute(sql, (exact, pool))]
+            ranked = [(rowid, -rank) for rowid, rank in con.execute(sql, (exact, *extra, pool))]
             if prefix and len(ranked) < pool:
                 seen = {rowid for rowid, _ in ranked}
-                ranked += [(rowid, -rank) for rowid, rank in con.execute(sql, (prefix, pool)) if rowid not in seen][:pool - len(ranked)]
+                ranked += [(rowid, -rank) for rowid, rank in con.execute(sql, (prefix, *extra, pool)) if rowid not in seen][:pool - len(ranked)]
             return ranked
         except sqlite3.OperationalError:
             return []
@@ -526,11 +769,11 @@ class Index:
             self._vectors = (version, np.asarray(ids), matrix)
         return self._vectors[1], self._vectors[2]
 
-    def _semantic(self, con, query, pool, embedder):
+    def _semantic(self, con, query, pool, embedder, band=SEMANTIC_BAND, scope=None):
         if embedder is None:
             return [], None
         meta = dict(con.execute('SELECT key,value FROM meta'))
-        if meta.get('embed_signature') != embedder.signature():
+        if meta.get('embed_signature') != self.vector_signature(embedder):
             return [], 'Search by meaning is catching up — Rescan to finish.'
         ids, matrix = self._matrix(con)
         if matrix is None or not len(ids):
@@ -549,10 +792,14 @@ class Index:
         if vector.size != matrix.shape[1]:
             return [], 'Search by meaning needs a Rescan (the model changed).'
         scores = matrix @ vector
+        if scope is not None:  # only that file's passages compete (and set the bar for "close to the best")
+            scores = np.where(np.isin(ids, np.asarray(scope, dtype=ids.dtype)), scores, -np.inf)
         order = np.argsort(-scores)[:pool]
+        if not np.isfinite(scores[order[0]]):
+            return [], None
         # Keep meaning matches near the best one and above the model's relevance floor, so an unrelated
         # query returns nothing rather than the least-unrelated files.
-        floor = max(getattr(embedder, 'min_similarity', 0.3), float(scores[order[0]]) - SEMANTIC_BAND)
+        floor = max(getattr(embedder, 'min_similarity', 0.3), float(scores[order[0]]) - band)
         return [(int(ids[i]), float(scores[i])) for i in order if scores[i] >= floor], None
 
     # --------------------------------------------------------------- excerpts
@@ -597,6 +844,25 @@ class Index:
                 'description_pending': vision is None and self.description_pending(key)}
 
 
+def _document_window(passages, order, chars=9000):
+    """The document around passage ``order`` (whole, when short), for writing that passage's context."""
+    texts = [text for _, text in passages]
+    if sum(len(t) for t in texts) <= chars:
+        return '\n\n'.join(texts)
+    position = next((n for n, (o, _) in enumerate(passages) if o == order), 0)
+    start = end = position
+    used = len(texts[position])
+    while used < chars and (start > 0 or end < len(texts) - 1):
+        if start > 0:
+            start -= 1
+            used += len(texts[start])
+        if end < len(texts) - 1 and used < chars:
+            end += 1
+            used += len(texts[end])
+    head = texts[0] + '\n\n…\n\n' if start > 0 else ''  # the opening usually says what the document is
+    return head + '\n\n'.join(texts[start:end + 1])
+
+
 # ----------------------------------------------------------------- tokens
 STOPWORDS = set('a an and are as at be but by for from has have how i in is it its me my of on or our that the their them this '
                 'to was we were what when where which who why will with you your'.split())
@@ -609,7 +875,17 @@ def _tokens(query):
     return (meaningful or words)[:16]
 
 
+# Documents number things in more than one way: "second semester", "Semester II", "II Sem", "2nd year".
+ORDINALS = [('first', 'i', '1st'), ('second', 'ii', '2nd'), ('third', 'iii', '3rd'), ('fourth', 'iv', '4th'), ('fifth', 'v', '5th'),
+            ('sixth', 'vi', '6th'), ('seventh', 'vii', '7th'), ('eighth', 'viii', '8th'), ('ninth', 'ix', '9th'), ('tenth', 'x', '10th')]
+# 'i', 'v' and 'x' alone are too common to search for (or to expand).
+EQUIVALENT = {form: tuple(f for f in group if len(f) > 1) for group in ORDINALS for form in group if len(form) > 1}
+EQUIVALENT.update({'sem': ('sem', 'semester'), 'semester': ('semester', 'sem'), 'yr': ('yr', 'year')})
+
+
 def _variants(token):
+    if token in EQUIVALENT:
+        return [token] + [form for form in EQUIVALENT[token] if form != token]
     forms = [token]
     if len(token) > 4 and token.endswith('ies'):
         forms.append(token[:-3] + 'y')

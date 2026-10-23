@@ -6,8 +6,8 @@ import time
 from io import BytesIO
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QByteArray, QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
-                           QPixmap)
+from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QFont, QGuiApplication, QIcon, QImage, QLinearGradient, QPainter, QPainterPath,
+                           QPen, QPixmap, QTransform)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QAbstractButton
 
@@ -57,8 +57,8 @@ def stylesheet(p):
 * {{ font-family: 'Segoe UI Variable Text', 'Segoe UI'; font-size: 10pt; color: {t}; }}
 QWidget#clear, QScrollArea, QScrollArea > QWidget > QWidget, QStackedWidget, QWidget#qt_scrollarea_viewport {{ background: transparent; border: none; }}
 QLabel#secondary {{ color: {s}; }}
-QLabel#caption {{ color: {s}; font-size: 8.5pt; }}
-QLabel#section {{ color: {s}; font-size: 8.5pt; font-weight: 600; }}
+QLabel#caption {{ color: {s}; font-size: 9pt; }}
+QLabel#section {{ color: {s}; font-size: 9pt; font-weight: 600; }}
 QLabel#title {{ font-size: 13.5pt; font-weight: 600; }}
 QLabel#hero {{ font-size: 15pt; font-weight: 600; }}
 QLineEdit#search {{ background: transparent; border: none; font-family: 'Segoe UI Variable Display', 'Segoe UI'; font-size: 17pt;
@@ -84,14 +84,16 @@ QPushButton#chip:hover {{ background: {fs}; border-color: {acc}; }}
 QPushButton#ghost {{ background: transparent; border: none; border-radius: 13px; padding: 0; }}
 QPushButton#ghost:hover {{ background: {fs}; }}
 QLabel#name {{ font-weight: 600; }}
-QLabel#badge {{ background: {fs}; border-radius: 7px; padding: 1px 7px; color: {s}; font-size: 7.5pt; font-weight: 600; }}
+QLabel#badge {{ background: {fs}; border-radius: 7px; padding: 1px 7px; color: {s}; font-size: 8.5pt; font-weight: 600; }}
 QLabel#bubble {{ background: {rgba(p['accent'], .20)}; border-radius: 14px; padding: 8px 13px; font-size: 10.5pt; }}
 QPushButton#pill {{ background: {f}; border: 1px solid {sep}; border-radius: 14px; padding: 5px 13px; }}
 QPushButton#pill:hover {{ background: {fs}; }}
-QLabel#tag {{ background: {fs}; border-radius: 9px; padding: 2px 9px; color: {s}; font-size: 8.5pt; }}
+QLabel#tag {{ background: {fs}; border-radius: 9px; padding: 2px 9px; color: {s}; font-size: 9pt; }}
 QPushButton#source {{ background: {f}; border: 1px solid {sep}; border-radius: 9px; padding: 6px 10px; text-align: left; }}
 QPushButton#source:hover {{ background: {fs}; }}
 QPushButton#source[used="false"] {{ color: {s}; }}
+QFrame#sourcerow {{ background: {f}; border: 1px solid {sep}; border-radius: 9px; }}
+QFrame#sourcerow:hover {{ background: {fs}; }}
 QCheckBox::indicator {{ width: 15px; height: 15px; border-radius: 4px; border: 1px solid {rgba(p['tertiary'])}; background: {f}; }}
 QCheckBox::indicator:checked {{ background: {acc}; border-color: {acc}; }}
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 1px; }}
@@ -109,6 +111,7 @@ QMenu::item:selected {{ background: {acc}; color: white; }}
 # -------------------------------------------------------------------- motion
 class Motion:
     reduced = False
+    instant = False  # True while a view is rebuilt behind a transition: springs started then land at once
 
     @classmethod
     def detect(cls, settings):
@@ -123,112 +126,291 @@ class Motion:
         cls.reduced = bool(settings.get('reduce_motion')) or system
 
 
+def refresh_rate(screen=None):
+    """Refresh rate (Hz) of ``screen`` (the primary one by default), 60 if the system doesn't say."""
+    screen = screen or QGuiApplication.primaryScreen()
+    hz = screen.refreshRate() if screen else 0.0
+    return hz if 23.0 <= hz <= 1000.0 else 60.0
+
+
+def frame_interval(screen=None):
+    """Milliseconds between two refreshes of ``screen`` (4.17 at 240 Hz, 16.7 at 60 Hz)."""
+    return 1000.0 / refresh_rate(screen)
+
+
 class Spring:
     """Damped spring (semi-implicit Euler). Retargeting mid-flight keeps velocity,
-    which is what makes motion feel fluid instead of restarting an easing curve."""
+    which is what makes motion feel fluid instead of restarting an easing curve.
 
-    def __init__(self, value=0.0, stiffness=260.0, damping=0.78, on_change=None):
+    It integrates over measured time, not per frame, so a spring takes the same time and follows the same curve at
+    60, 144 or 240 Hz, and when frames are dropped. ``precision`` is how close (in the spring's own units) counts as
+    arrived: for pixels a fraction of a device pixel, so nobody waits on motion too small to see."""
+    SUBSTEP = 0.002  # seconds: small enough that the curve doesn't depend on the frame rate
+
+    def __init__(self, value=0.0, stiffness=260.0, damping=0.78, on_change=None, precision=0.02):
         self.value = self.target = float(value)
         self.velocity = 0.0
         self.k = stiffness
         self.zeta = damping
         self.on_change = on_change
+        self.precision = precision
 
     def to(self, target, impulse=0.0):
         self.target = float(target)
         self.velocity += impulse
-        if Motion.reduced:
+        if Motion.reduced or Motion.instant:
             self.snap(target)
         else:
             DRIVER.add(self)
 
     def snap(self, value):
+        DRIVER.springs.discard(self)
         self.value = self.target = float(value)
         self.velocity = 0.0
         if self.on_change:
             self.on_change(self.value)
 
-    def step(self, dt):
+    def advance(self, elapsed):
+        """Move ``elapsed`` seconds forward; True once settled."""
+        steps = max(1, math.ceil(elapsed / self.SUBSTEP - 1e-9))
+        dt = elapsed / steps
         c = 2 * math.sqrt(self.k) * self.zeta
-        accel = -self.k * (self.value - self.target) - c * self.velocity
-        self.velocity += accel * dt
-        self.value += self.velocity * dt
-        settled = abs(self.velocity) < 0.02 and abs(self.value - self.target) < 0.02
+        for _ in range(steps):
+            accel = -self.k * (self.value - self.target) - c * self.velocity
+            self.velocity += accel * dt
+            self.value += self.velocity * dt
+        settled = abs(self.value - self.target) < self.precision and abs(self.velocity) < self.precision * 10
         if settled:
             self.value, self.velocity = self.target, 0.0
         return settled
 
 
+class _VBlank:
+    """Waits for the vertical blank of one display, so animation frames land on the screen's own refresh (60, 75, 144,
+    240 Hzâ€¦) instead of a timer that drifts against it. Windows only (D3DKMTWaitForVerticalBlankEvent, part of every
+    WDDM display driver, whatever the graphics card); ``wait`` returns False when it can't be used."""
+
+    class _Open(ctypes.Structure):
+        _fields_ = [('hDc', ctypes.c_void_p), ('hAdapter', ctypes.c_uint), ('luid_low', ctypes.c_uint), ('luid_high', ctypes.c_int),
+                    ('source', ctypes.c_uint)]
+
+    class _Wait(ctypes.Structure):
+        _fields_ = [('hAdapter', ctypes.c_uint), ('hDevice', ctypes.c_uint), ('source', ctypes.c_uint)]
+
+    class _Close(ctypes.Structure):
+        _fields_ = [('hAdapter', ctypes.c_uint)]
+
+    def __init__(self):
+        self.device, self.adapter = None, None
+        self.ok = os.name == 'nt'
+        if self.ok:
+            try:
+                self.gdi = ctypes.WinDLL('gdi32')
+                self.gdi.CreateDCW.restype = ctypes.c_void_p
+                self.gdi.CreateDCW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_void_p]
+                self.gdi.DeleteDC.argtypes = [ctypes.c_void_p]
+                self.gdi.D3DKMTWaitForVerticalBlankEvent.argtypes = [ctypes.c_void_p]
+            except (OSError, AttributeError):  # not a WDDM system
+                self.ok = False
+
+    def _open(self, device):
+        self._close()
+        dc = self.gdi.CreateDCW(device, None, None, None) if device else None
+        if not dc:
+            return False
+        request = self._Open(hDc=dc)
+        status = self.gdi.D3DKMTOpenAdapterFromHdc(ctypes.byref(request))
+        self.gdi.DeleteDC(dc)
+        if status != 0:
+            return False
+        self.adapter, self.device = request, device
+        return True
+
+    def _close(self):
+        if self.adapter is not None:
+            self.gdi.D3DKMTCloseAdapter(ctypes.byref(self._Close(self.adapter.hAdapter)))
+        self.adapter = self.device = None
+
+    def wait(self, device):
+        """Block until ``device`` (a GDI display name, see display_device) next refreshes; False if it can't. A display that
+        can't be opened turns this off (``ok``), and the frame clock falls back to its timer."""
+        if not self.ok:
+            return False
+        if device != self.device and not self._open(device):
+            self.ok = False
+            return False
+        request = self._Wait(self.adapter.hAdapter, 0, self.adapter.source)
+        if self.gdi.D3DKMTWaitForVerticalBlankEvent(ctypes.byref(request)) != 0:
+            self._close()  # the display changed (unplugged, mode switch): reopen on the next wait
+            return False
+        return True
+
+
+def display_device(hwnd=None):
+    """GDI name (such as DISPLAY1) of the display showing window ``hwnd`` (the primary display without one); '' off Windows."""
+    if os.name != 'nt':
+        return ''
+    from ctypes import wintypes
+
+    class Info(ctypes.Structure):
+        _fields_ = [('cbSize', wintypes.DWORD), ('rcMonitor', wintypes.RECT), ('rcWork', wintypes.RECT), ('dwFlags', wintypes.DWORD),
+                    ('szDevice', ctypes.c_wchar * 32)]
+    try:
+        user32 = ctypes.windll.user32
+        user32.MonitorFromWindow.restype = user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        monitor = user32.MonitorFromWindow(hwnd, 2) if hwnd else user32.MonitorFromPoint(wintypes.POINT(0, 0), 1)
+        info = Info(cbSize=ctypes.sizeof(Info))
+        return info.szDevice if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)) else ''
+    except Exception:
+        return ''
+
+
 class _Driver(QObject):
-    """One ~120 Hz timer for all springs; it stops when everything has settled."""
+    """One clock for every animation: springs and loops all advance in the same frame, once per refresh of the display
+    the visible Alfred window is on. A background thread waits for that display's vertical blank and wakes the UI thread;
+    if that isn't available, a precise timer runs at the display's refresh interval. Each frame advances everything by
+    the time that really passed (clamped, so a stall slows motion instead of making it jump), and the clock stops when
+    nothing moves."""
+    frame = Signal()
+    fallback = Signal()
+    MAX_STEP = 1 / 30  # seconds: the most one frame may advance
 
     def __init__(self):
         super().__init__()
-        self.springs = set()
+        self.springs, self.loops = set(), set()
         self.timer = None
         self.last = 0.0
+        self.screen = None
+        self.device, self.interval = '', 1000.0 / 60
+        self.vsync = _VBlank()
+        self.running = False
+        self.pending = False
+        self.thread = None
+        self.wake = None
+        self.frames = 0
+        self.paced = 0.0
+        self.frame.connect(self.tick, Qt.QueuedConnection)
+        self.fallback.connect(self._fall_back, Qt.QueuedConnection)
+
+    def follow(self, screen, window=None):
+        """Pace frames by ``screen``, the display ``window`` is on (call again when it moves to another display)."""
+        self.screen = screen
+        self.device = display_device(int(window.winId()) if window is not None else None)
+        self.interval = frame_interval(screen)
+        if self.timer is not None and self.timer.isActive():
+            self.timer.setInterval(max(1, round(self.interval)))
 
     def add(self, spring):
+        self.springs.add(spring)
+        self._start()
+
+    def add_loop(self, loop):
+        self.loops.add(loop)
+        self._start()
+
+    def _start(self):
+        if self.running:
+            return
+        self.running = True
+        self.last = time.perf_counter()
+        if self.screen is None:
+            self.follow(QGuiApplication.primaryScreen())
+        if self.vsync.ok:
+            import threading
+            if self.thread is None:
+                self.wake = threading.Condition()
+                self.thread = threading.Thread(target=self._pace, name='alfred-vsync', daemon=True)
+                self.thread.start()
+            with self.wake:
+                self.wake.notify()
+        else:
+            self._start_timer()
+
+    def _fall_back(self):
+        if self.running:
+            self._start_timer()
+
+    def _start_timer(self):
         if self.timer is None:
             self.timer = QTimer()
             self.timer.setTimerType(Qt.PreciseTimer)
             self.timer.timeout.connect(self.tick)
-        self.springs.add(spring)
         if not self.timer.isActive():
-            self.last = time.perf_counter()
-            self.timer.start(8)
+            self.timer.start(max(1, round(self.interval)))
+
+    def _pace(self):
+        """Background thread: one ``frame`` signal per vertical blank while anything moves."""
+        while True:
+            with self.wake:
+                while not self.running:
+                    self.wake.wait()
+            if not self.vsync.wait(self.device) and not self.vsync.ok:
+                self.fallback.emit()  # not usable here: the timer on the UI thread takes over
+                return
+            # Never faster than the display refreshes (a wait that fails, or returns at once while the display sleeps).
+            early = self.interval / 1000 - (time.perf_counter() - self.paced)
+            if early > self.interval / 2000:
+                time.sleep(early)
+            self.paced = time.perf_counter()
+            if self.running and not self.pending:  # the UI thread hasn't drawn the last frame: skip, don't queue up
+                self.pending = True
+                self.frame.emit()
 
     def tick(self):
+        self.pending = False
+        if not self.running:
+            return
         now = time.perf_counter()
-        elapsed = min(now - self.last, 0.05)
+        elapsed = min(max(now - self.last, 0.0), self.MAX_STEP)
         self.last = now
-        steps = max(1, int(elapsed / 0.004))
+        self.frames += 1
         for spring in list(self.springs):
-            settled = False
-            for _ in range(steps):
-                settled = spring.step(elapsed / steps)
+            settled = spring.advance(elapsed)
             if settled:
                 self.springs.discard(spring)
             if spring.on_change:
                 spring.on_change(spring.value)
-        if not self.springs:
-            self.timer.stop()
+        for loop in list(self.loops):
+            loop.advance(elapsed)
+        if not self.springs and not self.loops:
+            self.running = False
+            if self.timer is not None:
+                self.timer.stop()
 
 
 DRIVER = _Driver()
 
 
 class Loop(QObject):
-    """Phase 0..1 looping animation that only ticks while running (no idle CPU)."""
+    """Phase 0..1 looping animation on the shared clock that only ticks while running (no idle CPU)."""
     tick = Signal(float)
 
     def __init__(self, period=2.4, parent=None):
         super().__init__(parent)
         self.period, self.phase = period, 0.0
-        self.timer = QTimer(self)
-        self.timer.setTimerType(Qt.PreciseTimer)
-        self.timer.timeout.connect(self._tick)
-        self.last = 0.0
+        self.destroyed.connect(lambda: DRIVER.loops.discard(self))
 
     def start(self):
         if Motion.reduced:
             return
-        if not self.timer.isActive():
-            self.last = time.perf_counter()
-            self.timer.start(12)
+        DRIVER.add_loop(self)
 
     def stop(self):
-        self.timer.stop()
+        DRIVER.loops.discard(self)
 
     @property
     def running(self):
-        return self.timer.isActive()
+        return self in DRIVER.loops
 
-    def _tick(self):
-        now = time.perf_counter()
-        self.phase = (self.phase + (now - self.last) / self.period) % 1.0
-        self.last = now
-        self.tick.emit(self.phase)
+    def advance(self, elapsed):
+        self.phase = (self.phase + elapsed / self.period) % 1.0
+        try:
+            self.tick.emit(self.phase)
+        except RuntimeError:  # its widget is gone
+            DRIVER.loops.discard(self)
 
 
 # --------------------------------------------------------------------- icons
@@ -258,7 +440,8 @@ SVG = {
 _icon_cache = {}
 
 
-def icon_pixmap(name, size, color, dpr=2.0):
+def icon_pixmap(name, size, color, dpr=None):
+    dpr = dpr or screen_dpr()
     key = (name, size, color.rgba(), dpr)
     if key not in _icon_cache:
         svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">{SVG[name]}</svg>'.replace('"C"', f'"{color.name()}"')
@@ -276,7 +459,7 @@ def icon_pixmap(name, size, color, dpr=2.0):
     return _icon_cache[key]
 
 
-def icon(name, size, color, dpr=2.0):
+def icon(name, size, color, dpr=None):
     return QIcon(icon_pixmap(name, size, color, dpr))
 
 
@@ -287,11 +470,51 @@ BRAND_COLOURS = {'claude': '#D97757'}
 _logo_cache = {}
 
 
+TEXT_FAMILIES = ['Segoe UI Variable Text', 'Segoe UI']  # Windows 11's UI font, Windows 10's otherwise
+
+
+def tune_text(dpr):
+    """Set the application font's rendering for a screen with pixel ratio ``dpr``.
+
+    Alfred's panel is a translucent window, which Windows draws without ClearType, so text is grey-scale
+    anti-aliased. At 100 % (and 200 %) full hinting snaps stems to whole pixels and keeps small text crisp; at fractional
+    ratios (125 %, 150 %) full hinting distorts glyph shapes, so only vertical metrics are snapped. Returns True if
+    anything changed (widgets then re-render their text)."""
+    font = QGuiApplication.font()
+    hinting = QFont.PreferFullHinting if abs(dpr - round(dpr)) < 0.01 else QFont.PreferVerticalHinting
+    strategy = QFont.StyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
+    if font.families()[:2] == TEXT_FAMILIES and font.hintingPreference() == hinting and font.styleStrategy() == strategy:
+        return False
+    font.setFamilies(TEXT_FAMILIES)
+    font.setHintingPreference(hinting)
+    font.setStyleStrategy(strategy)
+    QGuiApplication.setFont(font)
+    return True
+
+
+def text_font(points, weight=None):
+    """A font for text drawn by hand in a paintEvent, rendered like the widgets' text (see tune_text)."""
+    font = QFont(QGuiApplication.font())
+    font.setPointSizeF(points)
+    if weight is not None:
+        font.setWeight(weight)
+    return font
+
+
 def screen_dpr():
-    """Render scale for crisp vector art: at least 2x, and the real screen ratio on high-DPI displays."""
-    from PySide6.QtGui import QGuiApplication
+    """Render scale for crisp vector art: exactly the screen's pixel ratio, so a pixmap lands 1:1 on device pixels
+    (a 2x pixmap shown at 1.5x is resampled and looks soft)."""
     screen = QGuiApplication.primaryScreen()
-    return max(2.0, math.ceil((screen.devicePixelRatio() if screen else 1.0) * 2) / 2 + 0.5)
+    return max(1.0, round((screen.devicePixelRatio() if screen else 1.0) * 4) / 4)
+
+
+def snapped(rect, widget):
+    """``rect`` (in ``widget``'s coordinates) moved onto the window's device-pixel grid, so a pixmap drawn there is a 1:1
+    copy instead of a blurry resample. At 150 % scaling an odd logical coordinate falls between two device pixels."""
+    dpr = widget.devicePixelRatioF()
+    origin = widget.mapTo(widget.window(), QPointF(0, 0)) if widget.window() is not widget else QPointF(0, 0)
+    x, y = origin.x() + rect.x(), origin.y() + rect.y()
+    return QRectF(round(x * dpr) / dpr - origin.x(), round(y * dpr) / dpr - origin.y(), rect.width(), rect.height())
 
 
 def brand_pixmap(name, size, color, dpr=None):
@@ -342,8 +565,12 @@ def dot_pixmap(color, size=8, dpr=None):
     return pixmap
 
 
-def sparkle_pixmap(size, dpr=2.0):
+def sparkle_pixmap(size, dpr=None):
     """Gradient sparkle used for Ask Alfred (Apple-Intelligence-like colouring)."""
+    dpr = dpr or screen_dpr()
+    key = ('sparkle', size, dpr)
+    if key in _icon_cache:
+        return _icon_cache[key]
     base = icon_pixmap('sparkle', size, QColor('white'), dpr).toImage()
     base.setDevicePixelRatio(1)  # work in device pixels so the mask covers the whole icon
     image = QImage(base.size(), QImage.Format_ARGB32_Premultiplied)
@@ -358,6 +585,7 @@ def sparkle_pixmap(size, dpr=2.0):
     painter.end()
     pixmap = QPixmap.fromImage(image)
     pixmap.setDevicePixelRatio(dpr)
+    _icon_cache[key] = pixmap  # drawn on every frame of the mode switch and window paint
     return pixmap
 
 
@@ -393,22 +621,23 @@ def app_icon():
 
 # --------------------------------------------------------------------- glass
 def blurred_backdrop(pixmap, strength=10):
-    """Frosted-glass backdrop: downscale, gaussian blur, boost saturation (vibrancy)."""
+    """Frosted-glass backdrop: downscale, gaussian blur, boost saturation (vibrancy).
+
+    Runs before the panel's first frame, so it stays cheap (~20 ms rather than ~200): the heavy blurs work on 1/8 and 1/2
+    size images and the result goes straight back to Qt (no PNG round trip). It looks the same as blurring at full size."""
     from PIL import Image, ImageEnhance, ImageFilter
     if pixmap is None or pixmap.isNull():
         return None
-    image = pixmap.toImage().convertToFormat(QImage.Format_RGBA8888)
+    image = pixmap.toImage()
     w, h = image.width(), image.height()
-    data = bytes(image.constBits())[:image.bytesPerLine() * h]
-    pil = Image.frombuffer('RGBA', (w, h), data, 'raw', 'RGBA', image.bytesPerLine(), 1).convert('RGB')
-    small = pil.resize((max(1, w // 8), max(1, h // 8)), Image.BILINEAR)
-    small = small.filter(ImageFilter.GaussianBlur(strength / 2.5))
-    small = ImageEnhance.Color(small).enhance(1.7)
-    large = small.resize((w, h), Image.BICUBIC).filter(ImageFilter.GaussianBlur(strength))
-    buffer = BytesIO()
-    large.save(buffer, 'PNG')
-    result = QPixmap()
-    result.loadFromData(buffer.getvalue(), 'PNG')
+    small = image.scaled(max(1, w // 8), max(1, h // 8), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    small = small.convertToFormat(QImage.Format_RGB888)
+    pil = Image.frombuffer('RGB', (small.width(), small.height()), bytes(small.constBits()), 'raw', 'RGB', small.bytesPerLine(), 1)
+    pil = ImageEnhance.Color(pil.filter(ImageFilter.GaussianBlur(strength / 2.5))).enhance(1.7)
+    half = pil.resize((max(1, w // 2), max(1, h // 2)), Image.BICUBIC).filter(ImageFilter.GaussianBlur(strength / 2))
+    data = half.tobytes()
+    large = QImage(data, half.width, half.height, half.width * 3, QImage.Format_RGB888)
+    result = QPixmap.fromImage(large.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
     result.setDevicePixelRatio(pixmap.devicePixelRatio())
     return result
 
@@ -431,35 +660,89 @@ def fallback_backdrop(size, dark=True):
     return pixmap
 
 
-def paint_shadow(p, rect, radius, color, spread=26):
+SHADOW_DROP = 10  # the shadow sits this much lower than the panel
+SHADOW_SPREAD = 26  # and reaches this far beyond it
+_shadow_cache = {}
+
+
+def _draw_shadow(p, rect, radius, color, spread):
     p.save()
     p.setPen(Qt.NoPen)
     for i in range(spread, 0, -2):
         c = QColor(color)
         c.setAlphaF(color.alphaF() * (1 - i / spread) ** 2 * 0.16)
         p.setBrush(c)
-        p.drawRoundedRect(rect.adjusted(-i, -i + 10, i, i + 10), radius + i, radius + i)
+        p.drawRoundedRect(rect.adjusted(-i, -i + SHADOW_DROP, i, i + SHADOW_DROP), radius + i, radius + i)
     p.restore()
 
 
-def paint_glass(p, rect, radius, palette, backdrop, backdrop_origin):
+def _shadow_sprite(width, radius, color, spread, dpr):
+    """The shadow of a short panel, drawn once at device resolution. Its middle rows are identical, so any taller
+    panel's shadow is its top, a stretched middle band and its bottom: three blits instead of 13 large anti-aliased fills."""
+    key = (round(width, 2), radius, color.rgba(), spread, dpr)
+    if key not in _shadow_cache:
+        pad, height = spread + SHADOW_DROP + 2, 2 * radius + 8
+        image = QImage(int(math.ceil((width + 2 * pad) * dpr)), int(math.ceil((height + 2 * pad) * dpr)), QImage.Format_ARGB32_Premultiplied)
+        image.setDevicePixelRatio(dpr)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing)
+        _draw_shadow(painter, QRectF(pad, pad, width, height), radius, color, spread)
+        painter.end()
+        pixmap = QPixmap.fromImage(image)
+        top_cut = pad + radius + SHADOW_DROP + 2  # inside the band of identical rows
+        band = pixmap.copy(0, int(round(top_cut * dpr)), pixmap.width(), int(round(2 * dpr)))
+        band.setDevicePixelRatio(dpr)
+        _shadow_cache[key] = (pixmap, band, pad, height, top_cut)
+    return _shadow_cache[key]
+
+
+def paint_shadow(p, rect, radius, color, spread=SHADOW_SPREAD):
+    pixmap, band, pad, height, top_cut = _shadow_sprite(rect.width(), radius, color, spread, p.device().devicePixelRatioF())
+    dpr = pixmap.devicePixelRatio()
+    bottom_cut = top_cut + 2
+    stretch = rect.height() - height  # extra height of this panel over the sprite's
+    if stretch + bottom_cut - top_cut < 0:  # too short to slice (never for Alfred's panel)
+        _draw_shadow(p, rect, radius, color, spread)
+        return
+    full_w = pixmap.width() / dpr
+    left, top = rect.left() - pad, rect.top() - pad
+    below = pixmap.height() / dpr - bottom_cut
+    p.drawPixmap(QRectF(left, top, full_w, top_cut), pixmap, QRectF(0, 0, pixmap.width(), top_cut * dpr))
+    # The middle is a tiled fill of identical rows (a scaled blit takes the raster engine's slow path).
+    p.drawTiledPixmap(QRectF(left, top + top_cut, full_w, stretch + bottom_cut - top_cut), band)
+    p.drawPixmap(QRectF(left, top + bottom_cut + stretch, full_w, below), pixmap,
+                 QRectF(0, bottom_cut * dpr, pixmap.width(), below * dpr))
+
+
+def paint_glass(p, rect, radius, palette, backdrop, backdrop_origin, span=None):
+    """``span``: the height the tint and rim gradients stretch over. A fixed span keeps every pixel above the bottom edge
+    the same while the panel grows or shrinks, so an animating panel only repaints its moving edge."""
+    span = span or rect.height()
+    # Fills of the rounded shape (the backdrop as a texture brush) instead of a clip path: an anti-aliased clip makes
+    # the raster engine build a mask on every frame.
     path = QPainterPath()
     path.addRoundedRect(rect, radius, radius)
     p.save()
-    p.setClipPath(path)
+    p.setPen(Qt.NoPen)
     if backdrop is not None:
-        p.drawPixmap(backdrop_origin, backdrop)
-    tint = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        brush = QBrush(backdrop)
+        brush.setTransform(QTransform.fromTranslate(backdrop_origin.x(), backdrop_origin.y()))
+        p.setBrush(brush)
+        p.drawPath(path)
+    tint = QLinearGradient(rect.topLeft(), QPointF(rect.left(), rect.top() + span))
     tint.setColorAt(0, palette['tint'])
     tint.setColorAt(1, palette['tint_bottom'])
-    p.fillRect(rect, tint)
+    p.setBrush(tint)
+    p.drawPath(path)
     # Liquid-glass sheen: a soft specular band across the top.
     sheen = QLinearGradient(rect.topLeft(), QPointF(rect.left(), rect.top() + min(90, rect.height())))
     sheen.setColorAt(0, palette['sheen'])
     sheen.setColorAt(1, QColor(255, 255, 255, 0))
-    p.fillRect(rect, sheen)
+    p.setBrush(sheen)
+    p.drawPath(path)
     p.restore()
-    rim = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+    rim = QLinearGradient(rect.topLeft(), QPointF(rect.left(), rect.top() + span))
     rim.setColorAt(0, palette['rim_top'])
     rim.setColorAt(0.35, palette['rim_bottom'])
     rim.setColorAt(1, palette['rim_bottom'])

@@ -13,8 +13,8 @@ one is in use:
 
 The two CLIs are coding agents, so Alfred runs them locked down: print mode, every tool off,
 no MCP servers or project settings, an empty working folder, and the question on stdin.
-Cloud providers only ever receive the conversation (later: the question and the passages
-retrieved for it) — never your files.
+Cloud providers only ever receive the conversation and the passages retrieved for each
+question — never your files.
 """
 import json
 import os
@@ -29,9 +29,9 @@ import urllib.request
 from pathlib import Path
 
 from . import ai, keys
+from .console import hidden
 from .ai import NotConfigured, ProviderError
 
-NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 CLI_TIMEOUT = 300
 ORDER = ['ollama', 'claude_code', 'codex', 'anthropic', 'openai', 'compatible']
 VIA = {'ollama': 'on this PC', 'claude_code': 'through your Claude plan', 'codex': 'through your ChatGPT plan',
@@ -195,8 +195,11 @@ class Ollama(Provider):
     def stream(self, messages, on_token=lambda t: None, cancel=None, on_status=lambda text: None):
         self.require()
         effort = (self.settings.get('effort') or 'off').lower()
+        # Room for the passages Ask Alfred sends (about 6k tokens), the chat so far and the answer; Ollama's default is 4k.
+        context = max(2048, min(int(self.settings.get('ollama_context') or 10240), 131072))
         payload = {'model': self.model, 'messages': messages, 'stream': True, 'keep_alive': ai.keep_alive(self.settings),
-                   'options': dict(ai._options(self.settings.get('device', 'auto')), temperature=self.settings.get('temperature', 0.2))}
+                   'options': dict(ai._options(self.settings.get('device', 'auto')), temperature=self.settings.get('temperature', 0.2),
+                                   num_ctx=context)}
         if 'thinking' in ai.model_capabilities(self.base, self.model):
             payload['think'] = effort if 'gpt-oss' in self.model else effort != 'off'
         parts = []
@@ -400,7 +403,7 @@ class CLIProvider(Provider):
         """Run the CLI with ``prompt`` on stdin; ``handle(event)`` gets each JSON line. Returns the exit code."""
         with tempfile.TemporaryDirectory(dir=self.workdir()) as folder:
             process = subprocess.Popen([self.exe()] + args, cwd=folder, env=self.env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, creationflags=NO_WINDOW)
+                                       stderr=subprocess.PIPE, **hidden())
             errors = []
             reader = threading.Thread(target=lambda: errors.append(process.stderr.read().decode('utf-8', 'replace')), daemon=True)
             reader.start()
@@ -457,7 +460,7 @@ class ClaudeCode(CLIProvider):
         def check():
             try:
                 out = subprocess.run([exe, 'auth', 'status'], capture_output=True, text=True, timeout=30, env=self.env(),
-                                     encoding='utf-8', errors='replace', creationflags=NO_WINDOW)
+                                     encoding='utf-8', errors='replace', **hidden())
                 info = json.loads(out.stdout[out.stdout.find('{'):] or '{}')
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 info = {}
@@ -538,7 +541,7 @@ class Codex(CLIProvider):
         def check():
             try:
                 out = subprocess.run([exe, 'login', 'status'], capture_output=True, text=True, timeout=30, encoding='utf-8',
-                                     errors='replace', creationflags=NO_WINDOW)
+                                     errors='replace', **hidden())
                 text = (out.stdout + out.stderr).strip()
             except (OSError, subprocess.TimeoutExpired):
                 text = ''

@@ -7,6 +7,7 @@ it; Esc hides it.
 import html
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
 import re
@@ -20,20 +21,22 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (QColor, QKeySequence, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QLinearGradient,
-                           QPainter, QPainterPath, QPen, QPixmap)
+                           QPainter, QPainterPath, QPen, QPixmap, QRegion)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconProvider, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
                                QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
-                               QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
+                               QSystemTrayIcon, QTextBrowser, QToolTip, QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, ai, chats, config, keys, paths, picker, providers, rag, startup
+from . import APP_NAME, __version__, ai, chats, config, keys, paths, picker, providers, rag, render, rerank, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
 from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, app_icon, blurred_backdrop, brand_pixmap, dot_pixmap, fallback_backdrop, icon,
                      icon_pixmap, logo_pixmap,
-                     paint_glass, paint_glow, paint_shadow, palette_for, sparkle_pixmap, stylesheet, HotkeyFilter)
+                     paint_glass, paint_glow, paint_shadow, palette_for, rgba, screen_dpr, snapped, sparkle_pixmap, stylesheet,
+                     HotkeyFilter, SHADOW_DROP, SHADOW_SPREAD, text_font, tune_text)
 
 W, BAR, MAXH, M, R, FOOT = 780, 62, 600, 46, 26, 34
+SEPARATOR_FADE = 60  # the line under the search bar fades in over the panel's first pixels of growth
 DEFAULT_HOTKEY, FALLBACK_HOTKEYS = 'Ctrl+Alt+L', ['Ctrl+Alt+L', 'Ctrl+Alt+K', 'Ctrl+Alt+A']
 SEARCH, ASK, SETTINGS = range(3)
 PLACEHOLDERS = {SEARCH: 'Search your files', ASK: 'Ask anything about your files', SETTINGS: 'Settings'}
@@ -160,14 +163,42 @@ def button(text, slot=None, name=None, tip=None, icon_value=None):
     return widget
 
 
+def _above_panel(dialog):
+    """Dialogs must sit above Alfred's always-on-top panel, or they open behind it and can't be clicked."""
+    dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+    dialog.setWindowModality(Qt.ApplicationModal)
+    QTimer.singleShot(0, lambda: (dialog.raise_(), dialog.activateWindow()))
+    return dialog
+
+
+def ask_box(parent, title, text, buttons, default):
+    """QMessageBox.question that stays above the panel; returns the button chosen (Esc counts as the escape button)."""
+    box = _above_panel(QMessageBox(QMessageBox.Question, title, text, buttons, parent.window() if parent else None))
+    box.setDefaultButton(default)
+    box.exec()
+    return box.standardButton(box.clickedButton()) if box.clickedButton() else QMessageBox.Cancel
+
+
+def ask_text(parent, title, prompt, echo=QLineEdit.Normal):
+    """QInputDialog.getText that stays above the panel; returns (text, ok)."""
+    from PySide6.QtWidgets import QDialog, QInputDialog
+    dialog = _above_panel(QInputDialog(parent.window() if parent else None))
+    dialog.setWindowTitle(title)
+    dialog.setLabelText(prompt)
+    dialog.setTextEchoMode(echo)
+    ok = dialog.exec() == QDialog.Accepted
+    return dialog.textValue(), ok
+
+
 def fade_in(widget, duration=0.22, dy=0):
     """Opacity spring for content changes (removed afterwards to keep text crisp)."""
-    if Motion.reduced:
+    if Motion.reduced or Motion.instant:
         return
     effect = QGraphicsOpacityEffect(widget)
     widget.setGraphicsEffect(effect)
     effect.setOpacity(0)
     spring = Spring(0, 160 / duration, 1.0)
+    spring.fade = True  # a transition's snapshot finishes it first
 
     def change(value):
         try:
@@ -190,20 +221,22 @@ class FileIcons:
     def get(cls, path, size=28):
         path = Path(path)
         suffix = path.suffix.lower()
+        dpr = screen_dpr()  # exactly the screen's ratio: no resampling when drawn
         if suffix in IMAGE_SUFFIXES and path.is_file():
-            key = ('thumb', str(path), size)
+            key = ('thumb', str(path), size, dpr)
             if key not in cls.cache:
                 pixmap = QPixmap(str(path))
                 if not pixmap.isNull():
-                    pixmap = pixmap.scaled(size * 2, size * 2, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-                    pixmap.setDevicePixelRatio(2)
+                    side = int(round(size * dpr))
+                    pixmap = pixmap.scaled(side, side, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                    pixmap.setDevicePixelRatio(dpr)
                 cls.cache[key] = pixmap
             return cls.cache[key]
-        key = ('type', suffix, size)
+        key = ('type', suffix, size, dpr)
         if key not in cls.cache:
             from PySide6.QtCore import QFileInfo
             cls.provider = cls.provider or QFileIconProvider()
-            cls.cache[key] = cls.provider.icon(QFileInfo(str(path))).pixmap(QSize(size, size), 2.0)
+            cls.cache[key] = cls.provider.icon(QFileInfo(str(path))).pixmap(QSize(size, size), dpr)
         return cls.cache[key]
 
 
@@ -221,8 +254,8 @@ class ModeSwitch(QWidget):
         self.setFixedSize(self.SIZE * len(self.ITEMS) + 8, self.SIZE + 6)
         self.setMouseTracking(True)
         self.setCursor(Qt.PointingHandCursor)
-        self.left = Spring(4, 380, 0.8, lambda v: self.update())
-        self.right = Spring(4 + self.SIZE, 380, 0.8, lambda v: self.update())
+        self.left = Spring(4, 380, 0.8, lambda v: self.update(), precision=0.1)
+        self.right = Spring(4 + self.SIZE, 380, 0.8, lambda v: self.update(), precision=0.1)
 
     def set(self, index, animate=True):
         moving_right = index > self.index
@@ -270,7 +303,7 @@ class ModeSwitch(QWidget):
         p.setPen(QPen(pal['rim_top'], 0.8))
         p.drawRoundedRect(pill, self.SIZE / 2, self.SIZE / 2)
         for i, (name, _) in enumerate(self.ITEMS):
-            rect = QRectF(4 + i * self.SIZE + 9, 12, 16, 16)
+            rect = snapped(QRectF(4 + i * self.SIZE + 9, 12, 16, 16), self)
             if name == 'sparkle' and i == self.index:
                 p.drawPixmap(rect, sparkle_pixmap(16), QRectF())
             else:
@@ -306,7 +339,7 @@ class ShimmerLabel(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.TextAntialiasing)
         pal = self.win.pal
-        font = QFont('Segoe UI', 10)
+        font = text_font(10)
         p.setFont(font)
         if self.active and not Motion.reduced:
             width = max(1, QFontMetrics(font).horizontalAdvance(self.text))
@@ -332,10 +365,10 @@ class ResultList(QWidget):
         self.win, self.scroll = win, scroll
         self.items, self.rows, self.current, self.hover = [], [], -1, -1
         self.setMouseTracking(True)
-        self.top = Spring(0, 500, 0.82, lambda v: self.update())
-        self.bottom = Spring(0, 500, 0.82, lambda v: self.update())
+        self.top = Spring(0, 500, 0.82, lambda v: self.update(), precision=0.1)
+        self.bottom = Spring(0, 500, 0.82, lambda v: self.update(), precision=0.1)
         self.reveal = Spring(1, 90, 1.0, lambda v: self.update())
-        self.scroll_spring = Spring(0, 300, 1.0, lambda v: self.scroll.verticalScrollBar().setValue(int(v)))
+        self.scroll_spring = Spring(0, 300, 1.0, lambda v: self.scroll.verticalScrollBar().setValue(int(v)), precision=0.1)
 
     def set_items(self, items):
         """items: list of ('header', text) or ('row', dict)."""
@@ -435,11 +468,9 @@ class ResultList(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(pal['accent'])
             p.drawRoundedRect(QRectF(6, top + 1, width - 12, bottom - top - 2), 9, 9)
-        title_font = QFont('Segoe UI', 10)
-        title_font.setWeight(QFont.Medium)
-        sub_font = QFont('Segoe UI', 8.5)
-        head_font = QFont('Segoe UI', 8.5)
-        head_font.setWeight(QFont.DemiBold)
+        title_font = text_font(10, QFont.Medium)
+        sub_font = text_font(9)
+        head_font = text_font(9, QFont.DemiBold)
         row_number = -1
         for index, (kind, value) in enumerate(self.items):
             y, h = self.layout_y[index]
@@ -466,7 +497,7 @@ class ResultList(QWidget):
             secondary = _mix(pal['secondary'], QColor(255, 255, 255, 200), cover)
             pixmap = value.get('pixmap')
             if pixmap is not None and not pixmap.isNull():
-                target = QRectF(16, y + offset + (h - 30) / 2, 30, 30)
+                target = snapped(QRectF(16, y + offset + (h - 30) / 2, 30, 30), self)
                 if value.get('rounded'):
                     path = QPainterPath()
                     path.addRoundedRect(target, 6, 6)
@@ -516,7 +547,18 @@ class EmptyState(QWidget):
             layout.addWidget(widget, 0, Qt.AlignCenter)
         layout.addLayout(self.buttons)
 
+    def blank(self):
+        """Show nothing (while the panel collapses, or until results for a new query arrive)."""
+        for widget in (self.art, self.title, self.text):
+            widget.hide()
+        while self.buttons.count():
+            item = self.buttons.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
     def show_state(self, title, text, actions=(), art='search'):
+        for widget in (self.art, self.title, self.text):
+            widget.show()
         self.art.setPixmap(sparkle_pixmap(44) if art == 'sparkle' else logo_pixmap(48) if art == 'logo'
                            else icon_pixmap(art, 40, self.win.pal['tertiary']))
         self.title.setText(title)
@@ -603,6 +645,7 @@ class SearchView(QWidget):
         self.win = win
         self.generation = 0
         self.query = ''
+        self.shown = None  # the query whose results (or "no results") are showing
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -696,7 +739,14 @@ class SearchView(QWidget):
         if problem and not self.query:
             self.empty.show_state(*problem)
             self.stack.setCurrentIndex(0)
+        elif self.shown is not None:
+            self.blank()  # the old results must not shrink away with the panel
         self.win.update_height()
+
+    def blank(self):
+        self.shown = None
+        self.empty.blank()
+        self.stack.setCurrentIndex(0)
 
     def run(self):
         self.generation += 1
@@ -711,6 +761,7 @@ class SearchView(QWidget):
                 lambda error: generation == self.generation and self.show_error(error))
 
     def show_error(self, error):
+        self.shown = None
         self.empty.show_state('Search unavailable', str(error), [('Rescan', self.win.start_index)], 'warning')
         self.stack.setCurrentIndex(0)
         self.win.update_height()
@@ -727,6 +778,7 @@ class SearchView(QWidget):
     def show(self, results, generation, query, pending=None):
         if generation != self.generation:
             return
+        self.shown = query
         if not results and pending and any(pending.values()):
             count = sum(pending.values())
             self.empty.show_state('Your folder has changed', f'{count} file{"s" * (count != 1)} added, changed or removed since the last '
@@ -794,8 +846,9 @@ class SearchView(QWidget):
         if Path(item['path']).suffix.lower() in IMAGE_SUFFIXES and absolute.is_file():
             pixmap = QPixmap(str(absolute))
             if not pixmap.isNull():
-                scaled = pixmap.scaled(330 * 2, 150 * 2, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                scaled.setDevicePixelRatio(2)
+                dpr = self.devicePixelRatioF()  # exactly the screen's ratio: shown 1:1, not resampled
+                scaled = pixmap.scaled(round(330 * dpr), round(150 * dpr), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                scaled.setDevicePixelRatio(dpr)
                 self.image.setPixmap(_rounded(scaled, 10))
                 self.image.show()
         elif Path(item['path']).suffix.lower() in VIDEO_SUFFIXES and absolute.is_file():
@@ -806,8 +859,9 @@ class SearchView(QWidget):
                     return
                 pixmap = QPixmap()
                 if pixmap.loadFromData(data, 'PNG'):
-                    scaled = pixmap.scaled(330 * 2, 170 * 2, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    scaled.setDevicePixelRatio(2)
+                    dpr = self.devicePixelRatioF()
+                    scaled = pixmap.scaled(round(330 * dpr), round(170 * dpr), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    scaled.setDevicePixelRatio(dpr)
                     self.image.setPixmap(_rounded(scaled, 10))
                     self.image.show()
                     fade_in(self.image)
@@ -926,13 +980,43 @@ def _highlight(text, query, pal):
     return f"<div style='font-size:10pt; line-height:150%'>{escaped}</div>"
 
 
+def chip_colors(pal):
+    return {'accent': pal['accent'].name(), 'chip': rgba(pal['accent'], .16), 'fill': rgba(pal['fill_strong']),
+            'tag': rgba(pal['fill_strong']), 'secondary': rgba(pal['secondary'])}
+
+
+def passage_html(text, sentence, pal, limit=1400):
+    """A cited passage with the sentence that supports the answer highlighted (trimmed around it when long)."""
+    text = text or ''
+    start = text.find(sentence) if sentence else -1
+    if len(text) > limit:
+        begin = max(0, min(start - limit // 3, len(text) - limit)) if start >= 0 else 0
+        text = ('…' if begin else '') + text[begin:begin + limit] + ('…' if begin + limit < len(text) else '')
+        start = text.find(sentence) if sentence else -1
+    if start < 0:
+        return html.escape(text).replace('\n', '<br>')
+    accent = pal['accent']
+    mark = f"<span style='background-color: rgba({accent.red()},{accent.green()},{accent.blue()},0.28);'>"
+    return (html.escape(text[:start]) + mark + html.escape(sentence) + '</span>' + html.escape(text[start + len(sentence):])).replace('\n', '<br>')
+
+
+def cite_preview(source, pal):
+    """Tooltip for a citation chip: file, place, and the supporting sentence."""
+    quote = source.get('highlight') or (source.get('text') or '')[:260]
+    if len(quote) > 320:
+        quote = quote[:320].rsplit(' ', 1)[0] + '…'
+    return (f"<b>{html.escape(source.get('filename', ''))}</b> <span style='color:{rgba(pal['secondary'])}'>· "
+            f"{html.escape(source.get('location', ''))}</span><br><div style='max-width: 360px'>{html.escape(quote)}</div>")
+
+
 class Turn(QWidget):
-    """One exchange: your question in a bubble on the right, Alfred's answer on the left with its sources."""
+    """One exchange: your question in a bubble on the right, Alfred's answer on the left with numbered citation chips and,
+    under it, one row per cited file."""
 
     def __init__(self, view, question, scope=None):
         super().__init__()
         self.view, self.win, self.question = view, view.win, question
-        self.text, self.result = '', None
+        self.text, self.result, self.cited, self.rows = '', None, {}, []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 6, 0, 12)
         layout.setSpacing(8)
@@ -957,10 +1041,12 @@ class Turn(QWidget):
         head.addWidget(self.status, 1)
         layout.addLayout(head)
         self.body = QLabel()
-        self.body.setTextFormat(Qt.MarkdownText)
+        self.body.setTextFormat(Qt.RichText)
         self.body.setWordWrap(True)
         self.body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
         self.body.setStyleSheet('font-size: 10.5pt;')
+        self.body.linkHovered.connect(self.hover_cite)
+        self.body.linkActivated.connect(self.open_cite)
         self.body.hide()
         layout.addWidget(self.body)
         self.sources = QVBoxLayout()
@@ -976,6 +1062,9 @@ class Turn(QWidget):
         if isinstance(items, tuple) and items and items[0] == 'status':
             self.status.set(items[1], True)
             return
+        if isinstance(items, tuple) and items and items[0] == 'cite':
+            self.cited[items[1]] = items[2]  # a new citation while streaming: its chip can preview it now
+            return
         self.status.set(f'Reading {len(items)} source{"s" * (len(items) != 1)}…' if items else 'No matching passages', True)
 
     def add_token(self, token):
@@ -987,41 +1076,81 @@ class Turn(QWidget):
         self.text += token
 
     def render(self):
-        self.body.setText(self.text)
+        self.body.setText(render.answer_html(self.text, chip_colors(self.win.pal)))
         self.view.follow()
 
-    def _show_sources(self, citations, used):
-        for number, item in enumerate(citations):
-            source = SourceRow(self, item, item['marker'] in used or not used)
-            self.sources.addWidget(source)
-            source.hide()
-            QTimer.singleShot(0 if Motion.reduced else 45 * number, lambda s=source: (s.show(), fade_in(s)))
+    def hover_cite(self, link):
+        source = self.cited.get(int(link[5:])) if link.startswith('cite:') and link[5:].isdigit() else None
+        if source is None:
+            QToolTip.hideText()
+            return
+        QToolTip.showText(QCursor.pos(), cite_preview(source, self.win.pal), self.body)
+
+    def open_cite(self, link):
+        if not (link.startswith('cite:') and link[5:].isdigit()):
+            return
+        number = int(link[5:])
+        for row in self.rows:
+            if any(item.get('marker') == number for item in row.items):
+                row.toggle(True, focus=number)
+                return
+
+    def _show_sources(self, citations, animate=True):
+        groups = {}
+        for item in citations:
+            groups.setdefault(item.get('path', ''), []).append(item)
+        for number, items in enumerate(groups.values()):
+            row = SourceRow(self, items)
+            self.rows.append(row)
+            self.sources.addWidget(row)
+            if animate:
+                row.hide()
+                QTimer.singleShot(0 if Motion.reduced else 45 * number, lambda r=row: (r.show(), fade_in(r)))
+
+    def copy(self):
+        lines = [self.text.strip()]
+        if self.cited:
+            lines.append('\nSources')
+            lines += [f"[{n}] {s.get('filename', '')} — {s.get('location', '')}" for n, s in sorted(self.cited.items())]
+        QApplication.clipboard().setText('\n'.join(lines))
+        self.win.toast('Answer copied', 'green')
 
     def _add_actions(self):
-        self.actions.addWidget(button('Copy', lambda: (QApplication.clipboard().setText(self.text), self.win.toast('Answer copied', 'green')),
-                                      'link', 'Copy the answer'))
+        self.actions.addWidget(button('Copy', self.copy, 'link', 'Copy the answer and its sources'))
         self.actions.addStretch()
+
+    def status_text(self, result, citations, model):
+        files = len({c.get('path') for c in citations})
+        if result.get('small_talk'):
+            return model
+        if citations:
+            count = len(citations)
+            text = (f"From {files} file{'s' * (files != 1)}" if count == files else
+                    f"From {count} source{'s' * (count != 1)} in {files} file{'s' * (files != 1)}")
+            if result.get('beyond'):
+                text += ' · plus general knowledge'
+        elif result.get('beyond'):
+            text = 'Not in your files · general knowledge'
+        else:
+            text = 'Not found in your files'
+        return f'{text} · {model}'
 
     def finish(self, result):
         self.flush.stop()
         self.result = result
         self.text = result['answer'] or self.text
+        citations = result.get('citations') or []
+        self.cited = {c['marker']: c for c in citations}
         self.render()
         self.body.show()
         info = result.get('provider', {})
         model = info.get('name') or info.get('model') or ''
-        where = f"via {info['group']}" if info.get('cloud') else 'on this PC'
-        used = result.get('used') or []
-        if result.get('grounded'):
-            status = f"From {len(used)} source{'s' * (len(used) != 1)} in your files · {model} {where}"
-        elif not result.get('citations'):
-            status = f'Not found in your files · {model}'
-        else:
-            status = f'No sources cited — your files may not cover this · {model}'
+        model += f" via {info['group']}" if info.get('cloud') else ' on this PC'
+        status = self.status_text(result, citations, model)
         if result.get('cancelled'):
             status += ' · stopped'
         self.status.set(status, False)
-        self._show_sources(result.get('citations') or [], used)
+        self._show_sources(citations)
         self._add_actions()
         self.view.follow()
 
@@ -1031,13 +1160,14 @@ class Turn(QWidget):
             self.fail(message['error'], setup=message.get('setup', False))
             return
         self.text = message.get('content') or ''
-        self.body.setText(self.text)
+        sources = [dict(s, marker=s['marker'] if isinstance(s.get('marker'), int) else n) for n, s in enumerate(message.get('sources') or [], 1)]
+        self.cited = {s['marker']: s for s in sources}
+        self.render()
         self.body.show()
-        sources = message.get('sources') or []
-        self.status.set(f"From {len(sources)} source{'s' * (len(sources) != 1)} · {message.get('model') or ''}" if sources
-                        else (message.get('model') or ''), False)
-        for item in sources:
-            self.sources.addWidget(SourceRow(self, item, True))
+        model = message.get('model') or ''
+        self.status.set(self.status_text({'beyond': message.get('beyond'), 'small_talk': message.get('small_talk')}, sources, model)
+                        if model else '', False)
+        self._show_sources(sources, animate=False)
         self._add_actions()
 
     def fail(self, error, setup=None):
@@ -1050,49 +1180,126 @@ class Turn(QWidget):
         self.body.show()
 
 
-class SourceRow(QWidget):
-    """A source chip under an answer; it springs open to show the passage, with Open / Show in folder."""
+class Drawer(QWidget):
+    """Reveals its content by clipping it rather than squeezing it. The content is laid out once at its full height,
+    so wrapped text never reflows or overlaps while the drawer springs open or shut."""
 
-    def __init__(self, turn, item, used):
+    def __init__(self, content):
         super().__init__()
-        self.turn, self.item, self.win = turn, item, turn.win
+        self.content = content
+        content.setParent(self)
+        self.setFixedHeight(0)
+        self.opened = False
+        self.spring = Spring(0, 330, 0.96, self._height, precision=0.1)
+
+    def full_height(self):
+        layout = self.content.layout()
+        return layout.totalHeightForWidth(self.width()) if layout.hasHeightForWidth() else self.content.sizeHint().height()
+
+    def resizeEvent(self, event):
+        self.content.setGeometry(0, 0, self.width(), self.full_height())
+        if self.opened and self.spring.value == self.spring.target:
+            self.spring.snap(self.full_height())  # the panel changed width while open: follow the reflowed text
+
+    def _height(self, value):
+        try:
+            self.setFixedHeight(max(0, round(value)))
+        except RuntimeError:
+            DRIVER.springs.discard(self.spring)
+
+    def set_open(self, on):
+        self.opened = on
+        self.content.setGeometry(0, 0, self.width(), self.full_height())
+        self.spring.to(self.full_height() if on else 0)
+
+
+class SourceRow(QFrame):
+    """One cited file under an answer: its icon, name and the cited places as numbered chips. It springs open to show
+    each cited passage with the supporting sentence highlighted, and Open / Show in folder."""
+
+    def __init__(self, turn, items):
+        super().__init__()
+        self.turn, self.items, self.win = turn, items, turn.win
+        self.path = items[0].get('path', '')
+        self.setObjectName('sourcerow')
+        self.setAttribute(Qt.WA_Hover)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(4)
-        text = f"{item.get('marker', '')}   {item['filename']}   ·   {item.get('location', '')}".strip()
-        if not used:
-            text += '   (retrieved, not cited)'
-        self.chip = button(text, self.toggle, 'source', 'Show the passage')
-        self.chip.setProperty('used', 'true' if used else 'false')
-        self.chip.setIcon(QIcon(FileIcons.get(item['path'], 16)))
-        layout.addWidget(self.chip)
-        self.box = QFrame()
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        art = QLabel()
+        art.setPixmap(FileIcons.get(self.path, 16))
+        top.addWidget(art)
+        name = label(items[0].get('filename') or Path(self.path).name, 'name')
+        name.setToolTip(self.path)
+        top.addWidget(name)
+        pal = self.win.pal
+        places = '&nbsp;&nbsp;'.join(
+            f"<span style='color:{pal['accent'].name()}; background-color:{rgba(pal['accent'], .16)};'>&nbsp;{html.escape(str(i.get('marker', '')))}&nbsp;</span>"
+            f"&nbsp;<span style='color:{rgba(pal['secondary'])};'>{html.escape(i.get('location', ''))}</span>" for i in items)
+        self.places = QLabel(places)
+        self.places.setTextFormat(Qt.RichText)
+        self.places.setStyleSheet('font-size: 9pt;')
+        top.addWidget(self.places, 1)
+        self.chevron = Chevron(self.win)
+        top.addWidget(self.chevron)
+        layout.addLayout(top)
+        self.box = QWidget()
         box = QVBoxLayout(self.box)
-        box.setContentsMargins(14, 8, 14, 10)
-        box.addWidget(label((item.get('snippet_full') or item.get('snippet') or '')[:1600], 'secondary', wrap=True, selectable=True))
+        box.setContentsMargins(24, 4, 0, 2)
+        box.setSpacing(6)
+        self.passages = {}
+        for item in items:
+            caption = label(f"{item.get('marker', '')} · {item.get('label') or item.get('location', '')}", 'caption')
+            box.addWidget(caption)
+            text = QLabel(passage_html(item.get('text') or item.get('snippet_full') or item.get('snippet') or '', item.get('highlight'), pal))
+            text.setTextFormat(Qt.RichText)
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            text.setObjectName('secondary')
+            box.addWidget(text)
+            self.passages[item.get('marker')] = caption
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(button('Open', self.open_file, 'link'))
         row.addWidget(button('Show in folder', self.reveal_file, 'link'))
         row.addStretch()
         box.addLayout(row)
-        self.box.setMaximumHeight(0)
-        layout.addWidget(self.box)
-        self.height_spring = Spring(0, 300, 0.85, self._height)
+        self.drawer = Drawer(self.box)
+        layout.addWidget(self.drawer)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip('Show the cited passages')
 
-    def _height(self, value):
-        try:
-            self.box.setMaximumHeight(max(0, int(value)))
-            self.turn.view.follow(soft=True)
-        except RuntimeError:
-            pass
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and event.position().y() < 34:
+            self.toggle()
 
-    def toggle(self):
-        opening = self.box.maximumHeight() < 5
-        self.height_spring.snap(self.box.maximumHeight())
-        self.height_spring.to(self.box.sizeHint().height() if opening else 0)
+    def toggle(self, opening=None, focus=None):
+        opening = not self.drawer.opened if opening is None else opening
+        self.chevron.set_open(opening)
+        self.drawer.set_open(opening)
+        if opening:
+            self.reveal(self.passages.get(focus))
+
+    def reveal(self, passage=None):
+        """Glide the chat so the opening passages (or the one a citation chip points at) end up in view."""
+        view = self.turn.view
+        bar = view.scroll.verticalScrollBar()
+        top = self.mapTo(view.scroll.widget(), QPoint(0, 0)).y()
+        if passage is not None:
+            start = top + self.drawer.y() + passage.mapTo(self.box, QPoint(0, 0)).y()
+            end = start + passage.height() + 80  # the caption and the start of its passage
+        else:
+            start, end = top, top + self.drawer.y() + self.drawer.full_height() + 8
+        visible = view.scroll.viewport().height()
+        if start >= bar.value() and end <= bar.value() + visible:
+            return
+        view.scroll_spring.snap(bar.value())
+        view.scroll_spring.to(max(0, min(start - 12, end - visible)) if passage is None else max(0, start - 60))
 
     def target(self):
-        return self.win.index.resolve(self.item['path'])
+        return self.win.index.resolve(self.path)
 
     def open_file(self):
         try:
@@ -1235,13 +1442,29 @@ class HistoryPanel(QWidget):
         layout.addWidget(self.scroll, 1)
         self.empty = label('Your chats will appear here.', 'caption', wrap=True)
         layout.addWidget(self.empty)
-        self.width_spring = Spring(0, 300, 0.88, self._width)
+        self.width_spring = Spring(0, 300, 0.88, self._width, precision=0.1)
 
     def _width(self, value):
         value = max(0, int(value))
         self.setFixedWidth(value)
         self.inner.move(value - self.WIDTH, 0)  # slides in from the left edge
         self.setVisible(value > 0)
+        if self.width_spring.value == self.width_spring.target and not self.width_spring.velocity:
+            self._unfreeze()
+
+    def _freeze(self, target):
+        """Hold the chat at the width it will have once the sidebar arrives. Re-wrapping every answer at a new width on
+        each frame of the slide is what made it stutter; this way the chat is laid out once and simply moves."""
+        holder = self.view.scroll.widget()
+        width = self.view.scroll.viewport().width() + self.width() - target
+        if width > 0:
+            holder.setFixedWidth(width)
+
+    def _unfreeze(self):
+        holder = self.view.scroll.widget()
+        if holder.minimumWidth() or holder.maximumWidth() < 16777215:
+            holder.setMinimumWidth(0)
+            holder.setMaximumWidth(16777215)
 
     def resizeEvent(self, event):
         self.inner.setFixedHeight(self.height())
@@ -1253,7 +1476,10 @@ class HistoryPanel(QWidget):
     def set_open(self, on, animate=True):
         if on:
             self.refresh()
-        (self.width_spring.to if animate else self.width_spring.snap)(self.WIDTH if on else 0)
+        target = self.WIDTH if on else 0
+        if animate and not Motion.reduced and self.view.isVisible() and target != self.width_spring.value:
+            self._freeze(target)
+        (self.width_spring.to if animate else self.width_spring.snap)(target)
 
     def refresh(self):
         for row in self.rows:
@@ -1415,11 +1641,12 @@ class AskView(QWidget):
         self.thread.addStretch()
         self.scroll.setWidget(holder)
         self.stack.addWidget(self.scroll)
-        self.scroll_spring = Spring(0, 260, 1.0, lambda v: self.scroll.verticalScrollBar().setValue(int(v)))
+        self.scroll_spring = Spring(0, 260, 1.0, lambda v: self.scroll.verticalScrollBar().setValue(int(v)), precision=0.1)
         self.show_title()
 
     # ---------------------------------------------------------------- state
     def activated(self):
+        self.stack.show()
         self.refresh_intro()
         self.history_button.setVisible(self.saving)
         if self.saving and not self.panel.is_open and not self.win.settings.get('sidebar_collapsed') and self.store.list():
@@ -1434,6 +1661,11 @@ class AskView(QWidget):
             self.win.search.setPlaceholderText(f'Ask about {Path(self.scope).name}…')
         settings = dict(self.win.settings)
         run_job(lambda s: providers.catalog(settings), self.models_loaded)
+
+    def deactivated(self):
+        """Leaving Ask AI: the chat is hidden at once (it was photographed for the transition already), so no frame of it
+        can show while another view slides in, and it is laid out afresh when it comes back."""
+        self.stack.hide()
 
     @property
     def saving(self):
@@ -1530,9 +1762,9 @@ class AskView(QWidget):
         settings = self.win.settings
         if cloud and kind not in (settings.get('cloud_ok') or []):
             group = providers.GROUPS[kind]
-            answer = QMessageBox.question(self, f'Use {group}?',
-                                          f'Answers will come from {group}, so your questions — and, once Alfred answers from your documents, '
-                                          'the few passages it finds for each question — are sent to that service. '
+            answer = ask_box(self, f'Use {group}?',
+                                          f'Answers will come from {group}, so your questions and the few passages Alfred finds '
+                                          'in your files for each question are sent to that service. '
                                           'Your files themselves stay on this PC, and indexing and search stay local.',
                                           QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
             if answer != QMessageBox.Ok:
@@ -1598,12 +1830,17 @@ class AskView(QWidget):
         self.turns = []
 
     def new_chat(self, quiet=False):
-        self.clear_scope()
-        self.clear_thread()
-        self.chat = None
-        self.panel.select(None)
-        self.show_title()
-        self.stack.setCurrentIndex(0)
+        def change():
+            self.clear_scope()
+            self.clear_thread()
+            self.chat = None
+            self.panel.select(None)
+            self.show_title()
+            self.stack.setCurrentIndex(0)
+        if self.win.mode == ASK and self.turns:
+            self.win.transition(change)
+        else:
+            change()
         if self.win.mode == ASK:
             self.win.search.setFocus()
         if not quiet:
@@ -1618,28 +1855,33 @@ class AskView(QWidget):
             self.win.toast('That chat is gone — it may have been deleted', 'orange')
             self.panel.refresh()
             return
-        self.clear_scope()
-        self.clear_thread()
-        self.chat = chat
-        messages = chat['messages']
-        for number, message in enumerate(messages):
-            if message.get('role') != 'user':
-                continue
-            turn = Turn(self, message.get('content', ''), message.get('scope'))
-            reply = messages[number + 1] if number + 1 < len(messages) and messages[number + 1].get('role') == 'assistant' else None
-            if reply:
-                turn.restore(reply)
-                if reply.get('content') and not reply.get('error'):
-                    self.history += [{'role': 'user', 'content': message['content']}, {'role': 'assistant', 'content': reply['content']}]
-            else:
-                turn.status.set('No answer was saved', False)
-            self.turns.append(turn)
-            self.thread.insertWidget(self.thread.count() - 1, turn)
-        self.panel.select(chat_id)
-        self.show_title()
-        self.stack.setCurrentIndex(1 if self.turns else 0)
-        fade_in(self.scroll)
-        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
+        def change():
+            self.clear_scope()
+            self.clear_thread()
+            self.chat = chat
+            messages = chat['messages']
+            for number, message in enumerate(messages):
+                if message.get('role') != 'user':
+                    continue
+                turn = Turn(self, message.get('content', ''), message.get('scope'))
+                reply = messages[number + 1] if number + 1 < len(messages) and messages[number + 1].get('role') == 'assistant' else None
+                if reply:
+                    turn.restore(reply)
+                    if reply.get('content') and not reply.get('error'):
+                        self.history += [{'role': 'user', 'content': message['content']}, {'role': 'assistant', 'content': reply['content']}]
+                else:
+                    turn.status.set('No answer was saved', False)
+                self.turns.append(turn)
+                self.thread.insertWidget(self.thread.count() - 1, turn)
+            self.panel.select(chat_id)
+            self.show_title()
+            self.stack.setCurrentIndex(1 if self.turns else 0)
+            # Lay the chat out now and open it at its end, so not even one frame shows it scrolled to the top.
+            QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
+            bar = self.scroll.verticalScrollBar()
+            bar.setValue(bar.maximum())
+            QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+        self.win.transition(change)
         self.win.search.setFocus()
 
     def record(self, question, scope, reply):
@@ -1702,9 +1944,12 @@ class AskView(QWidget):
         def done(result):
             turn.finish(result)
             self.history += [{'role': 'user', 'content': question}, {'role': 'assistant', 'content': result['answer']}]
-            sources = [{k: item.get(k) for k in ('marker', 'path', 'filename', 'location', 'segment_id', 'snippet_full')}
+            sources = [{k: item.get(k) for k in ('marker', 'path', 'filename', 'folder', 'kind', 'location', 'label', 'segment_id', 'text',
+                                                 'highlight')}
                        for item in result.get('citations') or []]
-            self.record(question, scope, {'content': result['answer'], 'sources': sources, 'error': None})
+            self.record(question, scope, {'content': result['answer'], 'sources': sources, 'error': None,
+                                          'beyond': bool(result.get('beyond')), 'small_talk': bool(result.get('small_talk')),
+                                          'query': result.get('query')})
             self.end()
 
         def failed(error):
@@ -1945,7 +2190,7 @@ class TrackedFolders(QWidget):
         foot.addStretch()
         self.list.addWidget(self.footer)
         self.card.addWidget(self.body)
-        self.height = Spring(0, 300, 0.86, self._height)
+        self.height = Spring(0, 300, 0.86, self._height, precision=0.1)
 
         self.auto_line = self._hairline()
         self.card.addWidget(self.auto_line)
@@ -2030,6 +2275,8 @@ class TrackedFolders(QWidget):
                     row.set_status(f"Describing pictures {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
                 elif phase == 'reading video':
                     row.set_status(f"Reading video {state.get('frame', 0)}/{state.get('frames', 0)}", 'accent')
+                elif phase == 'reading tables':
+                    row.set_status(f"Reading tables in PDFs {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
                 else:
                     row.set_status(f"Indexing {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
             elif self.win.indexing and key not in stats:
@@ -2135,6 +2382,34 @@ class SettingsView(QWidget):
         self.location = label('', 'caption', wrap=True)
         g.outer.addWidget(self.location)
         g.outer.addWidget(self.effort_note)
+        body.addWidget(g)
+
+        g = Group(win, 'ANSWERS FROM YOUR FILES', 'Alfred finds passages by keyword and by meaning, ranks them, and the chat model answers '
+                                                 'from them, citing each one. Passages are treated as data, never as instructions.')
+        self.beyond = Toggle(pal)
+        g.row('Allow answers beyond your files', self.beyond,
+              'The model may add general knowledge after what your files say — marked “General knowledge” and never cited')
+        self.rerank_model = QComboBox()
+        for name, info in rerank.MODELS.items():
+            self.rerank_model.addItem(f"{info['label']} · {info['languages']} · {info['size_mb']} MB", name)
+        self.rerank_model.setMinimumWidth(300)
+        self.rerank_button = button('Download…', self.rerank_action)
+        self.rerank_gpu_button = button('GPU version…', self.rerank_gpu_action)
+        self.rerank_gpu_button.setToolTip('A half-precision copy of the model that your graphics card runs several times faster')
+        self.rerank_gpu_button.hide()
+        rr = QHBoxLayout()
+        rr.addWidget(self.rerank_model)
+        rr.addWidget(self.rerank_button)
+        rr.addWidget(self.rerank_gpu_button)
+        g.row('Reranker', rr, 'Reads your question together with each candidate passage and keeps the most relevant. Runs on this PC.')
+        self.rerank_enabled = Toggle(pal)
+        g.row('Rerank passages', self.rerank_enabled, 'When off (or not downloaded), passages keep the keyword + meaning order')
+        self.rerank_status = label('', 'caption', wrap=True)
+        g.outer.addWidget(self.rerank_status)
+        self.contextual = Toggle(pal)
+        g.row('Add AI context to passages', self.contextual,
+              'While indexing, the vision model writes a line saying where each passage sits in its document. Finds more; indexing is slower.')
+        self.rerank_job = None
         body.addWidget(g)
 
         g = Group(win, 'ACCOUNTS', 'Use Claude or ChatGPT with your subscription (through their official command-line tools, which you sign in to '
@@ -2261,8 +2536,10 @@ class SettingsView(QWidget):
         self.embed_batch.valueChanged.connect(lambda _: self.save_timer.start(600))
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
         self.keep_minutes.valueChanged.connect(lambda _: self.save_timer.start(600))
-        for toggle in (self.embed_enabled, self.ocr_enabled, self.vision_enabled, self.reduce_motion, self.auto_index, self.autostart, self.save_chats):
+        for toggle in (self.embed_enabled, self.ocr_enabled, self.vision_enabled, self.reduce_motion, self.auto_index, self.autostart, self.save_chats,
+                       self.beyond, self.rerank_enabled, self.contextual):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
+        self.rerank_model.currentIndexChanged.connect(lambda _: (self.save_timer.start(250), self.show_rerank()))
         self.loading = False
         guard_wheel(self)
 
@@ -2289,8 +2566,13 @@ class SettingsView(QWidget):
         self.auto_index.setChecked(bool(s.get('auto_index', True)))
         self.autostart.setChecked(bool(s.get('ollama_autostart', True)))
         self.keep_minutes.setValue(max(5, int(s.get('keep_alive_minutes') or 5)))
+        self.beyond.setChecked(bool(s.get('answer_beyond_files', True)))
+        self.rerank_enabled.setChecked(bool(s.get('rerank_enabled', True)))
+        self.rerank_model.setCurrentIndex(max(0, self.rerank_model.findData(s.get('rerank_model') or rerank.DEFAULT)))
+        self.contextual.setChecked(bool(s.get('contextual_chunks')))
         for widget in self.findChildren(QWidget):
             widget.blockSignals(False)
+        self.show_rerank()
         self.load_models()
         self.load_effort()
         self.show_chats_info()
@@ -2299,6 +2581,95 @@ class SettingsView(QWidget):
         self.tracked.load()
         self.show_index_info()
         self.loading = False
+
+    def show_rerank(self):
+        if self.rerank_job is not None:
+            return
+        state = rerank.state(dict(self.win.settings, rerank_model=self.rerank_model.currentData()))
+        self.rerank_button.setText('Remove' if state['installed'] else f"Download ({state['size_mb']} MB)…")
+        self.rerank_gpu_button.setVisible(bool(state['installed'] and state['gpu'] and state['gpu_size_mb']))
+        self.rerank_gpu_button.setText('Remove GPU version' if state['gpu_model'] else f"GPU version ({state['gpu_size_mb']:,} MB)…")
+        if state['installed'] and state['gpu']:
+            state['detail'] += ' · half precision' if state['gpu_model'] else ' · 8-bit (the GPU version is faster)'
+        self.rerank_status.setText(f"Reranker: {state['detail']}" if state['installed'] else
+                                   f"Reranker not downloaded — answers use the keyword + meaning order. {state['label']} is "
+                                   f"{state['size_mb']} MB from Hugging Face, checked against its published checksum.")
+
+    def rerank_action(self):
+        name = self.rerank_model.currentData()
+        info = rerank.spec(name)
+        if self.rerank_job is not None:
+            self.rerank_job.set()
+            return
+        if rerank.installed(name):
+            answer = ask_box(self, 'Remove the reranker?', f"Delete {info['label']} ({info['size_mb']} MB) from this PC? "
+                                          'Answers will use the keyword + meaning order until you download it again.',
+                                          QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if answer == QMessageBox.Yes:
+                rerank.remove(name)
+                self.show_rerank()
+            return
+        answer = ask_box(self, 'Download the reranker?',
+                                      f"Download {info['label']} ({info['size_mb']} MB, {info['languages']}) from huggingface.co/{info['repo']}? "
+                                      'It runs on this PC; nothing about your files is sent anywhere.', QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+        if answer != QMessageBox.Ok:
+            return
+        self.rerank_job = cancel = threading.Event()
+        self.rerank_button.setText('Stop')
+
+        def progress(value):
+            done, total = value
+            self.rerank_status.setText(f'Downloading {info["label"]}… {done / 2 ** 20:,.0f} of {total / 2 ** 20:,.0f} MB')
+
+        def finished(result=None, error=None):
+            self.rerank_job = None
+            self.show_rerank()
+            if error is not None:
+                self.win.toast(str(error), 'orange' if cancel.is_set() else 'red', seconds=6)
+            else:
+                self.win.toast(f"{info['label']} is ready — answers now use it", 'green', seconds=4)
+                run_job(lambda s: rerank.for_settings(dict(self.win.settings)) and None)  # load it now, not on the next question
+        run_job(lambda s: rerank.download(name, lambda d, t: s.progress.emit((d, t)), cancel), lambda r: finished(r),
+                lambda e: finished(error=e), progress=progress)
+
+    def rerank_gpu_action(self):
+        name = self.rerank_model.currentData()
+        info = rerank.spec(name)
+        if self.rerank_job is not None:
+            self.rerank_job.set()
+            return
+        if rerank.gpu_model_installed(name):
+            answer = ask_box(self, 'Remove the GPU version?', f"Delete the GPU version of {info['label']} ({info['gpu_size_mb']:,} MB)? "
+                             'The reranker keeps working with the smaller copy.', QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if answer == QMessageBox.Yes:
+                for local in info.get('gpu_files', {}):
+                    (rerank.folder(name) / local).unlink(missing_ok=True)
+                rerank.forget()
+                self.show_rerank()
+            return
+        answer = ask_box(self, 'Download the GPU version?',
+                         f"Download the half-precision copy of {info['label']} ({info['gpu_size_mb']:,} MB) from huggingface.co/{info['repo']}? "
+                         'Your graphics card runs it several times faster, and it scores closer to the original model.',
+                         QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+        if answer != QMessageBox.Ok:
+            return
+        self.rerank_job = cancel = threading.Event()
+        self.rerank_gpu_button.setText('Stop')
+
+        def progress(value):
+            done, total = value
+            self.rerank_status.setText(f'Downloading the GPU version… {done / 2 ** 20:,.0f} of {total / 2 ** 20:,.0f} MB')
+
+        def finished(result=None, error=None):
+            self.rerank_job = None
+            self.show_rerank()
+            if error is not None:
+                self.win.toast(str(error), 'orange' if cancel.is_set() else 'red', seconds=6)
+            else:
+                self.win.toast('The reranker now runs on your graphics card', 'green', seconds=4)
+                run_job(lambda s: rerank.for_settings(dict(self.win.settings)) and None)
+        run_job(lambda s: rerank.download(name, lambda d, t: s.progress.emit((d, t)), cancel, gpu=True), lambda r: finished(r),
+                lambda e: finished(error=e), progress=progress)
 
     def show_index_info(self):
         st = self.win.status
@@ -2423,8 +2794,7 @@ class SettingsView(QWidget):
             self.load_models()
             return
         title, prompt = names[kind]
-        from PySide6.QtWidgets import QInputDialog
-        value, ok = QInputDialog.getText(self, title, prompt + '\nIt’s stored in Windows Credential Manager.', QLineEdit.Password)
+        value, ok = ask_text(self, title, prompt + '\nIt’s stored in Windows Credential Manager.', QLineEdit.Password)
         if not ok or not value.strip():
             return
         try:
@@ -2493,7 +2863,7 @@ class SettingsView(QWidget):
         count = len(store.list())
         if not count:
             return
-        answer = QMessageBox.question(self, 'Delete all chats?', f'This permanently deletes {count} saved chat{"s" * (count != 1)} from '
+        answer = ask_box(self, 'Delete all chats?', f'This permanently deletes {count} saved chat{"s" * (count != 1)} from '
                                       f'{store.folder}. It can’t be undone.', QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
         if answer != QMessageBox.Yes:
             return
@@ -2546,7 +2916,8 @@ class SettingsView(QWidget):
         if self.loading:
             return
         s = self.win.settings
-        before = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'))
+        before = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'),
+                  s.get('contextual_chunks'))
         before_model = (s.get('provider'), s.get('model'))
         s.update(base_url=self.base_url.text().strip() or ai.OLLAMA_DEFAULT, compatible_base_url=self.compatible_url.text().strip())
         if self.effort.isEnabled() and self.effort.currentData() is not None:
@@ -2559,7 +2930,9 @@ class SettingsView(QWidget):
                   'video_interval': self.video_interval.value(), 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
                   'reduce_motion': self.reduce_motion.isChecked(), 'auto_index': self.auto_index.isChecked(),
                   'ollama_autostart': self.autostart.isChecked(), 'keep_alive_minutes': self.keep_minutes.value(),
-                  'save_chat_history': self.save_chats.isChecked()})
+                  'save_chat_history': self.save_chats.isChecked(), 'answer_beyond_files': self.beyond.isChecked(),
+                  'rerank_enabled': self.rerank_enabled.isChecked(), 'rerank_model': self.rerank_model.currentData() or rerank.DEFAULT,
+                  'contextual_chunks': self.contextual.isChecked()})
         s.save()
         self.win.watch_folders()
         Motion.detect(s)
@@ -2569,7 +2942,8 @@ class SettingsView(QWidget):
         if (s.get('provider'), s.get('model')) != before_model:
             self.load_effort()
             self.show_location()
-        after = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'))
+        after = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'),
+                 s.get('contextual_chunks'))
         if after != before:
             self.win.toast('Saved · updating your index', 'green', seconds=4)
             self.win.start_index(quiet=True)
@@ -2609,6 +2983,84 @@ class SettingsView(QWidget):
 
 
 # ------------------------------------------------------------------ window
+class Veil(QWidget):
+    """Transitions the panel's content: a snapshot of what was showing glides out while a snapshot of what comes next
+    glides in, both on one spring, and then the real widgets take over pixel for pixel.
+
+    The real widgets are swapped behind it (moved out of sight but still shown, so their layouts and scroll positions
+    settle) and photographed only once that has happened, so a transition never shows a half-updated view, such as the
+    last chat for a frame before the new one is laid out. Each frame is two pixmap blits: nothing is re-laid out or
+    re-rendered (a QGraphicsOpacityEffect re-renders its whole widget tree into a buffer on every frame)."""
+    SHIFT = 34  # how far content slides between modes
+
+    def __init__(self, parent, finished):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.finished = finished
+        self.old = self.new = None
+        self.direction, self.active, self.collapsing = 0, False, False
+        self.spring = Spring(0, 250, 0.84, self._step)  # slightly under-damped: settles with a soft liquid overshoot
+        self.hide()
+
+    def begin(self, old, direction, collapsing=False):
+        self.old, self.new, self.direction, self.active, self.collapsing = old, None, direction, True, collapsing
+        self.spring.snap(0)
+        self.raise_()
+        self.show()
+        self.update()
+
+    def arrive(self, new):
+        """The next view, laid out and photographed: start the glide."""
+        if not self.active:
+            return
+        self.new = new
+        self.spring.to(1)
+
+    def frame(self):
+        """What is on screen right now (to start the next transition from mid-flight)."""
+        return self.grab()
+
+    def _step(self, value):
+        if not self.active:
+            return
+        if self.new is not None and abs(1 - value) < 0.004 and abs(self.spring.velocity) < 0.06:
+            self.spring.value = self.spring.target = 1.0  # the tail is invisible: hand over now
+            self.spring.velocity = 0.0
+            self.stop()
+            return
+        self.update()
+
+    def stop(self):
+        if self.active:
+            self.active = False
+            self.old = self.new = None
+            self.hide()
+            self.finished()
+
+    def _draw(self, p, pixmap, opacity, dx, dy):
+        """A snapshot blitted 1:1: it was rendered at the screen's pixel ratio and its offset is rounded to whole device
+        pixels, so it is never resampled (no scaling, no smoothing) and looks exactly like the live widgets."""
+        if pixmap is None or opacity <= 0.003:
+            return
+        p.setOpacity(min(1.0, opacity))
+        # On the window's device-pixel grid (at 125 % the veil itself starts half a device pixel off it).
+        p.drawPixmap(snapped(QRectF(dx, dy, 1, 1), self).topLeft(), pixmap)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        t = self.spring.value if self.new is not None else 0.0
+        side = self.direction
+        ease = max(0.0, min(1.0, t))
+        if side:  # between modes: slide sideways, the old view leaving faster than the new one arrives
+            # Into a collapsing panel the old view is gone within the first third, so it never shrinks away visibly.
+            out = (1 - min(1.0, ease * 3)) ** 1.4 if self.collapsing else (1 - ease) ** 1.6
+            self._draw(p, self.old, out, -side * self.SHIFT * 0.6 * t, 0)
+            self._draw(p, self.new, min(1.0, ease * 1.5), side * self.SHIFT * (1 - t), 0)
+        else:  # new content in the same place (another chat): crossfade with a small lift
+            self._draw(p, self.old, (1 - ease) ** 1.4, 0, -6 * ease)
+            self._draw(p, self.new, min(1.0, ease * 1.4), 0, 10 * (1 - t))
+
+
 class AlfredWindow(QWidget):
     def __init__(self):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint)
@@ -2630,11 +3082,12 @@ class AlfredWindow(QWidget):
         self.backdrop, self.grab_origin = None, QPoint()
         self.setFixedSize(W + 2 * M, MAXH + 2 * M)
 
-        self.height_spring = Spring(BAR, 300, 0.86, self._height)
+        self.height_spring = Spring(BAR, 300, 0.86, self._height, precision=0.1)
         self.appear = Spring(0, 420, 0.82, self._appear)
-        self.glow_strength = Spring(0, 140, 1.0, lambda v: self.update())
+        # The glow only touches the panel's edge: repaint that ring, not the whole window and every widget in it.
+        self.glow_strength = Spring(0, 140, 1.0, lambda v: self.update(self.glow_region()))
         self.glow = Loop(3.0, self)
-        self.glow.tick.connect(lambda _: self.update())
+        self.glow.tick.connect(lambda _: self.update(self.glow_region()))
         self.shimmer = Loop(1.4, self)
         self.shimmer.tick.connect(lambda _: self.update(int(M), int(M + BAR - 2), W, 4))
 
@@ -2673,6 +3126,9 @@ class AlfredWindow(QWidget):
         row.addWidget(self.toast_action)
         row.addWidget(self.hints)
         inner.addWidget(footer)
+        self.veil = Veil(self.clip, self._transition_done)
+        self.veil.setGeometry(self.inner.geometry())
+        self.veil_token = 0
         self.toast_timer = QTimer(self, singleShot=True, timeout=self.end_toast)
         self.toasting = False
         self._height(BAR)
@@ -2705,19 +3161,103 @@ class AlfredWindow(QWidget):
 
     def _height(self, value):
         self.clip.setGeometry(M, M + BAR, W, max(0, int(value - BAR)))
-        self.update()
+        previous, self.painted_height = getattr(self, 'painted_height', None), value
+        if previous is None or min(previous, value) < BAR + SEPARATOR_FADE:
+            self.update()  # near the bar the separator line fades too
+            return
+        # Only the band around the moving bottom edge (its rounded corners and shadow) changes: repaint just that, not
+        # the whole translucent window, which on Windows means re-sending every pixel of it to the compositor.
+        top = M + min(previous, value) - R - 2
+        bottom = M + max(previous, value) + SHADOW_DROP + SHADOW_SPREAD + 2
+        self.update(0, int(top), self.width(), int(math.ceil(bottom - top)))
+
+    def glow_region(self):
+        rect = self.panel_rect().toAlignedRect()
+        return QRegion(rect.adjusted(-3, -3, 3, 3)).subtracted(QRegion(rect.adjusted(18, 18, -18, -18)))
+
+    # ---------------------------------------------------------- transitions
+    def transition(self, change, direction=0):
+        """Run ``change`` (it swaps what the content area shows) behind a glide between snapshots of before and after."""
+        if Motion.reduced or not self.isVisible() or self.hiding:
+            self.veil.stop()
+            change()
+            return
+        # Snapshots are taken at the screen's pixel ratio (QWidget.grab renders at devicePixelRatio), never scaled.
+        old = self.veil.frame() if self.veil.active else self.inner.grab()
+        Motion.instant = True  # anything the change animates (fades, reveals) is photographed finished
+        try:
+            change()
+        finally:
+            Motion.instant = False
+        self.inner.move(0, -self.inner.height() - 40)  # out of sight, still shown: layouts and scrolling settle
+        self.veil.begin(old, direction, collapsing=bool(direction) and not self.wants_expanded())
+        self.veil_token += 1
+        token = self.veil_token
+        # Photograph the new state on the next turn of the event loop, after the deferred layout and scroll updates.
+        QTimer.singleShot(0, lambda: token == self.veil_token and self._capture())
+
+    def _capture(self):
+        for spring in [s for s in DRIVER.springs if getattr(s, 'fade', False)]:
+            spring.snap(spring.target)  # a fade still running inside the content would be photographed half-done
+        QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
+        self.veil.arrive(self.inner.grab())
+
+    def _transition_done(self):
+        self.inner.move(0, 0)
+
+    def wants_expanded(self):
+        return self.mode != SEARCH or self.search_view.wants_expanded()
 
     def update_height(self):
-        expanded = self.mode != SEARCH or self.search_view.wants_expanded()
-        self.height_spring.to(MAXH if expanded else BAR)
+        self.height_spring.to(MAXH if self.wants_expanded() else BAR)
+
+    DROP = 14  # the panel drops in from this far above
 
     def _appear(self, value):
         self.setWindowOpacity(max(0.0, min(1.0, value)))
         if hasattr(self, 'base_pos'):
-            self.move(self.base_pos.x(), int(self.base_pos.y() - (1 - value) * 14))
+            self._place((1 - value) * self.DROP)
         if self.hiding and value < 0.03:
             self.hiding = False
             self.hide()
+
+    def _place(self, lift):
+        """Put the panel ``lift`` logical pixels above its resting place. On Windows the window is moved in whole device
+        pixels, so at 125 % or 150 % scaling the drop glides one device pixel at a time instead of stepping by 1.25 or
+        1.5 (Qt positions windows in whole logical pixels)."""
+        native = getattr(self, 'native_base', None)
+        if native is not None:
+            dpr = self.devicePixelRatioF()
+            import ctypes
+            # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW: just move the composited surface.
+            if ctypes.windll.user32.SetWindowPos(int(self.winId()), 0, native[0], native[1] - round(lift * dpr), 0, 0, 0x1 | 0x4 | 0x10 | 0x8):
+                return
+        self.move(self.base_pos.x(), round(self.base_pos.y() - lift))
+
+    def _native_base(self):
+        """The resting place in device pixels (read from Windows once the window sits there), or None elsewhere."""
+        if os.name != 'nt':
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            box = wintypes.RECT()
+            if ctypes.windll.user32.GetWindowRect(int(self.winId()), ctypes.byref(box)):
+                return box.left, box.top
+        except Exception:
+            pass
+        return None
+
+    def _start_appear(self):
+        if getattr(self, 'appear_pending', False):
+            self.appear_pending = False
+            self.appear.to(1)
+
+    def screen_changed(self, screen):
+        """Animations follow the refresh rate of whichever display the panel is on, and text is rendered for its scale."""
+        DRIVER.follow(screen, self)
+        if tune_text(screen.devicePixelRatio()):
+            self.apply_theme()  # re-polish: style-sheet fonts pick up the new rendering
 
     def show_panel(self):
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
@@ -2726,8 +3266,18 @@ class AlfredWindow(QWidget):
         self.capture_backdrop(screen)
         self.hiding = False
         self.appear.snap(0 if not Motion.reduced else 1)
-        self.move(self.base_pos.x(), self.base_pos.y() - 14)
+        self.native_base = None
+        self.move(self.base_pos)
+        handle = self.windowHandle()
+        if handle is not None and not getattr(self, 'screen_hooked', False):
+            handle.screenChanged.connect(self.screen_changed)
+            self.screen_hooked = True
+        if tune_text(screen.devicePixelRatio()):  # before the first frame on this display
+            self.apply_theme()  # re-polish: style-sheet fonts pick up the new rendering
         self.show()
+        DRIVER.follow(self.screen(), self)
+        self.native_base = self._native_base()
+        self._place(0 if Motion.reduced else self.DROP)
         self.raise_()
         self.activateWindow()
         if os.name == 'nt':
@@ -2736,7 +3286,9 @@ class AlfredWindow(QWidget):
                 ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
             except Exception:
                 pass
-        self.appear.to(1)
+        # The drop-in starts once the first frame is on screen (see paintEvent): that first paint and hand-over to the
+        # compositor is the slowest of all, and inside the animation it would swallow its opening frames.
+        self.appear_pending = True
         self.search.setFocus()
         self.search.selectAll()
         self.refresh_status()
@@ -2745,7 +3297,7 @@ class AlfredWindow(QWidget):
     def hide_panel(self):
         if not self.isVisible():
             return
-        self.hiding = True
+        self.hiding, self.appear_pending = True, False
         if Motion.reduced:
             self.hide()
             self.hiding = False
@@ -2777,11 +3329,11 @@ class AlfredWindow(QWidget):
         rect = self.panel_rect()
         paint_shadow(p, rect, R, self.pal['shadow'])
         origin = QPointF(0, 0) if self.grab_origin == QPoint(-1, -1) else QPointF(self.grab_origin - self.pos())
-        paint_glass(p, rect, R, self.pal, self.backdrop, origin)
-        icon_rect = QRectF(M + 22, M + (BAR - 22) / 2, 22, 22)
+        paint_glass(p, rect, R, self.pal, self.backdrop, origin, span=MAXH)
+        icon_rect = snapped(QRectF(M + 22, M + (BAR - 22) / 2, 22, 22), self)
         p.drawPixmap(icon_rect, sparkle_pixmap(22) if self.mode == ASK else icon_pixmap(
             {SEARCH: 'search', SETTINGS: 'gear'}.get(self.mode, 'search'), 22, self.pal['secondary']), QRectF())
-        expansion = max(0.0, min(1.0, (self.height_spring.value - BAR) / 60))
+        expansion = max(0.0, min(1.0, (self.height_spring.value - BAR) / SEPARATOR_FADE))
         if expansion > 0:
             sep = QColor(self.pal['separator'])
             sep.setAlphaF(sep.alphaF() * expansion)
@@ -2790,6 +3342,8 @@ class AlfredWindow(QWidget):
         if self.indexing:
             self.paint_progress(p)
         paint_glow(p, rect, R, self.glow.phase, self.glow_strength.value)
+        if getattr(self, 'appear_pending', False):
+            QTimer.singleShot(0, self._start_appear)  # after this frame has been handed to the compositor
 
     def paint_progress(self, p):
         y = M + BAR - 1.5
@@ -2832,15 +3386,24 @@ class AlfredWindow(QWidget):
             self.search.blockSignals(True)
             self.search.clear()
             self.search.blockSignals(False)
-        self.views.setCurrentIndex(mode)
-        view = self.views.currentWidget()
-        if hasattr(view, 'activated'):
-            view.activated()
+
+        def change():
+            leaving = self.views.currentWidget()
+            if previous != mode and hasattr(leaving, 'deactivated'):
+                leaving.deactivated()
+            self.views.setCurrentIndex(mode)
+            view = self.views.currentWidget()
+            if hasattr(view, 'activated'):
+                view.activated()
+            if mode == SEARCH:
+                if self.search_view.shown not in (None, self.search.text().strip()):
+                    self.search_view.blank()  # results for another query: never glide them in
+                self.search_view.set_query(self.search.text())
+            self.update_hints()
         if animate and previous != mode:
-            fade_in(view)
-        if mode == SEARCH:
-            self.search_view.set_query(self.search.text())
-        self.update_hints()
+            self.transition(change, 1 if mode > previous else -1)
+        else:
+            change()
         self.update_height()
         self.update()
         self.search.setFocus()
@@ -3085,7 +3648,7 @@ class AlfredWindow(QWidget):
             total, done = state.get('total', 0), state.get('done', 0)
             self.progress = done / total if total else None
             phase = {'scanning': 'Looking for files', 'indexing': 'Reading', 'embedding': 'Learning meaning', 'reading video': 'Reading video',
-                     'describing': 'Describing pictures',
+                     'describing': 'Describing pictures', 'reading tables': 'Reading tables',
                      'done': 'Finishing'}.get(state.get('phase'), state.get('phase'))
             if not self.toasting:
                 where = f" · {html.escape(Path(state['current']).name)}" if state.get('current') else ''
@@ -3226,7 +3789,8 @@ def send_command(message, reply=True, timeout_ms=60000):
 
 
 def serve_command(socket, window):
-    """Handle one command from send_command: show, track <folder>, search <query>, status."""
+    """Handle one command from send_command: show, track <folder>, search <query>, ask <question>, status,
+    rerank_download [model]."""
     if socket is None:
         return
     buffer = bytearray()
@@ -3256,7 +3820,17 @@ def serve_command(socket, window):
                     answer, lambda error: answer({'error': str(error)}))
         elif cmd == 'status':
             answer({'status': window.index.status(), 'folders': window.index.folder_stats(), 'indexing': window.indexing,
-                    'hotkey': window.active_hotkey, 'settings_file': str(window.settings.path)})
+                    'hotkey': window.active_hotkey, 'settings_file': str(window.settings.path),
+                    'reranker': rerank.state(window.settings)})
+        elif cmd == 'ask':
+            settings, index = window.settings, window.index
+            run_job(lambda s: rag.ask(index, settings, arg, message.get('history') or [], only_path=message.get('path')),
+                    answer, lambda error: answer({'error': str(error)}))
+        elif cmd == 'rerank_download':
+            settings = window.settings
+            name = arg or settings.get('rerank_model') or rerank.DEFAULT
+            gpu = bool(message.get('gpu'))
+            run_job(lambda s: (rerank.download(name, gpu=gpu), rerank.state(settings))[1], answer, lambda error: answer({'error': str(error)}))
         else:
             window.show_panel()
             answer({})
@@ -3281,6 +3855,7 @@ def run():
     logging.getLogger('alfred').setLevel(logging.INFO)
     logging.getLogger('alfred').info('Alfred %s starting', __version__)
     app = QApplication(sys.argv)
+    tune_text(app.primaryScreen().devicePixelRatio())
     app.setApplicationName(APP_NAME)
     app.setWindowIcon(app_icon())
     startup.register_app()
@@ -3297,6 +3872,7 @@ def run():
     # On quit, stop indexing at the next file and let background work finish before Python shuts down.
     app.aboutToQuit.connect(lambda: (window.index.cancel.set(), QThreadPool.globalInstance().waitForDone(5000)))
     server.newConnection.connect(lambda: serve_command(server.nextPendingConnection(), window))
+    run_job(lambda s: rerank.for_settings(dict(window.settings)) and None)  # load the reranker now, not on the first question
 
     hotkey_error = ''
     try:
