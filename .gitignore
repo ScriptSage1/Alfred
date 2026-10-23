@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Builds
+build/
+dist/
+*.spec
+
+# OS clutter
+Thumbs.db
+.DS_Store
