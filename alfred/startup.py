@@ -16,6 +16,9 @@ from pathlib import Path
 from . import REPO
 
 NAME = 'Alfred.lnk'
+# Windows identifies Alfred's notifications by this ID; register_app() gives it the name "Alfred".
+APP_ID = 'Alfred.Desktop'
+ASSETS = Path(__file__).resolve().parent / 'assets'
 FROZEN = getattr(sys, 'frozen', False)
 TASK_DELAY_MS = 15000  # give Windows and drivers a moment after sign-in before starting extra components
 
@@ -82,6 +85,34 @@ def relaunch_outside():
         return False
 
 
+def register_app():
+    """Tell Windows Alfred's display name, so notifications say "Alfred" (not the raw app ID).
+    Per-user (HKCU), no administrator rights; rewritten each start so it follows the install folder."""
+    if os.name != 'nt':
+        return
+    try:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf'Software\Classes\AppUserModelId\{APP_ID}') as key:
+            winreg.SetValueEx(key, 'DisplayName', 0, winreg.REG_SZ, 'Alfred')
+            # No IconUri: the notification already shows the large logo, so the header stays text-only.
+            for name in ('IconUri', 'IconBackgroundColor'):
+                try:
+                    winreg.DeleteValue(key, name)
+                except FileNotFoundError:
+                    pass
+    except OSError as error:
+        logging.getLogger('alfred').warning('Could not register Alfred with Windows notifications: %s', error)
+
+    def refresh_shortcut():  # keep the sign-in shortcut's icon current (in the background: it runs PowerShell)
+        try:
+            if (startup_folder() / NAME).is_file() and enabled():
+                enable()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    import threading
+    threading.Thread(target=refresh_shortcut, daemon=True).start()
+
+
 def startup_folder():
     return Path(os.environ.get('APPDATA', str(Path.home()))) / 'Microsoft' / 'Windows' / 'Start Menu' / 'Programs' / 'Startup'
 
@@ -127,6 +158,7 @@ def enable(folder=None):
     target, arguments = command()
     script = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{_quote(link)}');"
               f"$s.TargetPath='{_quote(target)}'; $s.Arguments='{arguments}'; $s.WorkingDirectory='{_quote(REPO)}';"
+              f"$s.IconLocation='{_quote(ASSETS / 'alfred.ico')},0';"
               "$s.WindowStyle=7; $s.Description='Alfred (starts hidden in the tray)'; $s.Save()")
     out = _powershell(script)
     if out.returncode or not link.is_file():

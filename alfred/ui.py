@@ -29,8 +29,8 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconPr
 from . import APP_NAME, __version__, ai, chats, config, keys, paths, picker, providers, rag, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
-from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, blurred_backdrop, brand_pixmap, dot_pixmap, fallback_backdrop, icon, icon_pixmap,
-                     logo_pixmap,
+from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, app_icon, blurred_backdrop, brand_pixmap, dot_pixmap, fallback_backdrop, icon,
+                     icon_pixmap, logo_pixmap,
                      paint_glass, paint_glow, paint_shadow, palette_for, sparkle_pixmap, stylesheet, HotkeyFilter)
 
 W, BAR, MAXH, M, R, FOOT = 780, 62, 600, 46, 26, 34
@@ -2614,7 +2614,7 @@ class AlfredWindow(QWidget):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle(APP_NAME)
-        self.setWindowIcon(QIcon(logo_pixmap(64)))
+        self.setWindowIcon(app_icon())
         self.settings = config.load()
         Motion.detect(self.settings)
         self.pal = palette_for(self.settings.get('theme'))
@@ -3014,7 +3014,7 @@ class AlfredWindow(QWidget):
         if self.isVisible() and not self.hiding:
             self.toast(text, color, seconds=6)
         elif self.tray is not None:
-            self.tray.showMessage('Alfred', text, QIcon(logo_pixmap(32)), 5000)
+            self.tray.showMessage('Alfred', text, app_icon(), 5000)
 
     def refresh_status(self):
         self.status = self.index.status()
@@ -3272,7 +3272,7 @@ def run():
     if os.name == 'nt':
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Alfred.KnowledgeAssistant')
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(startup.APP_ID)
         except Exception:
             pass
     handler = RotatingFileHandler(config.data_home() / 'assistant.log', maxBytes=512 * 1024, backupCount=2, encoding='utf-8')
@@ -3282,6 +3282,8 @@ def run():
     logging.getLogger('alfred').info('Alfred %s starting', __version__)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setWindowIcon(app_icon())
+    startup.register_app()
     app.setQuitOnLastWindowClosed(False)
     app.setStyle('Fusion')
     # Single instance: a second launch just shows the running Alfred.
@@ -3318,7 +3320,7 @@ def run():
     window.settings_view.show_hotkey()
     shortcut = window.active_hotkey or 'the tray icon'
 
-    tray = QSystemTrayIcon(QIcon(logo_pixmap(32)), app)
+    tray = QSystemTrayIcon(app_icon(), app)
     tray.setToolTip(f'Alfred — {shortcut}')
     menu = QMenu()
     window.open_action = menu.addAction(f'Open Alfred	{window.active_hotkey}', window.show_panel)
@@ -3341,7 +3343,7 @@ def run():
         QTimer.singleShot(700, lambda: window.start_index(quiet=True))
     if window.active_hotkey:
         tray.showMessage('Alfred is ready' if at_sign_in else 'Alfred is running',
-                         f'Press {window.active_hotkey} anywhere to open Alfred. Esc hides it.', QIcon(logo_pixmap(32)), 4000)
+                         f'Press {window.active_hotkey} anywhere to open Alfred. Esc hides it.', app_icon(), 4000)
         if window.active_hotkey != (window.settings.get('hotkey') or DEFAULT_HOTKEY):
             window.toast(f"{window.settings.get('hotkey')} is used by another app — using {window.active_hotkey}", 'orange', seconds=8)
     else:

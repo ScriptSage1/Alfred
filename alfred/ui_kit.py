@@ -7,7 +7,7 @@ from io import BytesIO
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QByteArray, QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
-                           QPixmap, QRadialGradient)
+                           QPixmap)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QAbstractButton
 
@@ -361,31 +361,34 @@ def sparkle_pixmap(size, dpr=2.0):
     return pixmap
 
 
-def logo_pixmap(size=64, dpr=2.0):
-    """Alfred mark: a glass orb with a gradient sparkle (Spotlight-adjacent, original)."""
-    image = QImage(int(size * dpr), int(size * dpr), QImage.Format_ARGB32_Premultiplied)
-    image.fill(Qt.transparent)
-    p = QPainter(image)
-    p.setRenderHint(QPainter.Antialiasing)
-    p.scale(dpr, dpr)
-    rect = QRectF(1, 1, size - 2, size - 2)
-    orb = QRadialGradient(QPointF(size * 0.35, size * 0.3), size * 0.85)
-    orb.setColorAt(0, QColor('#5AC8FA'))
-    orb.setColorAt(0.55, QColor('#0A84FF'))
-    orb.setColorAt(1, QColor('#5E5CE6'))
-    p.setPen(Qt.NoPen)
-    p.setBrush(orb)
-    p.drawRoundedRect(rect, size * 0.28, size * 0.28)
-    sheen = QLinearGradient(0, 0, 0, size * 0.55)
-    sheen.setColorAt(0, QColor(255, 255, 255, 120))
-    sheen.setColorAt(1, QColor(255, 255, 255, 0))
-    p.setBrush(sheen)
-    p.drawRoundedRect(QRectF(3, 2, size - 6, size * 0.5), size * 0.24, size * 0.24)
-    p.drawPixmap(QRectF(size * 0.2, size * 0.2, size * 0.6, size * 0.6), icon_pixmap('sparkle', size * 0.6, QColor('white'), dpr), QRectF())
-    p.end()
-    pixmap = QPixmap.fromImage(image)
-    pixmap.setDevicePixelRatio(dpr)
-    return pixmap
+APP_LOGO = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'alfred.svg')
+_app_logo_cache = {}
+
+
+def logo_pixmap(size=64, dpr=None):
+    """Alfred's logo, drawn from assets/alfred.svg at the screen's resolution."""
+    dpr = dpr or screen_dpr()
+    key = (size, dpr)
+    if key not in _app_logo_cache:
+        side = int(round(size * dpr))
+        image = QImage(side, side, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        QSvgRenderer(APP_LOGO).render(painter, QRectF(0, 0, side, side))
+        painter.end()
+        pixmap = QPixmap.fromImage(image)
+        pixmap.setDevicePixelRatio(dpr)
+        _app_logo_cache[key] = pixmap
+    return _app_logo_cache[key]
+
+
+def app_icon():
+    """Alfred's icon at every size Windows asks for (tray, taskbar, notifications), each drawn from the vector."""
+    icon = QIcon()
+    for size in (16, 20, 24, 32, 40, 48, 64, 96, 128, 256):
+        icon.addPixmap(logo_pixmap(size, 1.0))
+    return icon
 
 
 # --------------------------------------------------------------------- glass
