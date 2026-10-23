@@ -10,22 +10,23 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (QColor, QKeySequence, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QLinearGradient,
                            QPainter, QPainterPath, QPen, QPixmap)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFileIconProvider, QFrame, QGraphicsOpacityEffect,
-                               QGridLayout, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-                               QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QSystemTrayIcon, QTextBrowser, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconProvider, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
+                               QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
+                               QSystemTrayIcon, QTextBrowser, QVBoxLayout, QWidget)
 
-from . import APP_NAME, REPO, __version__, ai, config, knowledge, paths, rag, startup
+from . import APP_NAME, __version__, ai, chats, config, paths, rag, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
 from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, blurred_backdrop, fallback_backdrop, icon, icon_pixmap, logo_pixmap,
@@ -33,9 +34,8 @@ from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, blurred_backdrop, fal
 
 W, BAR, MAXH, M, R, FOOT = 780, 62, 600, 46, 26, 34
 DEFAULT_HOTKEY, FALLBACK_HOTKEYS = 'Ctrl+Alt+L', ['Ctrl+Alt+L', 'Ctrl+Alt+K', 'Ctrl+Alt+A']
-SEARCH, ASK, KNOW, SETTINGS, NOTE = range(5)
-PLACEHOLDERS = {SEARCH: 'Search your files', ASK: 'Ask Alfred anything about your files', KNOW: 'Filter knowledge notes',
-                SETTINGS: 'Settings', NOTE: 'Review knowledge note'}
+SEARCH, ASK, SETTINGS = range(3)
+PLACEHOLDERS = {SEARCH: 'Search your files', ASK: 'Ask anything about your files', SETTINGS: 'Settings'}
 GROUPS = [('PDF Documents', {'pdf'}), ('Presentations', {'pptx'}), ('Spreadsheets', {'xlsx', 'csv'}),
           ('Images', {s.lstrip('.') for s in IMAGE_SUFFIXES}), ('Videos', {s.lstrip('.') for s in VIDEO_SUFFIXES})]
 
@@ -208,17 +208,16 @@ class FileIcons:
 
 # ------------------------------------------------------------------ widgets
 class ModeSwitch(QWidget):
-    """Four glass icon buttons; a liquid pill glides (and stretches) to the active one."""
+    """Glass icon buttons, one per mode; a liquid pill glides (and stretches) to the active one."""
     changed = Signal(int)
-    ITEMS = [('search', 'Search  (Ctrl+1)'), ('sparkle', 'Ask Alfred  (Ctrl+2 · Tab)'),
-             ('graph', 'Knowledge  (Ctrl+3)'), ('gear', 'Settings  (Ctrl+4)')]
+    ITEMS = [('search', 'Search  (Ctrl+1)'), ('sparkle', 'Ask Alfred  (Ctrl+2 · Tab)'), ('gear', 'Settings  (Ctrl+3)')]
     SIZE = 34
 
     def __init__(self, win):
         super().__init__(win)
         self.win = win
         self.index, self.hover = 0, -1
-        self.setFixedSize(self.SIZE * 4 + 8, self.SIZE + 6)
+        self.setFixedSize(self.SIZE * len(self.ITEMS) + 8, self.SIZE + 6)
         self.setMouseTracking(True)
         self.setCursor(Qt.PointingHandCursor)
         self.left = Spring(4, 380, 0.8, lambda v: self.update())
@@ -240,7 +239,7 @@ class ModeSwitch(QWidget):
 
     def mouseMoveEvent(self, event):
         hover = int((event.position().x() - 4) // self.SIZE)
-        hover = hover if 0 <= hover < 4 else -1
+        hover = hover if 0 <= hover < len(self.ITEMS) else -1
         if hover != self.hover:
             self.hover = hover
             self.setToolTip(self.ITEMS[hover][1] if hover >= 0 else '')
@@ -252,7 +251,7 @@ class ModeSwitch(QWidget):
 
     def mousePressEvent(self, event):
         index = int((event.position().x() - 4) // self.SIZE)
-        if 0 <= index < 4:
+        if 0 <= index < len(self.ITEMS):
             self.changed.emit(index)
 
     def paintEvent(self, event):
@@ -927,20 +926,29 @@ def _highlight(text, query, pal):
 
 
 class Turn(QWidget):
-    """One question and Alfred's streamed, cited answer."""
+    """One exchange: your question in a bubble on the right, Alfred's answer on the left with its sources."""
 
     def __init__(self, view, question, scope=None):
         super().__init__()
         self.view, self.win, self.question = view, view.win, question
         self.text, self.result = '', None
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 6, 0, 10)
+        layout.setContentsMargins(0, 6, 0, 12)
         layout.setSpacing(8)
-        q = label(question, 'title', wrap=True, selectable=True)
-        layout.addWidget(q)
+        ask = QHBoxLayout()
+        ask.addStretch()
+        bubble = label(question, 'bubble', wrap=True, selectable=True)
+        bubble.ensurePolished()  # measure with the bubble's own (stylesheet) font
+        widest = max((bubble.fontMetrics().horizontalAdvance(line) for line in question.splitlines() or ['']), default=0)
+        bubble.setFixedWidth(min(430, widest + 40))  # short questions stay on one line; long ones wrap at 430
+        ask.addWidget(bubble)
+        layout.addLayout(ask)
         if scope:
-            layout.addWidget(label(f'Only from {Path(scope).name}', 'caption'))
+            note = label(f'Only from {Path(scope).name}', 'caption')
+            note.setAlignment(Qt.AlignRight)
+            layout.addWidget(note)
         head = QHBoxLayout()
+        head.setSpacing(6)
         mark = QLabel()
         mark.setPixmap(sparkle_pixmap(16))
         head.addWidget(mark)
@@ -951,7 +959,6 @@ class Turn(QWidget):
         self.body.setTextFormat(Qt.MarkdownText)
         self.body.setWordWrap(True)
         self.body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
-        self.body.setOpenExternalLinks(True)  # web sources open in the browser
         self.body.setStyleSheet('font-size: 10.5pt;')
         self.body.hide()
         layout.addWidget(self.body)
@@ -959,6 +966,7 @@ class Turn(QWidget):
         self.sources.setSpacing(5)
         layout.addLayout(self.sources)
         self.actions = QHBoxLayout()
+        self.actions.setSpacing(2)
         layout.addLayout(self.actions)
         self.flush = QTimer(self, interval=50, timeout=self.render)
         self.status.set('Searching your files…', True)
@@ -981,77 +989,84 @@ class Turn(QWidget):
         self.body.setText(self.text)
         self.view.follow()
 
+    def _show_sources(self, citations, used):
+        for number, item in enumerate(citations):
+            source = SourceRow(self, item, item['marker'] in used or not used)
+            self.sources.addWidget(source)
+            source.hide()
+            QTimer.singleShot(0 if Motion.reduced else 45 * number, lambda s=source: (s.show(), fade_in(s)))
+
+    def _add_actions(self):
+        self.actions.addWidget(button('Copy', lambda: (QApplication.clipboard().setText(self.text), self.win.toast('Answer copied', 'green')),
+                                      'link', 'Copy the answer'))
+        self.actions.addStretch()
+
     def finish(self, result):
         self.flush.stop()
         self.result = result
         self.text = result['answer'] or self.text
         self.render()
         self.body.show()
-        provider = result['provider']
-        where = 'on this PC' if provider.get('location') == 'local' else f"via {provider.get('host', 'remote provider')}"
-        if provider.get('provider') == 'claude_code':
-            where = 'via your Claude plan'
-        effort = f" · {provider['effort']} effort" if provider.get('provider') in ('anthropic', 'claude_code') else ''
-        who = f"{provider.get('name', provider.get('model', ''))} {where}{effort}"
-        searches = len(result.get('web_searches') or [])
-        web = f" + web search ({searches} search{'es' * (searches != 1)})" if result.get('web') else ''
-        if result['grounded']:
-            status = f"Grounded in {len(result['used'])} source{'s' * (len(result['used']) != 1)}{web} · {who}"
-        elif result.get('web'):
-            status = f"From the web — not in your files · {who}"
-        elif not result['citations']:
-            status = 'Not found in your files'
+        model = result.get('provider', {}).get('model') or ''
+        used = result.get('used') or []
+        if result.get('grounded'):
+            status = f"From {len(used)} source{'s' * (len(used) != 1)} in your files · {model} on this PC"
+        elif not result.get('citations'):
+            status = f'Not found in your files · {model}'
         else:
-            status = f"No sources cited — the files may not cover this · {provider.get('model', '')}"
+            status = f'No sources cited — your files may not cover this · {model}'
         if result.get('cancelled'):
             status += ' · stopped'
         self.status.set(status, False)
-        for number, item in enumerate(result['citations']):
-            source = SourceRow(self, item, item['marker'] in result['used'] or not result['used'])
-            self.sources.addWidget(source)
-            QTimer.singleShot(0 if Motion.reduced else 45 * number, lambda s=source: (s.show(), fade_in(s)))
-            source.hide()
-        if result['citations']:
-            self.actions.addWidget(button('Save to Knowledge', lambda: self.win.open_note_sheet(self), 'primary',
-                                          'Ctrl+S', icon('bookmark', 14, QColor('white'))))
-        self.actions.addWidget(button('Copy', lambda: (QApplication.clipboard().setText(self.text), self.win.toast('Answer copied', 'green')),
-                                      None, None, icon('copy', 14, self.win.pal['text'])))
-        self.actions.addStretch()
+        self._show_sources(result.get('citations') or [], used)
+        self._add_actions()
         self.view.follow()
 
-    def fail(self, error):
+    def restore(self, message):
+        """Show a saved answer (reopened from history) without animating it in."""
+        if message.get('error'):
+            self.fail(message['error'], setup=message.get('setup', False))
+            return
+        self.text = message.get('content') or ''
+        self.body.setText(self.text)
+        self.body.show()
+        sources = message.get('sources') or []
+        self.status.set(f"From {len(sources)} source{'s' * (len(sources) != 1)} · {message.get('model') or ''}" if sources
+                        else (message.get('model') or ''), False)
+        for item in sources:
+            self.sources.addWidget(SourceRow(self, item, True))
+        self._add_actions()
+
+    def fail(self, error, setup=None):
         self.flush.stop()
-        setup = isinstance(error, ai.NotConfigured)
-        self.status.set('Setup needed' if setup else 'Provider error', False)
+        setup = isinstance(error, ai.NotConfigured) if setup is None else setup
+        self.status.set('Not available yet' if setup else 'Something went wrong', False)
         self.body.setTextFormat(Qt.PlainText)
         self.body.setText(str(error))
-        self.body.setStyleSheet(f"color: {self.win.pal['orange' if setup else 'red'].name()}; font-size: 10pt;")
+        self.body.setStyleSheet(f"color: {self.win.pal['secondary' if setup else 'red'].name()}; font-size: 10pt;")
         self.body.show()
-        self.actions.addWidget(button('Open Settings', lambda: self.win.set_mode(SETTINGS), 'primary'))
-        self.actions.addStretch()
 
 
 class SourceRow(QWidget):
+    """A source chip under an answer; it springs open to show the passage, with Open / Show in folder."""
+
     def __init__(self, turn, item, used):
         super().__init__()
         self.turn, self.item, self.win = turn, item, turn.win
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
-        text = f"{item['marker']}   {item['filename']}   ·   {item['location']}"
+        text = f"{item.get('marker', '')}   {item['filename']}   ·   {item.get('location', '')}".strip()
         if not used:
             text += '   (retrieved, not cited)'
-        if item.get('flagged'):
-            text += '   ⚠ instructions withheld'
-        self.chip = button(text, self.toggle, 'source', 'Show the supporting excerpt')
+        self.chip = button(text, self.toggle, 'source', 'Show the passage')
         self.chip.setProperty('used', 'true' if used else 'false')
         self.chip.setIcon(QIcon(FileIcons.get(item['path'], 16)))
         layout.addWidget(self.chip)
         self.box = QFrame()
         box = QVBoxLayout(self.box)
         box.setContentsMargins(14, 8, 14, 10)
-        body = label(item['snippet_full'][:1600], 'secondary', wrap=True, selectable=True)
-        box.addWidget(body)
+        box.addWidget(label((item.get('snippet_full') or item.get('snippet') or '')[:1600], 'secondary', wrap=True, selectable=True))
         row = QHBoxLayout()
         row.addWidget(button('Open', self.open_file, 'link'))
         row.addWidget(button('Show in folder', self.reveal_file, 'link'))
@@ -1090,199 +1105,422 @@ class SourceRow(QWidget):
             self.win.toast(str(error), 'red')
 
 
+def when(timestamp):
+    """'16:52' today, 'Yesterday', 'Mon' this week, otherwise 'Oct 21'."""
+    moment = datetime.fromtimestamp(timestamp or 0)
+    days = (datetime.now().date() - moment.date()).days
+    return moment.strftime('%H:%M') if days == 0 else 'Yesterday' if days == 1 else moment.strftime('%a') if days < 7 else moment.strftime('%b %d')
+
+
+class ChatRow(QWidget):
+    """A saved chat in the history panel; rename and delete appear on hover."""
+    HEIGHT = 46
+
+    def __init__(self, panel, chat):
+        super().__init__()
+        self.panel, self.win, self.chat = panel, panel.win, chat
+        self.hover = self.selected = False
+        self.setFixedHeight(self.HEIGHT)
+        self.setCursor(Qt.PointingHandCursor)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 4, 4, 4)
+        row.setSpacing(2)
+        texts = QVBoxLayout()
+        texts.setSpacing(0)
+        self.title = label('', None)
+        self.title.setToolTip(chat['title'])
+        self.edit = QLineEdit(chat['title'])
+        self.edit.hide()
+        self.edit.returnPressed.connect(self.commit)
+        self.edit.editingFinished.connect(self.commit)
+        texts.addWidget(self.title)
+        texts.addWidget(self.edit)
+        self.meta = label(when(chat['updated']), 'caption')
+        texts.addWidget(self.meta)
+        row.addLayout(texts, 1)
+        self.rename_button = button('', self.start_rename, 'ghost', 'Rename', icon('pencil', 12, self.win.pal['secondary']))
+        self.delete_button = button('', lambda: self.panel.delete(self), 'ghost', 'Delete this chat', icon('close', 11, self.win.pal['secondary']))
+        for widget in (self.rename_button, self.delete_button):
+            widget.setFixedSize(24, 24)
+            widget.hide()
+            row.addWidget(widget)
+        self.elide()
+
+    def elide(self):
+        width = self.panel.WIDTH - 24 - (52 if self.hover else 0)
+        self.title.setText(self.title.fontMetrics().elidedText(self.chat['title'], Qt.ElideRight, width))
+
+    def enterEvent(self, event):
+        self.hover = True
+        for widget in (self.rename_button, self.delete_button):
+            widget.show()
+        self.elide()
+        self.update()
+
+    def leaveEvent(self, event):
+        self.hover = False
+        for widget in (self.rename_button, self.delete_button):
+            widget.hide()
+        self.elide()
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not self.edit.isVisible():
+            self.panel.open(self.chat['id'])
+
+    def mouseDoubleClickEvent(self, event):
+        self.start_rename()
+
+    def start_rename(self):
+        self.title.hide()
+        self.edit.setText(self.chat['title'])
+        self.edit.show()
+        self.edit.setFocus()
+        self.edit.selectAll()
+
+    def commit(self):
+        if not self.edit.isVisible():
+            return
+        self.edit.hide()
+        self.title.show()
+        title = ' '.join(self.edit.text().split())
+        if title and title != self.chat['title']:
+            self.panel.rename(self, title)
+
+    def paintEvent(self, event):
+        if not (self.hover or self.selected):
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.win.pal['fill_strong' if self.selected else 'hover'])
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(2, 1, -2, -1), 9, 9)
+
+
+class HistoryPanel(QWidget):
+    """Saved chats grouped by day, with a filter and New chat; springs open and closed from the left."""
+    WIDTH = 230
+
+    def __init__(self, view):
+        super().__init__()
+        self.view, self.win = view, view.win
+        self.rows, self.current = [], None
+        self.setFixedWidth(0)
+        self.inner = QWidget(self)
+        self.inner.setFixedWidth(self.WIDTH)
+        layout = QVBoxLayout(self.inner)
+        layout.setContentsMargins(14, 10, 8, 10)
+        layout.setSpacing(8)
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText('Search chats')
+        self.filter.textChanged.connect(lambda _: self.refresh())
+        top.addWidget(self.filter, 1)
+        top.addWidget(button('', self.view.new_chat, 'ghost', 'New chat  (Ctrl+N)', icon('plus', 14, self.win.pal['text'])))
+        layout.addLayout(top)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        holder = QWidget()
+        holder.setObjectName('clear')
+        self.list = QVBoxLayout(holder)
+        self.list.setContentsMargins(0, 0, 0, 0)
+        self.list.setSpacing(1)
+        self.list.addStretch()
+        self.scroll.setWidget(holder)
+        layout.addWidget(self.scroll, 1)
+        self.empty = label('Your chats will appear here.', 'caption', wrap=True)
+        layout.addWidget(self.empty)
+        self.width_spring = Spring(0, 300, 0.88, self._width)
+
+    def _width(self, value):
+        value = max(0, int(value))
+        self.setFixedWidth(value)
+        self.inner.move(value - self.WIDTH, 0)  # slides in from the left edge
+        self.setVisible(value > 0)
+
+    def resizeEvent(self, event):
+        self.inner.setFixedHeight(self.height())
+
+    @property
+    def is_open(self):
+        return self.width_spring.target > 0
+
+    def set_open(self, on, animate=True):
+        if on:
+            self.refresh()
+        (self.width_spring.to if animate else self.width_spring.snap)(self.WIDTH if on else 0)
+
+    def refresh(self):
+        for row in self.rows:
+            row.setParent(None)
+            row.deleteLater()
+        while self.list.count() > 1:
+            item = self.list.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.rows = []
+        found = self.view.store.list(self.filter.text())
+        position = 0
+        for name, items in chats.group(found):
+            header = label(name, 'section')
+            header.setContentsMargins(10, 8 if position else 0, 0, 2)
+            self.list.insertWidget(position, header)
+            position += 1
+            for chat in items:
+                row = ChatRow(self, chat)
+                row.selected = chat['id'] == self.current
+                self.list.insertWidget(position, row)
+                self.rows.append(row)
+                position += 1
+        self.empty.setText('No chats match.' if self.filter.text() else 'Your chats will appear here.')
+        self.empty.setVisible(not found)
+
+    def select(self, chat_id):
+        self.current = chat_id
+        for row in self.rows:
+            row.selected = row.chat['id'] == chat_id
+            row.update()
+
+    def open(self, chat_id):
+        self.view.open_chat(chat_id)
+
+    def rename(self, row, title):
+        chat = self.view.store.rename(row.chat['id'], title)
+        if chat is None:
+            return
+        row.chat['title'] = chat['title']
+        row.title.setToolTip(chat['title'])
+        row.elide()
+        if self.view.chat and self.view.chat['id'] == chat['id']:
+            self.view.chat['title'] = chat['title']
+            self.view.chat['_path'] = chat['_path']
+            self.view.show_title()
+
+    def delete(self, row):
+        removed = self.view.store.delete(row.chat['id'])
+        if removed is None:
+            return
+        if self.view.chat and self.view.chat['id'] == removed['id']:
+            self.view.new_chat(quiet=True)
+        fade_out_and_remove = lambda: (self.refresh(), self.win.settings_view.show_chats_info())
+        if Motion.reduced:
+            fade_out_and_remove()
+        else:
+            effect = QGraphicsOpacityEffect(row)
+            row.setGraphicsEffect(effect)
+            spring = Spring(1, 420, 1.0)
+
+            def change(value):
+                try:
+                    effect.setOpacity(max(0.0, value))
+                except RuntimeError:
+                    return
+                if value <= 0.02:
+                    spring.on_change = None
+                    fade_out_and_remove()
+            spring.on_change = change
+            spring.to(0)
+            row._fade = spring
+        removed.pop('_path', None)
+        self.win.toast(f'Deleted “{removed["title"]}”', 'green', ('Undo', lambda: self.restore(removed)), 6)
+
+    def restore(self, chat):
+        self.view.store.save(chat, touch=False)
+        self.refresh()
+        self.win.settings_view.show_chats_info()
+        self.win.toast('Chat restored', 'green', seconds=2)
+
+
 class AskView(QWidget):
-    SUGGESTIONS = ['Summarize the most important decisions in my files', 'What risks or problems are mentioned?',
-                   'Which documents mention costs or budgets?']
+    SUGGESTIONS = ['Summarize the most important points in my files', 'Which documents mention costs or budgets?',
+                   'What did I save about travel?']
 
     def __init__(self, win):
         super().__init__()
         self.win = win
-        self.history, self.cancel, self.turns = [], None, []
+        self.history, self.cancel, self.turns, self.chat, self.models = [], None, [], None, []
+        self.models_known = False  # True once the installed models have been listed
+        self.store = chats.ChatStore(win.settings.chats_folder)
+        self.scope = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        pickers = QHBoxLayout()
-        pickers.setContentsMargins(26, 10, 26, 0)
-        pickers.setSpacing(8)
-        self.model_box, self.effort_box = QComboBox(), QComboBox()
-        self.model_box.setMinimumWidth(250)
-        self.effort_box.setMinimumWidth(120)
-        self.model_box.setToolTip('Which model writes Ask Alfred answers')
-        self.model_box.activated.connect(self.choose_model)
-        self.effort_box.activated.connect(self.choose_effort)
-        pickers.addWidget(label('Model', 'caption'))
-        pickers.addWidget(self.model_box)
-        pickers.addSpacing(6)
-        pickers.addWidget(label('Thinking', 'caption'))
-        pickers.addWidget(self.effort_box)
-        pickers.addSpacing(6)
-        self.web_box = QCheckBox('Web search')
-        self.web_box.setToolTip('When your files don’t cover a question, Claude searches the web and labels what came from it')
-        self.web_box.toggled.connect(self.choose_web)
-        pickers.addWidget(self.web_box)
-        pickers.addStretch()
-        self.scope = None
-        self.scope_chip = button('', self.clear_scope, 'source', 'Remove to ask about all your files again')
+        layout.setSpacing(0)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(16, 8, 20, 6)
+        bar.setSpacing(8)
+        self.history_button = button('', self.toggle_history, 'ghost', 'Chat history  (Ctrl+H)', icon('sidebar', 16, win.pal['secondary']))
+        self.history_button.setFixedSize(30, 30)
+        bar.addWidget(self.history_button)
+        self.title = label('', 'secondary')
+        bar.addWidget(self.title, 1)
+        self.scope_chip = button('', self.clear_scope, 'source', 'Ask about all your files again')
         self.scope_chip.hide()
-        pickers.addWidget(self.scope_chip)
-        layout.addLayout(pickers)
-        guard_wheel(self)
-        self.models = []
+        bar.addWidget(self.scope_chip)
+        self.model_pill = button('Choose a model', self.show_model_menu, 'pill', 'The chat model that writes answers (runs on this PC)')
+        bar.addWidget(self.model_pill)
+        layout.addLayout(bar)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        self.panel = HistoryPanel(self)
+        body.addWidget(self.panel)
         self.stack = QStackedWidget()
-        layout.addWidget(self.stack)
+        body.addWidget(self.stack, 1)
+        layout.addLayout(body, 1)
+
         intro = QWidget()
         box = QVBoxLayout(intro)
-        box.setAlignment(Qt.AlignCenter)
+        box.setContentsMargins(40, 0, 40, 0)
         box.setSpacing(10)
+        box.addStretch(3)
         art = QLabel()
-        art.setPixmap(sparkle_pixmap(46))
+        art.setPixmap(sparkle_pixmap(44))
         art.setAlignment(Qt.AlignCenter)
-        box.addWidget(art, 0, Qt.AlignCenter)
-        title = label('Ask Alfred', 'hero')
-        title.setAlignment(Qt.AlignCenter)
-        box.addWidget(title, 0, Qt.AlignCenter)
+        box.addWidget(art)
+        self.intro_title = label('', 'hero')
+        self.intro_title.setAlignment(Qt.AlignCenter)
+        box.addWidget(self.intro_title)
         self.intro_text = label('', 'secondary', wrap=True)
         self.intro_text.setAlignment(Qt.AlignCenter)
-        self.intro_text.setMaximumWidth(500)
-        box.addWidget(self.intro_text, 0, Qt.AlignCenter)
-        self.suggestions = QVBoxLayout()
-        self.suggestions.setAlignment(Qt.AlignCenter)
+        self.intro_text.setMinimumHeight(40)
+        box.addWidget(self.intro_text)
+        self.suggestions = QWidget()
+        chips = QVBoxLayout(self.suggestions)
+        chips.setContentsMargins(0, 6, 0, 0)
+        chips.setSpacing(7)
         for text in self.SUGGESTIONS:
-            self.suggestions.addWidget(button(text, lambda _=False, t=text: (self.win.search.setText(t), self.win.search.setFocus()),
-                                              'source', 'Puts this question in the box — edit it, then press Enter'), 0, Qt.AlignCenter)
-        box.addLayout(self.suggestions)
-        self.setup_button = button('Open Settings', lambda: self.win.set_mode(SETTINGS), 'primary')
-        box.addWidget(self.setup_button, 0, Qt.AlignCenter)
+            chips.addWidget(button(text, lambda _=False, t=text: (self.win.search.setText(t), self.win.search.setFocus()),
+                                   'chip', 'Puts this question in the box — edit it, then press Enter'), 0, Qt.AlignCenter)
+        box.addWidget(self.suggestions)
+        self.intro_button = button('', self.intro_action, 'primary')
+        box.addWidget(self.intro_button, 0, Qt.AlignCenter)
+        box.addStretch(4)
         self.stack.addWidget(intro)
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         holder = QWidget()
         holder.setObjectName('clear')
         self.thread = QVBoxLayout(holder)
-        self.thread.setContentsMargins(26, 14, 26, 14)
-        self.thread.setSpacing(6)
+        self.thread.setContentsMargins(26, 10, 26, 14)
+        self.thread.setSpacing(4)
         self.thread.addStretch()
         self.scroll.setWidget(holder)
         self.stack.addWidget(self.scroll)
         self.scroll_spring = Spring(0, 260, 1.0, lambda v: self.scroll.verticalScrollBar().setValue(int(v)))
+        self.show_title()
 
+    # ---------------------------------------------------------------- state
     def activated(self):
-        info = ai.ChatProvider(self.win.settings).describe()
-        if not info['configured']:
-            self.intro_text.setText('Connect an AI model to get answers grounded in your files. Search, Knowledge and Claude Code (MCP) work without one.')
-            self.setup_button.show()
-        else:
-            if info['provider'] == 'claude_code':
-                where = ('through your Claude plan (Claude Code in the background, no tools) — the passages Alfred retrieves '
-                         'for each question are sent to Anthropic under your account; no API billing')
-            elif info['provider'] == 'anthropic':
-                where = 'via the Claude API — the passages Alfred retrieves for each question are sent to Anthropic'
-            elif info['location'] == 'local':
-                where = 'running on this PC — your files stay local'
-            else:
-                where = f"at {info['host']} — retrieved excerpts are sent to this provider"
-            web = (info['provider'] in ('claude_code', 'anthropic') and self.win.settings.get('web_search', True))
-            lead = ('Answers come from your indexed files first, with citations; when they don’t have the answer, Claude searches the web '
-                    'and labels it “From the web”.' if web else 'Answers come only from your indexed files, with citations.')
-            self.intro_text.setText(f"{lead}\n{info.get('name', info['model'])} {where}.")
-            self.setup_button.hide()
+        self.refresh_intro()
+        self.history_button.setVisible(self.saving)
+        if self.saving and not self.panel.is_open and not self.win.settings.get('sidebar_collapsed') and self.store.list():
+            self.panel.set_open(True, animate=False)
+        elif not self.saving and self.panel.is_open:
+            self.panel.set_open(False, animate=False)
+        elif self.panel.is_open:
+            self.panel.refresh()
         if not self.turns:
             self.stack.setCurrentIndex(0)
         if self.scope:
             self.win.search.setPlaceholderText(f'Ask about {Path(self.scope).name}…')
-        self.load_pickers()
-
-    def load_pickers(self):
         settings = dict(self.win.settings)
-        run_job(lambda s: (ai.available_models(settings), ai.effort_options(settings)), self.fill_pickers)
+        run_job(lambda s: ai.available_models(settings), self.models_loaded)
 
-    def fill_pickers(self, value):
-        models, (efforts, explanation) = value
-        settings = self.win.settings
-        provider = settings.get('provider')
-        current = (settings.get('claude_model') if provider == 'anthropic' else settings.get('claude_code_model') if provider == 'claude_code'
-                   else (settings.get('model') or '').removesuffix(':latest'))
-        self.models = list(models)
-        index = next((i for i, m in enumerate(self.models) if m['provider'] == provider and m['model'] == current), -1)
-        if index < 0 and provider in ('ollama', 'openai', 'anthropic', 'claude_code') and current:
-            self.models.insert(0, {'provider': provider, 'model': current, 'label': f'{current}  ·  {provider}'})
-            index = 0
-        self.model_box.blockSignals(True)
-        self.model_box.clear()
+    @property
+    def saving(self):
+        return bool(self.win.settings.get('save_chat_history', True))
+
+    def models_loaded(self, models):
+        self.models, self.models_known = models, True
+        self.refresh_intro()
+
+    def refresh_intro(self):
+        model = (self.win.settings.get('model') or '').strip()
+        installed = [m['model'] for m in self.models]
+        self.model_pill.setText(f'{model}  ▾' if model else 'Choose a model  ▾')
+        folders = self.win.settings.folders
+        if not model:
+            self.intro_title.setText('Choose a model to chat with your files')
+            lead = 'Alfred answers from the folders you track, using a chat model that runs on this PC through Ollama.'
+            self.intro_text.setText(lead if installed or not self.models_known else f'{lead} Install one first, e.g.  ollama pull gemma3:4b')
+            self.intro_button.setText('Choose a model')
+            self.intro_button.show()
+            self.suggestions.hide()
+        elif not folders:
+            self.intro_title.setText('Track a folder to chat with it')
+            self.intro_text.setText(f'{model} answers from the folders you track. Track one, like Downloads or Documents, to begin.')
+            self.intro_button.setText('Track folder…')
+            self.intro_button.show()
+            self.suggestions.hide()
+        else:
+            names = ', '.join(f.name for f in folders[:3]) + (f' and {len(folders) - 3} more' if len(folders) > 3 else '')
+            self.intro_title.setText('Ask anything about your files')
+            self.intro_text.setText(f'Answers come from {names}, with the sources they used. {model} runs on this PC.')
+            self.intro_button.hide()
+            self.suggestions.show()
+
+    def intro_action(self):
+        if not (self.win.settings.get('model') or '').strip():
+            self.show_model_menu()
+        else:
+            self.win.choose_folder()
+
+    def show_title(self):
+        title = self.chat['title'] if self.chat else 'New chat'
+        self.title.setText(self.title.fontMetrics().elidedText(title, Qt.ElideRight, 300))
+        self.title.setToolTip(title if self.chat else '')
+
+    # ---------------------------------------------------------------- model
+    def show_model_menu(self):
+        settings = dict(self.win.settings)
+        run_job(lambda s: (ai.available_models(settings), ai.effort_options(settings)), self._model_menu)
+
+    def _model_menu(self, value):
+        self.models, (efforts, _) = value
+        menu = QMenu(self)
+        current = self.win.settings.get('model') or ''
+        if not self.models:
+            empty = menu.addAction('No chat models installed — run: ollama pull gemma3:4b')
+            empty.setEnabled(False)
         for model in self.models:
-            self.model_box.addItem(model['label'])
-        if index >= 0:
-            self.model_box.setCurrentIndex(index)
-        self.model_box.blockSignals(False)
-        fill_effort(self.effort_box, None, efforts, explanation, settings.get('effort'))
-        claude = settings.get('provider') in ('claude_code', 'anthropic')
-        self.web_box.blockSignals(True)
-        self.web_box.setChecked(bool(settings.get('web_search', True)) and claude)
-        self.web_box.setEnabled(claude)
-        self.web_box.setToolTip('When your files don’t cover a question, Claude searches the web and labels what came from it'
-                                if claude else 'Web search is available with Claude models; local models answer from your files only')
-        self.web_box.blockSignals(False)
+            extra = '  ·  reads images' if model['vision'] else ''
+            action = menu.addAction(f"{model['model']}   {model['size_gb']} GB{extra}", lambda m=model['model']: self.choose_model(m))
+            action.setCheckable(True)
+            action.setChecked(model['model'] == current)
+        if efforts:
+            menu.addSeparator()
+            thinking = menu.addMenu('Thinking')
+            for value, text in efforts:
+                action = thinking.addAction(text, lambda v=value, t=text: self.choose_effort(v, t))
+                action.setCheckable(True)
+                action.setChecked(value == self.win.settings.get('effort'))
+        menu.addSeparator()
+        menu.addAction('AI settings…', lambda: self.win.set_mode(SETTINGS))
+        menu.exec(self.model_pill.mapToGlobal(QPoint(self.model_pill.width() - menu.sizeHint().width(), self.model_pill.height() + 4)))
 
-    def choose_model(self, index):
-        if not 0 <= index < len(self.models):
-            return
-        choice, settings = self.models[index], self.win.settings
-        if choice['provider'] == 'claude_code':
-            settings.update(provider='claude_code', claude_code_model=choice['model'])
-        elif choice['provider'] == 'anthropic':
-            settings.update(provider='anthropic', claude_model=choice['model'])
-        else:
-            if settings.get('provider') != choice['provider']:
-                settings['base_url'] = ai.OLLAMA_DEFAULT if choice['provider'] == 'ollama' else settings.get('base_url')
-            settings.update(provider=choice['provider'], model=choice['model'])
-        settings.save()
-        self.win.refresh_status()
-        self.activated()
-        name = ai.ChatProvider(settings).describe().get('name', choice['model'])
-        if choice['provider'] == 'claude_code':
-            snapshot = dict(settings)
-
-            def checked(status):
-                if not status['installed']:
-                    self.win.toast('Claude Code was not found — install the Claude desktop app', 'orange', seconds=8)
-                elif status['logged_in']:
-                    self.win.toast(f'Answers now from {name} through your Claude plan · no API billing', 'green', seconds=6)
-                else:
-                    self.win.toast('Sign in once with your Claude account to use your plan', 'orange',
-                                   ('Sign in', lambda: self.win.claude_sign_in()), 12)
-            run_job(lambda s: ai.claude_code_status(snapshot, refresh=True), checked)
-            return
-        if choice['provider'] == 'anthropic':
-            has_key = bool(settings.get('anthropic_api_key') or os.environ.get('ANTHROPIC_API_KEY'))
-            if has_key:
-                self.win.toast(f'Answers now from {name} · retrieved excerpts are sent to Anthropic', 'green', seconds=6)
-            else:
-                self.win.toast(f'{name} needs an Anthropic API key', 'orange', ('Add key in Settings', lambda: self.win.set_mode(SETTINGS)), 10)
-        else:
-            self.win.toast(f'Answers now from {name} on this PC', 'green')
-            self.win.warm_up()
-
-    def choose_web(self, on):
-        self.win.settings['web_search'] = bool(on)
+    def choose_model(self, model):
+        self.win.settings['model'] = model
         self.win.settings.save()
-        self.win.toast('Web search on — used when your files don’t have the answer' if on else
-                       'Web search off — answers come only from your files', 'green', seconds=3)
-        self.activated()
+        self.refresh_intro()
+        self.win.refresh_status()
+        self.win.toast(f'Chatting with {model} on this PC', 'green', seconds=3)
 
-    def choose_effort(self, index):
-        value = self.effort_box.itemData(index)
-        if value is None:
-            return
+    def choose_effort(self, value, text):
         self.win.settings['effort'] = value
         self.win.settings.save()
-        self.win.toast(f'Thinking effort: {self.effort_box.itemText(index)}', 'green', seconds=2)
+        self.win.toast(f'Thinking: {text}', 'green', seconds=2)
 
-    def set_scope(self, rel):
+    # ---------------------------------------------------------------- scope
+    def set_scope(self, path):
         """Answer the next questions only from this file (from Search → Ask about this)."""
-        self.scope = rel
-        name = Path(rel).name
+        self.scope = path
+        name = Path(path).name
         self.scope_chip.setText(f'Only from: {name}   ✕')
-        self.scope_chip.setIcon(QIcon(FileIcons.get(rel, 16)))
+        self.scope_chip.setIcon(QIcon(FileIcons.get(path, 16)))
         self.scope_chip.show()
         fade_in(self.scope_chip)
         self.win.search.setPlaceholderText(f'Ask about {name}…')
@@ -1295,17 +1533,102 @@ class AskView(QWidget):
             self.win.search.setPlaceholderText(PLACEHOLDERS[ASK])
             self.win.search.setFocus()
 
-    def reset(self):
-        self.clear_scope()
+    # -------------------------------------------------------------- history
+    def toggle_history(self):
+        if not self.saving:
+            self.win.toast('Chat history is off', 'orange', ('Turn on in Settings', lambda: self.win.set_mode(SETTINGS)), 6)
+            return
+        opening = not self.panel.is_open
+        self.panel.set_open(opening)
+        self.win.settings['sidebar_collapsed'] = not opening
+        self.win.settings.save()
+        if opening:
+            self.panel.filter.setFocus()
+
+    def chats_changed(self, current_deleted=False):
+        """Settings changed where or whether chats are saved."""
+        self.store = chats.ChatStore(self.win.settings.chats_folder)
+        if current_deleted and self.chat:
+            self.new_chat(quiet=True)
+        if self.win.mode == ASK:
+            self.activated()
+
+    def clear_thread(self):
         if self.cancel:
             self.cancel.set()
-        self.history.clear()
+        self.history = []
         for turn in self.turns:
             turn.deleteLater()
-        self.turns.clear()
-        self.stack.setCurrentIndex(0)
-        self.win.toast('New conversation', 'green')
+        self.turns = []
 
+    def new_chat(self, quiet=False):
+        self.clear_scope()
+        self.clear_thread()
+        self.chat = None
+        self.panel.select(None)
+        self.show_title()
+        self.stack.setCurrentIndex(0)
+        if self.win.mode == ASK:
+            self.win.search.setFocus()
+        if not quiet:
+            self.win.toast('New chat', 'green', seconds=2)
+
+    def open_chat(self, chat_id):
+        if self.cancel is not None:
+            self.win.toast('Wait for the answer to finish, or press Enter to stop it', 'orange')
+            return
+        chat = self.store.load(chat_id)
+        if chat is None:
+            self.win.toast('That chat is gone — it may have been deleted', 'orange')
+            self.panel.refresh()
+            return
+        self.clear_scope()
+        self.clear_thread()
+        self.chat = chat
+        messages = chat['messages']
+        for number, message in enumerate(messages):
+            if message.get('role') != 'user':
+                continue
+            turn = Turn(self, message.get('content', ''), message.get('scope'))
+            reply = messages[number + 1] if number + 1 < len(messages) and messages[number + 1].get('role') == 'assistant' else None
+            if reply:
+                turn.restore(reply)
+                if reply.get('content') and not reply.get('error'):
+                    self.history += [{'role': 'user', 'content': message['content']}, {'role': 'assistant', 'content': reply['content']}]
+            else:
+                turn.status.set('No answer was saved', False)
+            self.turns.append(turn)
+            self.thread.insertWidget(self.thread.count() - 1, turn)
+        self.panel.select(chat_id)
+        self.show_title()
+        self.stack.setCurrentIndex(1 if self.turns else 0)
+        fade_in(self.scroll)
+        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
+        self.win.search.setFocus()
+
+    def record(self, question, scope, reply):
+        """Add one exchange to the current chat and save it (when chat history is on)."""
+        model = self.win.settings.get('model') or ''
+        if self.chat is None:
+            self.chat = chats.ChatStore.new_chat(question, model)
+        self.chat['model'] = model
+        self.chat['messages'] += [{'role': 'user', 'content': question, 'time': time.time(), 'scope': scope},
+                                  dict(reply, role='assistant', time=time.time(), model=model)]
+        self.show_title()
+        if not self.saving:
+            return
+        try:
+            self.store.save(self.chat)
+        except OSError as error:
+            self.win.toast(f'Couldn’t save this chat: {error}', 'red', seconds=6)
+            return
+        self.panel.select(self.chat['id'])
+        if self.panel.is_open:
+            self.panel.refresh()
+        elif not self.win.settings.get('sidebar_collapsed'):
+            self.panel.set_open(True)
+
+    # ----------------------------------------------------------------- chat
     def follow(self, soft=False):
         bar = self.scroll.verticalScrollBar()
         QTimer.singleShot(0, lambda: (self.scroll_spring.snap(bar.value()), self.scroll_spring.to(bar.maximum())) if not soft else None)
@@ -1331,13 +1654,10 @@ class AskView(QWidget):
 
         def work(signals):
             if settings.get('ollama_autostart', True):
-                if settings.get('provider') == 'ollama':
+                try:
                     ai.ensure_ollama(settings.get('base_url'))
-                if settings.get('embed_enabled') and settings.get('embed_provider', 'ollama') == 'ollama':
-                    try:
-                        ai.ensure_ollama(settings.get('embed_base_url'))  # search by meaning needs it, even for Claude answers
-                    except ai.ProviderError as error:
-                        logging.getLogger('alfred').warning('Ollama unavailable before Ask: %s', error)
+                except ai.ProviderError as error:
+                    logging.getLogger('alfred').warning('Ollama unavailable before Ask: %s', error)
             return rag.ask(index, settings, question, history, on_token=signals.token.emit, cancel=cancel,
                            on_evidence=signals.progress.emit, only_path=scope,
                            on_status=lambda text: signals.progress.emit(('status', text)))
@@ -1345,19 +1665,20 @@ class AskView(QWidget):
         def done(result):
             turn.finish(result)
             self.history += [{'role': 'user', 'content': question}, {'role': 'assistant', 'content': result['answer']}]
+            sources = [{k: item.get(k) for k in ('marker', 'path', 'filename', 'location', 'segment_id', 'snippet_full')}
+                       for item in result.get('citations') or []]
+            self.record(question, scope, {'content': result['answer'], 'sources': sources, 'error': None})
             self.end()
 
         def failed(error):
             turn.fail(error)
+            self.record(question, scope, {'content': '', 'sources': [], 'error': str(error), 'setup': isinstance(error, ai.NotConfigured)})
             self.end()
         run_job(work, done, failed, progress=turn.evidence, token=turn.add_token)
 
     def end(self):
         self.cancel = None
         self.win.thinking(False)
-
-    def last_result_turn(self):
-        return next((t for t in reversed(self.turns) if t.result and t.result['citations']), None)
 
 
 class Group(QFrame):
@@ -1382,6 +1703,7 @@ class Group(QFrame):
         self.count = 0
 
     def row(self, title, widget=None, caption=None):
+        line = None
         if self.count:
             line = QFrame()
             line.setFixedHeight(1)
@@ -1389,6 +1711,7 @@ class Group(QFrame):
             self.rows.addWidget(line)
         self.count += 1
         holder = QWidget()
+        holder.hairline = line  # hide it together with the row
         row = QHBoxLayout(holder)
         row.setContentsMargins(0, 7, 0, 7)
         texts = QVBoxLayout()
@@ -1404,195 +1727,6 @@ class Group(QFrame):
                 row.addLayout(widget)
         self.rows.addWidget(holder)
         return holder
-
-
-class KnowledgeView(QWidget):
-    def __init__(self, win):
-        super().__init__()
-        self.win = win
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 16, 26, 8)
-        layout.setSpacing(12)
-        head = QHBoxLayout()
-        self.dot = QLabel('●')
-        self.status = label('', None, wrap=True)
-        head.addWidget(self.dot)
-        head.addWidget(self.status, 1)
-        head.addWidget(button('Choose vault…', self.win.choose_vault))
-        self.open_vault = button('Open in Obsidian', self.open_in_obsidian, 'primary')
-        head.addWidget(self.open_vault)
-        layout.addLayout(head)
-        self.tip = label('Save answers from Ask Alfred as linked notes. In Obsidian, press Ctrl+G for Graph view, '
-                         'or run “Open local graph” (Ctrl+P) on a note to see its connections.', 'caption', wrap=True)
-        layout.addWidget(self.tip)
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.list = ResultList(win, self.scroll)
-        self.list.activated.connect(self.open_note)
-        self.scroll.setWidget(self.list)
-        self.body = QStackedWidget()
-        self.empty = EmptyState(win)
-        self.body.addWidget(self.empty)
-        self.body.addWidget(self.scroll)
-        layout.addWidget(self.body, 1)
-        self.notes = []
-
-    def activated(self):
-        status = knowledge.vault_status(self.win.settings)
-        ready = status['state'] == 'ready'
-        self.dot.setStyleSheet(f"color: {self.win.pal['green' if ready else 'orange'].name()};")
-        self.status.setText(status['message'])
-        self.open_vault.setEnabled(ready)
-        self.notes = []
-        if ready:
-            try:
-                self.notes = knowledge.list_notes(self.win.settings, limit=60)['notes']
-            except knowledge.VaultError as error:
-                self.status.setText(str(error))
-        self.filter(self.win.search.text())
-
-    def filter(self, text):
-        words = text.casefold().split()
-        notes = [n for n in self.notes if all(w in (n['title'] + ' ' + ' '.join(n['tags'] + n['headings'])).casefold() for w in words)]
-        alfred = [n for n in notes if n['by_alfred']]
-        others = [n for n in notes if not n['by_alfred']]
-        items = []
-        note_icon = icon_pixmap('note', 30, self.win.pal['accent'])
-        for title, group in (('Saved by Alfred', alfred), ('Your vault', others)):
-            if group:
-                items.append(('header', title))
-                items.extend(('row', dict(n, title=n['title'], pixmap=note_icon, right=n['modified'],
-                                          subtitle=(' · '.join('#' + t for t in n['tags'][:4]) + ('   ' if n['tags'] else '') + n['snippet'])))
-                             for n in group)
-        self.list.set_items(items)
-        ready = knowledge.vault_status(self.win.settings)['state'] == 'ready'
-        if items:
-            self.body.setCurrentIndex(1)
-            return
-        if not ready:
-            self.empty.show_state('Connect your Obsidian vault', 'Alfred works fully without one. Connect a vault to save answers '
-                                  'as linked Markdown notes and explore them in Graph view.', [('Choose vault…', self.win.choose_vault)], 'graph')
-        elif words:
-            self.empty.show_state('No matching notes', 'Try a different filter.', (), 'search')
-        else:
-            self.empty.show_state('No notes yet', 'Ask Alfred a question, then press “Save to Knowledge” to create your first linked note.',
-                                  [('Ask Alfred', lambda: self.win.set_mode(ASK))], 'note')
-        self.body.setCurrentIndex(0)
-
-    def open_note(self, note):
-        vault = knowledge.require_vault(self.win.settings)
-        target = paths.resolve_within(vault, note['path'])
-        QDesktopServices.openUrl(QUrl(knowledge.obsidian_uri(target)))
-        self.win.hide_panel()
-
-    def activate(self):
-        if self.list.item():
-            self.open_note(self.list.item())
-
-    def open_in_obsidian(self):
-        try:
-            QDesktopServices.openUrl(QUrl(knowledge.vault_uri(self.win.settings)))
-            self.win.hide_panel()
-        except knowledge.VaultError as error:
-            self.win.toast(str(error), 'orange')
-
-
-class NoteSheet(QWidget):
-    """Review step: nothing is written until the user presses Save."""
-
-    def __init__(self, win):
-        super().__init__()
-        self.win = win
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 14, 26, 8)
-        layout.setSpacing(8)
-        top = QHBoxLayout()
-        top.addWidget(label('Review knowledge note', 'title'))
-        top.addStretch()
-        top.addWidget(button('Cancel', lambda: self.win.set_mode(ASK)))
-        top.addWidget(button('Save note', self.save, 'primary', 'Ctrl+S'))
-        layout.addLayout(top)
-        self.title = QLineEdit()
-        self.title.textChanged.connect(self.update_destination)
-        layout.addWidget(self.title)
-        self.destination = label('', 'caption')
-        layout.addWidget(self.destination)
-        layout.addWidget(label('LINKS TO EXISTING NOTES', 'section'))
-        self.links = QVBoxLayout()
-        layout.addLayout(self.links)
-        self.editor = QPlainTextEdit()
-        self.editor.setFont(QFont('Cascadia Mono', 9))
-        layout.addWidget(self.editor, 1)
-        self.checks, self.turn, self.edited = [], None, False
-        self.editor.textChanged.connect(lambda: setattr(self, 'edited', True))
-
-    def load(self, turn):
-        self.turn = turn
-        result = turn.result
-        title, _ = knowledge.draft_note(turn.question, result['answer'], result['citations'])
-        self.title.blockSignals(True)
-        self.title.setText(title)
-        self.title.blockSignals(False)
-        while self.links.count():
-            item = self.links.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self.checks = []
-        suggestions = knowledge.suggest_links(self.win.settings, title, result['answer'] + ' ' + turn.question)
-        if not suggestions:
-            self.links.addWidget(label('No existing notes look genuinely related, so no links are proposed.', 'caption'))
-        for suggestion in suggestions:
-            check = QCheckBox(f"[[{suggestion['title']}]]  —  {suggestion['reason']}")
-            check.setChecked(True)
-            check.toggled.connect(self.regenerate)
-            self.links.addWidget(check)
-            self.checks.append((check, suggestion))
-        self.edited = False
-        self.regenerate()
-
-    def regenerate(self):
-        if self.edited and QMessageBox.question(self, 'Regenerate draft?', 'Changing links rebuilds the draft and discards manual edits. Continue?') != QMessageBox.Yes:
-            return
-        result = self.turn.result
-        _, content = knowledge.draft_note(self.turn.question, result['answer'], result['citations'],
-                                          [s for c, s in self.checks if c.isChecked()], self.title.text())
-        self.editor.blockSignals(True)
-        self.editor.setPlainText(content)
-        self.editor.blockSignals(False)
-        self.edited = False
-        self.update_destination()
-
-    def update_destination(self):
-        try:
-            _, _, rel, target = knowledge.note_path(self.win.settings, self.title.text())
-            self.destination.setText(f"Saves to  {Path(self.win.settings['vault_path']).name}/{rel}" + ('   ·   ⚠ already exists' if target.exists() else ''))
-        except knowledge.VaultError as error:
-            self.destination.setText(str(error))
-
-    def save(self):
-        title, content = self.title.text().strip(), self.editor.toPlainText()
-        if '\n# ' in content:
-            content = content.replace(content.split('\n# ', 1)[1].split('\n', 1)[0], title, 1)
-        try:
-            saved = knowledge.save_note(self.win.settings, title, content)
-        except knowledge.NoteExists as exists:
-            box = QMessageBox(QMessageBox.Warning, 'Note already exists', f'{exists.rel} already exists. Replace it, or save as a new note?',
-                              QMessageBox.Cancel, self)
-            replace = box.addButton('Replace existing', QMessageBox.DestructiveRole)
-            copy = box.addButton('Save as new note', QMessageBox.AcceptRole)
-            box.exec()
-            if box.clickedButton() is replace:
-                saved = knowledge.save_note(self.win.settings, title, content, overwrite=True)
-            elif box.clickedButton() is copy:
-                saved = knowledge.save_note(self.win.settings, knowledge.unique_title(self.win.settings, title), content)
-            else:
-                return
-        except (knowledge.VaultError, OSError) as error:
-            QMessageBox.warning(self, 'Could not save note', str(error))
-            return
-        self.win.set_mode(ASK)
-        self.win.toast(f"Saved {saved['path']}", 'green', ('Open in Obsidian', lambda: QDesktopServices.openUrl(QUrl(saved['uri']))), 8)
 
 
 def folder_icon(path, size=28):
@@ -1938,51 +2072,46 @@ class SettingsView(QWidget):
         self.index_info = label('', 'caption', wrap=True, selectable=True)
         body.addWidget(self.index_info)
 
-        g = Group(win, 'AI MODEL', 'Ollama runs models on this PC and uses your GPU when available. Claude runs on Anthropic’s servers with your API key. '
-                                   'OpenAI-compatible URLs can be local (LM Studio, llama-server) or a cloud API.')
-        self.provider = QComboBox()
-        self.provider.addItems(['Not configured', 'Ollama (local)', 'OpenAI-compatible', 'Claude API (API key)', 'Claude (your Claude plan)'])
-        self.provider.currentIndexChanged.connect(self.provider_changed)
-        self.base_url, self.api_key = QLineEdit(), QLineEdit()
-        self.api_key.setEchoMode(QLineEdit.Password)
-        self.api_key.setPlaceholderText('optional · stored in app data, never shown again')
+        g = Group(win, 'AI MODEL', 'Ask Alfred uses a chat model that runs in Ollama on this PC, so your questions and files never leave it.')
         self.model = QComboBox()
-        self.model.setEditable(True)
-        self.device = QComboBox()
-        self.device.addItems(['Auto (GPU when available)', 'CPU only'])
-        for widget in (self.provider, self.base_url, self.model, self.api_key, self.device):
-            widget.setMinimumWidth(300)
-        g.row('Provider', self.provider)
-        g.row('Server', self.base_url)
+        self.model.setMinimumWidth(260)
+        self.model.setToolTip('Installed Ollama models that can chat')
         models = QHBoxLayout()
         models.addWidget(self.model)
-        models.addWidget(button('', self.refresh_models, None, 'Refresh models', icon('refresh', 14, QColor(140, 140, 150))))
-        g.row('Model', models)
-        g.row('API key', self.api_key)
-        account = QHBoxLayout()
-        self.account_status = label('', 'secondary')
-        account.addWidget(self.account_status)
-        account.addWidget(button('Sign in…', lambda: self.win.claude_sign_in(), None, 'Opens a window to sign in with your Claude account (subscription)'))
-        account.addWidget(button('Check', lambda: self.check_account(refresh=True)))
-        self.account_row = g.row('Claude account', account, 'Used by “Claude (your Claude plan)” — answers count toward your Claude plan, no API billing')
-        g.row('Device', self.device)
+        models.addWidget(button('', self.refresh_models, None, 'Refresh the list of installed models', icon('refresh', 14, QColor(140, 140, 150))))
+        g.row('Chat model', models, 'Get more with ollama pull, e.g. ollama pull llama3.2')
         self.effort = QComboBox()
-        self.effort.setMinimumWidth(300)
+        self.effort.setMinimumWidth(260)
         self.effort_note = label('', 'caption', wrap=True)
-        g.row('Thinking effort', self.effort)
-        g.outer.addWidget(self.effort_note)
+        self.effort_row = g.row('Thinking', self.effort)
+        self.device = QComboBox()
+        self.device.addItems(['Auto (GPU when available)', 'CPU only'])
+        self.device.setMinimumWidth(260)
+        g.row('Device', self.device)
+        self.base_url = QLineEdit()
+        self.base_url.setMinimumWidth(260)
+        g.row('Ollama server', self.base_url)
         self.autostart = Toggle(pal)
-        self.web_search = Toggle(pal)
-        g.row('Search the web when needed', self.web_search,
-              'Claude only: when your files don’t cover a question, Claude searches the web and labels that part “From the web (not in your files)”')
-        g.row('Start Ollama automatically', self.autostart,
-              'When Alfred opens (shortcut or tray), start Ollama in the background if needed and pre-load the models')
+        g.row('Start Ollama automatically', self.autostart, 'When Alfred starts, start Ollama in the background if it isn’t running')
         self.keep_minutes = QSpinBox()
         self.keep_minutes.setRange(5, 240)
         self.keep_minutes.setSuffix(' min')
         g.row('Keep models loaded', self.keep_minutes, 'After the last use; then Ollama unloads them and frees GPU memory')
-        self.location = label('', 'caption', wrap=True)
-        g.outer.addWidget(self.location)
+        g.outer.addWidget(self.effort_note)
+        body.addWidget(g)
+
+        g = Group(win, 'CHATS', 'Chats are saved as files on this PC, so you can reopen them from the history panel (Ctrl+H) in Ask Alfred. '
+                               'The chats folder is never added to search.')
+        self.save_chats = Toggle(pal)
+        g.row('Save chat history', self.save_chats, 'When off, new chats aren’t saved; chats already saved stay until you delete them')
+        place = QHBoxLayout()
+        self.chats_place = label('', 'caption')
+        place.addWidget(self.chats_place)
+        place.addWidget(button('Open folder', self.open_chats_folder))
+        place.addWidget(button('Change…', self.change_chats_folder))
+        g.row('Saved in', place)
+        self.delete_chats = button('Delete all chats…', self.delete_all_chats, None, 'Permanently deletes every saved chat (asks first)')
+        g.row('Saved chats', self.delete_chats)
         body.addWidget(g)
 
         g = Group(win, 'SEARCH BY MEANING', 'EmbeddingGemma 2 runs in Ollama on this PC and finds passages by meaning, not just matching words. '
@@ -2029,17 +2158,6 @@ class SettingsView(QWidget):
         g.outer.addWidget(self.diag)
         body.addWidget(g)
 
-        g = Group(win, 'OBSIDIAN', 'Notes are written only inside <vault>/<notes folder>. The vault is never added to search.')
-        self.vault = label('', 'secondary', selectable=True)
-        vault_row = QHBoxLayout()
-        vault_row.addWidget(self.vault)
-        vault_row.addWidget(button('Choose…', self.win.choose_vault))
-        g.row('Vault', vault_row)
-        self.folder = QLineEdit()
-        self.folder.setMinimumWidth(200)
-        g.row('Notes folder', self.folder)
-        body.addWidget(g)
-
         g = Group(win, 'APPEARANCE')
         self.theme = QComboBox()
         self.theme.addItems(['Match Windows', 'Dark', 'Light'])
@@ -2065,15 +2183,14 @@ class SettingsView(QWidget):
         body.addStretch()
 
         self.save_timer = QTimer(self, singleShot=True, timeout=self.save)
-        for widget in (self.base_url, self.api_key, self.embed_model, self.embed_url, self.vision_model, self.folder):
+        for widget in (self.base_url, self.embed_model, self.embed_url, self.vision_model):
             widget.textEdited.connect(lambda _: self.save_timer.start(600))
-        for widget in (self.provider, self.device, self.embed_device, self.theme, self.effort):
+        for widget in (self.model, self.device, self.embed_device, self.theme, self.effort):
             widget.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
-        self.model.currentTextChanged.connect(lambda _: self.save_timer.start(600))
         self.embed_batch.valueChanged.connect(lambda _: self.save_timer.start(600))
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
         self.keep_minutes.valueChanged.connect(lambda _: self.save_timer.start(600))
-        for toggle in (self.embed_enabled, self.ocr_enabled, self.vision_enabled, self.reduce_motion, self.auto_index, self.autostart, self.web_search):
+        for toggle in (self.embed_enabled, self.ocr_enabled, self.vision_enabled, self.reduce_motion, self.auto_index, self.autostart, self.save_chats):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
         self.loading = False
         guard_wheel(self)
@@ -2083,8 +2200,7 @@ class SettingsView(QWidget):
         s = self.win.settings
         for widget in self.findChildren(QWidget):
             widget.blockSignals(True)
-        self.provider.setCurrentIndex({'none': 0, 'ollama': 1, 'openai': 2, 'anthropic': 3, 'claude_code': 4}.get(s.get('provider'), 0))
-        self.load_provider_fields()
+        self.base_url.setText(s.get('base_url') or ai.OLLAMA_DEFAULT)
         self.device.setCurrentIndex(1 if s.get('device') == 'cpu' else 0)
         self.embed_enabled.setChecked(bool(s.get('embed_enabled')))
         self.embed_model.setText(s.get('embed_model') or '')
@@ -2095,18 +2211,17 @@ class SettingsView(QWidget):
         self.vision_enabled.setChecked(bool(s.get('vision_enabled', True)))
         self.vision_model.setText(s.get('vision_model') or 'gemma3:4b')
         self.video_interval.setValue(int(s.get('video_interval') or 10))
-        self.vault.setText(s.get('vault_path') or 'Not set')
-        self.folder.setText(s.get('notes_folder') or 'Alfred')
+        self.save_chats.setChecked(bool(s.get('save_chat_history', True)))
         self.theme.setCurrentIndex({'system': 0, 'dark': 1, 'light': 2}.get(s.get('theme'), 0))
         self.reduce_motion.setChecked(bool(s.get('reduce_motion')))
         self.auto_index.setChecked(bool(s.get('auto_index', True)))
         self.autostart.setChecked(bool(s.get('ollama_autostart', True)))
-        self.web_search.setChecked(bool(s.get('web_search', True)))
         self.keep_minutes.setValue(max(5, int(s.get('keep_alive_minutes') or 5)))
         for widget in self.findChildren(QWidget):
             widget.blockSignals(False)
-        self.provider_changed(save=False)
+        self.load_models()
         self.load_effort()
+        self.show_chats_info()
         self.show_hotkey()
         run_job(lambda s: startup.enabled(), self.show_start_login)
         self.tracked.load()
@@ -2119,80 +2234,87 @@ class SettingsView(QWidget):
                                 f"{st['errors']} failed · {st['unsupported']} unsupported · last indexed {st['last_indexed'] or 'never'}"
                                 + ''.join(f"\n{p['status']}: {p['path']} — {p['error']}" for p in self.win.index.problems(6)))
 
-    def load_provider_fields(self):
-        """Show the saved server/model/key for the provider selected in the drop-down."""
-        s, kind = self.win.settings, self.provider.currentIndex()
-        for widget in (self.base_url, self.model, self.api_key):
-            widget.blockSignals(True)
-        if kind == 4:
-            exe = ai.find_claude_code(s)
-            self.base_url.setText(f'Claude Code · {exe}' if exe else 'Claude Code not found')
-            self.model.clear()
-            self.model.addItems([model for model, _ in ai.CLAUDE_PLAN_MODELS])
-            self.model.setEditText(s.get('claude_code_model') or 'sonnet')
-            self.api_key.setText('')
-        elif kind == 3:
-            self.base_url.setText(s.get('anthropic_base_url') or ai.ANTHROPIC_DEFAULT)
-            self.model.clear()
-            self.model.addItems([model for model, _ in ai.CLAUDE_MODELS])
-            self.model.setEditText(s.get('claude_model') or 'claude-sonnet-5-5')
-            self.api_key.setText(s.get('anthropic_api_key') or '')
-        else:
-            self.base_url.setText(s.get('base_url') or (ai.OLLAMA_DEFAULT if kind == 1 else ''))
-            if self.model.findText('claude-opus-5-5') >= 0 or self.model.findText('sonnet') >= 0:
-                self.model.clear()
-            self.model.setEditText(s.get('model') or '')
-            self.api_key.setText(s.get('api_key') or '')
-        for widget in (self.base_url, self.model, self.api_key):
-            widget.blockSignals(False)
-
-    def check_account(self, refresh=False):
+    def load_models(self, announce=False):
+        """Fill the chat-model list with installed Ollama models; keep the current choice."""
         settings = dict(self.win.settings)
-        self.account_status.setText('Checking…')
 
-        def done(status):
-            if not status['installed']:
-                self.account_status.setText('Claude Code not found')
-            elif status['logged_in']:
-                self.account_status.setText('✓ Signed in' + (f" ({status['method']})" if status.get('method') else ''))
-            else:
-                self.account_status.setText('Not signed in')
-        run_job(lambda s: ai.claude_code_status(settings, refresh=refresh), done)
+        def done(models):
+            current = settings.get('model') or ''
+            self.model.blockSignals(True)
+            self.model.clear()
+            self.model.addItem('Choose a model…' if models else 'No chat models installed', '')
+            for model in models:
+                note = ' · reads images' if model['vision'] else ''
+                self.model.addItem(f"{model['model']}  ({model['size_gb']} GB{note})", model['model'])
+            if current and self.model.findData(current) < 0:
+                self.model.addItem(f'{current}  (not installed)', current)
+            self.model.setCurrentIndex(max(0, self.model.findData(current)))
+            self.model.blockSignals(False)
+            if announce:
+                self.win.toast(f'{len(models)} chat model{"s" * (len(models) != 1)} installed' if models else
+                               'No chat models found — install one with: ollama pull gemma3:4b', 'green' if models else 'orange', seconds=5)
+        run_job(lambda s: ai.available_models(settings), done)
 
     def load_effort(self):
         settings = dict(self.win.settings)
-        run_job(lambda s: ai.effort_options(settings),
-                lambda value: fill_effort(self.effort, self.effort_note, value[0], value[1], settings.get('effort')))
+        def show(value):
+            fill_effort(self.effort, self.effort_note, value[0], value[1], settings.get('effort'))
+            for widget in (self.effort_row, self.effort_row.hairline):
+                widget.setVisible(bool(value[0]))  # only for models that can think
+        run_job(lambda s: ai.effort_options(settings), show)
 
-    def provider_changed(self, *_, save=True):
-        kind = self.provider.currentIndex()
-        if save and not self.loading:
-            self.load_provider_fields()
-        self.base_url.setEnabled(kind in (1, 2))
-        self.model.setEnabled(kind != 0)
-        self.device.setEnabled(kind == 1)
-        self.api_key.setEnabled(kind in (2, 3))
-        self.account_row.setVisible(kind == 4)
-        if kind == 4:
-            self.check_account()
-        self.api_key.setPlaceholderText('Anthropic API key from console.anthropic.com (or set ANTHROPIC_API_KEY)' if kind == 3
-                                        else 'optional · stored in app data, never shown again')
-        url = self.base_url.text()
-        if kind == 0:
-            self.location.setText('Ask Alfred is off until a model is connected. Search, indexing, Knowledge and MCP still work.')
-        elif kind == 4:
-            self.location.setText('☁  Claude answers through your Claude plan: Alfred runs Claude Code invisibly with no tools and sends only the passages '
-                                  'it retrieved for your question to Anthropic, under your account. Usage counts toward your plan’s limits; no API billing. '
-                                  'Search, embeddings and image reading stay on this PC.')
-        elif kind == 3:
-            has_key = bool(self.api_key.text().strip() or os.environ.get('ANTHROPIC_API_KEY'))
-            self.location.setText('☁  Claude runs on Anthropic’s servers: the passages Alfred retrieves for each question are sent to Anthropic. '
-                                  'Search, embeddings and image reading stay on this PC.' +
-                                  ('' if has_key else '  An API key is needed (separate from a Claude.ai subscription).'))
-        elif ai.is_local_url(url):
-            self.location.setText('⌂  Local inference — questions and retrieved passages stay on this PC.')
-        else:
-            self.location.setText('☁  Remote inference — retrieved document excerpts are sent to this provider with each question.')
+    def show_chats_info(self):
+        store = self.win.ask_view.store
+        count = len(store.list())
+        self.chats_place.setText(paths.shorten(store.folder, 44))
+        self.chats_place.setToolTip(str(store.folder))
+        self.delete_chats.setText(f'Delete all chats ({count})…' if count else 'Delete all chats…')
+        self.delete_chats.setEnabled(bool(count))
+
+    def open_chats_folder(self):
+        folder = self.win.settings.chats_folder
+        folder.mkdir(parents=True, exist_ok=True)
+        open_path(folder)
+
+    def change_chats_folder(self):
+        old = self.win.settings.chats_folder
+        chosen = QFileDialog.getExistingDirectory(self, 'Choose where Alfred saves your chats', str(old))
+        if not chosen:
+            return
+        folder = Path(os.path.realpath(chosen))
+        if folder.parent == folder:
+            self.win.toast('Choose a folder, not a whole drive', 'orange')
+            return
+        if any(paths.is_within(t, folder) or paths.is_within(folder, t) for t in self.win.settings.folders):
+            self.win.toast('Keep chats outside your tracked folders, so they don’t show up in search', 'orange', seconds=6)
+            return
+        moved = 0
+        if old.is_dir() and paths.canonical(old) != paths.canonical(folder):
+            for file in old.glob('*.json'):
+                target = folder / file.name
+                if not target.exists():
+                    shutil.move(str(file), str(target))
+                    moved += 1
+        default = self.win.settings.home / 'Chats'
+        self.win.settings['chats_folder'] = '' if paths.canonical(folder) == paths.canonical(default) else str(folder)
+        self.win.settings.save()
+        self.win.ask_view.chats_changed()
+        self.show_chats_info()
+        self.win.toast(f'Chats are now saved in {folder.name}' + (f' · moved {moved} chat{"s" * (moved != 1)}' if moved else ''), 'green', seconds=5)
+
+    def delete_all_chats(self):
+        store = self.win.ask_view.store
+        count = len(store.list())
+        if not count:
+            return
+        answer = QMessageBox.question(self, 'Delete all chats?', f'This permanently deletes {count} saved chat{"s" * (count != 1)} from '
+                                      f'{store.folder}. It can’t be undone.', QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if answer != QMessageBox.Yes:
+            return
+        deleted = store.delete_all()
+        self.win.ask_view.chats_changed(current_deleted=True)
+        self.show_chats_info()
+        self.win.toast(f'Deleted {deleted} chat{"s" * (deleted != 1)}', 'green')
 
     def show_start_login(self, on):
         self.start_login.blockSignals(True)
@@ -2238,40 +2360,28 @@ class SettingsView(QWidget):
         if self.loading:
             return
         s = self.win.settings
-        try:
-            knowledge.notes_folder({'notes_folder': self.folder.text()})
-        except knowledge.VaultError as error:
-            self.win.toast(str(error), 'red')
-            return
         before = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'))
-        kind = ['none', 'ollama', 'openai', 'anthropic', 'claude_code'][self.provider.currentIndex()]
-        before_model = (s.get('provider'), s.get('model'), s.get('claude_model'), s.get('claude_code_model'))
-        if kind == 'claude_code':
-            s.update(claude_code_model=self.model.currentText().strip() or 'sonnet')
-        elif kind == 'anthropic':
-            s.update(claude_model=self.model.currentText().strip() or 'claude-sonnet-5-5', anthropic_api_key=self.api_key.text().strip())
-        else:
-            s.update(base_url=self.base_url.text().strip(), model=self.model.currentText().strip(), api_key=self.api_key.text().strip())
+        before_model = s.get('model')
+        s.update(model=self.model.currentData() or '', base_url=self.base_url.text().strip() or ai.OLLAMA_DEFAULT)
         if self.effort.isEnabled() and self.effort.currentData() is not None:
             s['effort'] = self.effort.currentData()
-        s.update({'provider': kind, 'device': 'cpu' if self.device.currentIndex() else 'auto',
+        s.update({'device': 'cpu' if self.device.currentIndex() else 'auto',
                   'embed_enabled': self.embed_enabled.isChecked(), 'embed_model': self.embed_model.text().strip(),
                   'embed_base_url': self.embed_url.text().strip(), 'embed_device': 'cpu' if self.embed_device.currentIndex() else 'auto',
                   'embed_batch': self.embed_batch.value(), 'ocr_enabled': self.ocr_enabled.isChecked(),
                   'vision_enabled': self.vision_enabled.isChecked(), 'vision_model': self.vision_model.text().strip() or 'gemma3:4b',
-                  'video_interval': self.video_interval.value(),
-                  'notes_folder': self.folder.text().strip() or 'Alfred', 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
+                  'video_interval': self.video_interval.value(), 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
                   'reduce_motion': self.reduce_motion.isChecked(), 'auto_index': self.auto_index.isChecked(),
                   'ollama_autostart': self.autostart.isChecked(), 'keep_alive_minutes': self.keep_minutes.value(),
-                  'web_search': self.web_search.isChecked()})
+                  'save_chat_history': self.save_chats.isChecked()})
         s.save()
         self.win.watch_folders()
         Motion.detect(s)
         self.win.apply_theme()
         self.win.refresh_status()
-        if (s.get('provider'), s.get('model'), s.get('claude_model'), s.get('claude_code_model')) != before_model:
+        self.win.ask_view.chats_changed()
+        if s.get('model') != before_model:
             self.load_effort()
-            self.provider_changed(save=False)
         after = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('vision_enabled'), s.get('vision_model'))
         if after != before:
             self.win.toast('Saved · updating your index', 'green', seconds=4)
@@ -2280,20 +2390,7 @@ class SettingsView(QWidget):
             self.win.toast('Settings saved', 'green', seconds=2)
 
     def refresh_models(self):
-        settings = dict(self.win.settings)
-        settings.update(provider=['none', 'ollama', 'openai', 'anthropic', 'claude_code'][self.provider.currentIndex()], base_url=self.base_url.text().strip(),
-                        api_key=self.api_key.text().strip(), anthropic_api_key=self.api_key.text().strip())
-        current = self.model.currentText()
-
-        def done(models):
-            self.model.blockSignals(True)
-            self.model.clear()
-            self.model.addItems(models)
-            self.model.setEditText(current or (models[0] if models else ''))
-            self.model.blockSignals(False)
-            self.win.toast(f'{len(models)} models available' if models else 'Reachable, but no models installed (ollama pull llama3.2)',
-                           'green' if models else 'orange')
-        run_job(lambda s: ai.ChatProvider(settings).list_models(), done, lambda e: self.win.toast(str(e), 'red', seconds=8))
+        self.load_models(announce=True)
 
     def diagnose(self, probe):
         settings = dict(self.win.settings)
@@ -2312,7 +2409,7 @@ class SettingsView(QWidget):
                 o = r['ollama']
                 lines.append(f"**Ollama:** {'v' + str(o.get('version')) if o.get('running') else 'not running'}" +
                              (' · ' + ', '.join(f"{m['model']} → {m['device']}" for m in o['loaded']) if o.get('loaded') else ' · nothing loaded'))
-            for key, name in (('chat', 'Answers'), ('embeddings', 'Embeddings'), ('vision', 'Vision')):
+            for key, name in (('chat', 'Chat'), ('embeddings', 'Search by meaning'), ('vision', 'Picture descriptions')):
                 info = r.get(key, {})
                 if (key == 'chat' and not info.get('configured')) or (key != 'chat' and not info.get('enabled')):
                     lines.append(f'**{name}:** off')
@@ -2356,7 +2453,7 @@ class AlfredWindow(QWidget):
 
         self.search = QLineEdit(self)
         self.search.setObjectName('search')
-        self.search.setGeometry(M + 56, M + (BAR - 40) // 2, W - 56 - ModeSwitch.SIZE * 4 - 34, 40)
+        self.search.setGeometry(M + 56, M + (BAR - 40) // 2, W - 56 - ModeSwitch.SIZE * len(ModeSwitch.ITEMS) - 34, 40)
         self.search.textChanged.connect(self.text_changed)
         self.search.installEventFilter(self)
         self.modes = ModeSwitch(self)
@@ -2372,8 +2469,8 @@ class AlfredWindow(QWidget):
         inner.setSpacing(0)
         self.views = QStackedWidget()
         self.search_view, self.ask_view = SearchView(self), AskView(self)
-        self.know_view, self.settings_view, self.note_sheet = KnowledgeView(self), SettingsView(self), NoteSheet(self)
-        for view in (self.search_view, self.ask_view, self.know_view, self.settings_view, self.note_sheet):
+        self.settings_view = SettingsView(self)
+        for view in (self.search_view, self.ask_view, self.settings_view):
             self.views.addWidget(view)
         inner.addWidget(self.views, 1)
         footer = QWidget()
@@ -2496,7 +2593,7 @@ class AlfredWindow(QWidget):
         paint_glass(p, rect, R, self.pal, self.backdrop, origin)
         icon_rect = QRectF(M + 22, M + (BAR - 22) / 2, 22, 22)
         p.drawPixmap(icon_rect, sparkle_pixmap(22) if self.mode == ASK else icon_pixmap(
-            {SEARCH: 'search', KNOW: 'graph', SETTINGS: 'gear', NOTE: 'bookmark'}.get(self.mode, 'search'), 22, self.pal['secondary']), QRectF())
+            {SEARCH: 'search', SETTINGS: 'gear'}.get(self.mode, 'search'), 22, self.pal['secondary']), QRectF())
         expansion = max(0.0, min(1.0, (self.height_spring.value - BAR) / 60))
         if expansion > 0:
             sep = QColor(self.pal['separator'])
@@ -2540,13 +2637,11 @@ class AlfredWindow(QWidget):
     # ---------------------------------------------------------------- modes
     def set_mode(self, mode, animate=True):
         previous = self.mode
-        if mode == NOTE and previous != NOTE:
-            self.saved_text = self.search.text()
         self.mode = mode
-        self.modes.set(min(mode, SETTINGS) if mode != NOTE else ASK, animate)
+        self.modes.set(mode, animate)
         self.search.setPlaceholderText(PLACEHOLDERS[mode])
-        self.search.setReadOnly(mode in (SETTINGS, NOTE))
-        if mode in (SETTINGS, NOTE):
+        self.search.setReadOnly(mode == SETTINGS)
+        if mode == SETTINGS:
             self.search.blockSignals(True)
             self.search.clear()
             self.search.blockSignals(False)
@@ -2565,29 +2660,14 @@ class AlfredWindow(QWidget):
 
     def update_hints(self):
         hints = {SEARCH: '↑↓ Select   ↵ Open   Ctrl+↵ Show in folder   ⇥ Ask Alfred   Esc Close',
-                 ASK: '↵ Ask   Ctrl+S Save   Ctrl+N New chat   Esc Close',
-                 KNOW: '↑↓ Select   ↵ Open in Obsidian   Esc Back',
-                 SETTINGS: 'Changes save automatically   Esc Back', NOTE: 'Ctrl+S Save note   Esc Cancel'}
+                 ASK: '↵ Ask   Ctrl+N New chat   Ctrl+H History   Esc Close',
+                 SETTINGS: 'Changes save automatically   Esc Back'}
         if not self.toasting:
             self.hints.setText(hints[self.mode])
 
     def text_changed(self, text):
         if self.mode == SEARCH:
             self.search_view.set_query(text)
-        elif self.mode == KNOW:
-            self.know_view.filter(text)
-
-    def open_note_sheet(self, turn=None):
-        turn = turn or self.ask_view.last_result_turn()
-        if not turn:
-            self.toast('Ask a question first, then save the answer.', 'orange')
-            return
-        status = knowledge.vault_status(self.settings)
-        if status['state'] != 'ready':
-            self.toast(status['message'], 'orange', ('Choose vault…', lambda: self.choose_vault() and self.open_note_sheet(turn)), 8)
-            return
-        self.note_sheet.load(turn)
-        self.set_mode(NOTE)
 
     # ------------------------------------------------------------- keyboard
     def eventFilter(self, obj, event):
@@ -2595,9 +2675,7 @@ class AlfredWindow(QWidget):
             key, mods = event.key(), event.modifiers()
             ctrl = bool(mods & Qt.ControlModifier)
             if key == Qt.Key_Escape:
-                if self.mode == NOTE:
-                    self.set_mode(ASK)
-                elif self.search.text() and self.mode in (SEARCH, ASK, KNOW):
+                if self.search.text() and self.mode in (SEARCH, ASK):
                     self.search.clear()
                 elif self.mode != SEARCH:
                     self.set_mode(SEARCH)
@@ -2608,32 +2686,30 @@ class AlfredWindow(QWidget):
                 self.set_mode(SEARCH if self.mode == ASK else ASK)
                 return True
             if ctrl and Qt.Key_1 <= key <= Qt.Key_4:
-                self.set_mode(key - Qt.Key_1)
+                self.set_mode(min(key - Qt.Key_1, SETTINGS))
                 return True
             if ctrl and key == Qt.Key_R:
                 self.start_index()
                 return True
             if ctrl and key == Qt.Key_N:
                 self.set_mode(ASK)
-                self.ask_view.reset()
+                self.ask_view.new_chat()
                 return True
-            if ctrl and key == Qt.Key_S:
-                self.note_sheet.save() if self.mode == NOTE else self.open_note_sheet()
+            if ctrl and key == Qt.Key_H:
+                if self.mode != ASK:
+                    self.set_mode(ASK)
+                self.ask_view.toggle_history()
                 return True
             if key in (Qt.Key_Up, Qt.Key_Down):
                 delta = -1 if key == Qt.Key_Up else 1
                 if self.mode == SEARCH:
                     self.search_view.list.move(delta)
-                elif self.mode == KNOW:
-                    self.know_view.list.move(delta)
                 return True
             if key in (Qt.Key_Return, Qt.Key_Enter):
                 if self.mode == SEARCH:
                     self.search_view.reveal_current() if ctrl else self.search_view.activate()
                 elif self.mode == ASK:
                     self.ask_view.send()
-                elif self.mode == KNOW:
-                    self.know_view.activate()
                 return True
         return super().eventFilter(obj, event)
 
@@ -2679,8 +2755,7 @@ class AlfredWindow(QWidget):
             self.ready_callbacks = getattr(self, 'ready_callbacks', []) + [on_ready]
         if self.warming or not self.settings.get('ollama_autostart', True):
             return
-        uses_ollama = self.settings.get('provider') == 'ollama' or (
-            self.settings.get('embed_enabled') and self.settings.get('embed_provider', 'ollama') == 'ollama')
+        uses_ollama = bool(self.settings.get('model')) or bool(self.settings.get('embed_enabled'))
         if not uses_ollama:
             return
         self.warming = True
@@ -2718,13 +2793,6 @@ class AlfredWindow(QWidget):
                 self.ready_callbacks = []
                 self.toast(f'Ollama unavailable: {error} — searching by keyword only', 'orange', seconds=10)
         run_job(lambda s: ai.warm_up(settings, s.progress.emit), done, failed, progress=progress)
-
-    def claude_sign_in(self):
-        try:
-            ai.claude_code_sign_in(self.settings)
-            self.toast('A sign-in window opened — finish signing in with your Claude account there', 'green', seconds=10)
-        except ai.ProviderError as error:
-            self.toast(str(error), 'red', seconds=8)
 
     def rebind_hotkey(self, text):
         """Switch the global shortcut live; GlobalHotkey restores the old one if the new one is taken."""
@@ -2917,9 +2985,9 @@ class AlfredWindow(QWidget):
         if parent is not None:
             self.toast(f'{folder.name} is already tracked as part of {parent.name}', 'orange', seconds=6)
             return False
-        vault = (self.settings.get('vault_path') or '').strip()
-        if vault and (paths.is_within(vault, folder) or paths.is_within(folder, vault)):
-            self.toast('Keep your Obsidian vault separate from tracked folders', 'orange', seconds=6)
+        saved_chats = self.settings.chats_folder
+        if paths.is_within(saved_chats, folder) or paths.is_within(folder, saved_chats):
+            self.toast('That folder holds your saved chats, so Alfred won’t search it', 'orange', seconds=6)
             return False
         inside = [t for t in tracked if paths.is_within(folder, t)]
         self.settings['tracked_folders'] = [str(t) for t in tracked if t not in inside] + [str(folder)]
@@ -2946,22 +3014,6 @@ class AlfredWindow(QWidget):
         run_job(lambda s: index.remove_root(folder), lambda _: self.refresh_status(),
                 lambda error: self.toast(f'Couldn’t remove {Path(folder).name} from the index: {error}', 'red'))
         self.toast(f'Stopped tracking {Path(folder).name}', 'green', seconds=4)
-
-    def choose_vault(self):
-        folder = QFileDialog.getExistingDirectory(self, 'Choose your Obsidian vault folder', self.settings.get('vault_path') or str(Path.home()))
-        if not folder:
-            return False
-        if any(paths.is_within(t, folder) or paths.is_within(folder, t) for t in self.settings.folders):
-            QMessageBox.warning(self, 'Vault overlaps a tracked folder', 'Keep the Obsidian vault separate from tracked folders.')
-            return False
-        self.settings['vault_path'] = str(Path(folder).resolve())
-        self.settings.save()
-        self.settings_view.activated()
-        self.know_view.activated()
-        status = knowledge.vault_status(self.settings)
-        self.toast(status['message'], 'green' if status['state'] == 'ready' else 'orange')
-        return status['state'] == 'ready'
-
 
 # ------------------------------------------------------------------ app
 INSTANCE = 'alfred-desktop-' + os.environ.get('USERNAME', 'user')

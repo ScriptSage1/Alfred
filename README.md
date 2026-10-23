@@ -55,6 +55,18 @@ listed as unsupported; save them in the newer format to search them.
 Search combines SQLite FTS5 (BM25) keyword matches with EmbeddingGemma 2 vectors through
 reciprocal-rank fusion.
 
+## Ask Alfred and chat history
+
+Ask Alfred (Ctrl+2 or Tab) chats with a model that runs in Ollama on your PC — pick any installed
+chat model from the model button at the top right (e.g. `gemma3:4b`, `llama3.2`). Answers from your
+documents are the next feature; until then Ask Alfred says so.
+
+Chats are saved as one JSON file each in `%LOCALAPPDATA%\Alfred\Chats` (change the folder, open it,
+or delete all chats under **Settings → Chats**). The history panel (Ctrl+H) lists them by day; hover a
+chat to rename or delete it (with Undo), and click one to reopen and continue it. Turning **Save chat
+history** off stops saving new chats; nothing already saved is deleted. The chats folder is never
+tracked or searched.
+
 ## Shortcut
 
 The default is **Ctrl+Alt+L**. If another app already uses it, Alfred falls back to Ctrl+Alt+K, then
@@ -77,7 +89,6 @@ These talk to the running Alfred.
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
 
-`alfred/rag.py` and `alfred/knowledge.py` (Ask Alfred answers, Obsidian notes) are still placeholders
-that report "not set up yet". More components to start at sign-in go in `TASKS` in `alfred/startup.py`.
+`alfred/rag.py` (answers from your documents) is still a placeholder that reports "coming next". More components to start at sign-in go in `TASKS` in `alfred/startup.py`.
 
 Settings, the index and logs live in `%LOCALAPPDATA%\Alfred` (override with `ALFRED_HOME`).

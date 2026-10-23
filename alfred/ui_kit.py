@@ -84,6 +84,9 @@ QPushButton#chip:hover {{ background: {fs}; border-color: {acc}; }}
 QPushButton#ghost {{ background: transparent; border: none; border-radius: 13px; padding: 0; }}
 QPushButton#ghost:hover {{ background: {fs}; }}
 QLabel#name {{ font-weight: 600; }}
+QLabel#bubble {{ background: {rgba(p['accent'], .20)}; border-radius: 14px; padding: 8px 13px; font-size: 10.5pt; }}
+QPushButton#pill {{ background: {f}; border: 1px solid {sep}; border-radius: 14px; padding: 5px 13px; }}
+QPushButton#pill:hover {{ background: {fs}; }}
 QLabel#tag {{ background: {fs}; border-radius: 9px; padding: 2px 9px; color: {s}; font-size: 8.5pt; }}
 QPushButton#source {{ background: {f}; border: 1px solid {sep}; border-radius: 9px; padding: 6px 10px; text-align: left; }}
 QPushButton#source:hover {{ background: {fs}; }}
@@ -243,6 +246,8 @@ SVG = {
     'warning': '<path d="M12 3 22 20H2Z" fill="C"/><path d="M12 9v5" stroke="#000" stroke-opacity=".7" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17" r="1.2" fill="#000" fill-opacity=".7"/>',
     'refresh': '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" fill="none" stroke="C" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>',
     'close': '<path d="M6 6l12 12M18 6L6 18" stroke="C" stroke-width="2.4" stroke-linecap="round"/>',
+    'sidebar': '<rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="C" stroke-width="1.9"/><path d="M9 5.5v13" stroke="C" stroke-width="1.9"/>',
+    'pencil': '<path d="M5 19l1-4L16 5l3 3L9 18Z" fill="none" stroke="C" stroke-width="2" stroke-linejoin="round"/>',
     'plus': '<path d="M12 5v14M5 12h14" stroke="C" stroke-width="2.2" stroke-linecap="round"/>',
     'note': '<path d="M6 3h8l5 5v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" fill="C"/><path d="M8.5 12h7M8.5 15.5h7" stroke="#000" stroke-opacity=".35" stroke-width="1.5" stroke-linecap="round"/>',
 }

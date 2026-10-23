@@ -1,9 +1,7 @@
 """Single source of truth for Alfred settings.
 
 Settings live in %LOCALAPPDATA%\\Alfred\\settings.json (override with
-ALFRED_HOME), outside the repository. API keys may instead come from the
-ALFRED_API_KEY / ALFRED_EMBED_API_KEY / ALFRED_ANTHROPIC_API_KEY environment
-variables. Secrets are never returned by ``public()``.
+ALFRED_HOME), outside the repository. Every model runs locally through Ollama.
 """
 import json
 import logging
@@ -17,30 +15,23 @@ DEFAULTS = {
     # Folders Alfred indexes and watches (absolute paths), added under Settings → Tracked folders.
     'tracked_folders': [],
     'auto_index': True,          # watch tracked folders and index new/changed files automatically
-    # AI generation: 'none' | 'ollama' | 'openai' | 'claude_code' | 'anthropic'. Off until the AI backend is added.
-    'provider': 'none',
-    'claude_code_model': 'sonnet',
-    'claude_code_path': '',
-    'base_url': '',
+    # Chat (Ask Alfred): a model running in Ollama on this PC. Empty until you choose one.
     'model': '',
-    'api_key': '',
-    'device': 'auto',            # ollama only: 'auto' (GPU when available) | 'cpu'
-    'ollama_autostart': True,    # start Ollama (headless) and warm the models when Alfred starts
-    'keep_alive_minutes': 5,
-    'gpu_layers': -1,
+    'base_url': 'http://127.0.0.1:11434',
+    'device': 'auto',            # 'auto' (GPU when available) | 'cpu'
+    'effort': 'off',             # thinking, for models that support it: off | on (gpt-oss: low | medium | high)
     'temperature': 0.2,
-    'effort': 'medium',
-    'web_search': True,
-    'claude_model': 'claude-sonnet-5-5',
-    'anthropic_api_key': '',
-    'anthropic_base_url': '',
     'top_k': 6,
+    'ollama_autostart': True,    # start Ollama (headless) and warm the search model when Alfred starts
+    'keep_alive_minutes': 5,
+    # Chat history: one JSON file per chat. Empty folder = %LOCALAPPDATA%\Alfred\Chats.
+    'save_chat_history': True,
+    'chats_folder': '',
     # Semantic search: EmbeddingGemma 2 through a local Ollama. Keyword search always works.
     'embed_enabled': True,
     'embed_provider': 'ollama',
     'embed_base_url': 'http://127.0.0.1:11434',
     'embed_model': 'embeddinggemma-2',
-    'embed_api_key': '',
     'embed_device': 'auto',
     'embed_batch': 16,
     # Text in images, scanned PDF pages and video frames, read by a local OCR model.
@@ -51,9 +42,6 @@ DEFAULTS = {
     'vision_model': 'gemma3:4b',
     'vision_base_url': '',       # empty = the same Ollama as embeddings
     'vision_device': 'auto',
-    # Obsidian
-    'vault_path': '',
-    'notes_folder': 'Alfred',
     # UI
     'reduce_motion': False,
     'theme': 'system',           # 'system' | 'dark' | 'light'
@@ -62,7 +50,6 @@ DEFAULTS = {
     # Start with Windows: turned on once at first launch; after that only the Settings switch changes it.
     'start_with_windows_configured': False,
 }
-SECRETS = ('api_key', 'embed_api_key', 'anthropic_api_key')
 LEGACY_FILES = ('settings.json', 'alfred.sqlite', 'alfred.sqlite-wal', 'alfred.sqlite-shm', 'claude-code-runs')
 _lock = threading.Lock()
 
@@ -109,10 +96,6 @@ class Settings(dict):
                 self.update({k: v for k, v in loaded.items() if k in DEFAULTS})
             except (OSError, ValueError):
                 pass
-        for key, env in (('api_key', 'ALFRED_API_KEY'), ('embed_api_key', 'ALFRED_EMBED_API_KEY'),
-                         ('anthropic_api_key', 'ALFRED_ANTHROPIC_API_KEY')):
-            if os.environ.get(env):
-                self[key] = os.environ[env]
 
     def save(self):
         stored = {k: v for k, v in self.items() if k in DEFAULTS}
@@ -130,12 +113,10 @@ class Settings(dict):
     def db_path(self):
         return self.home / 'index.sqlite'
 
-    def public(self):
-        """Settings safe to show: secrets reduced to a boolean."""
-        values = {k: v for k, v in self.items() if k not in SECRETS}
-        for key in SECRETS:
-            values[key + '_set'] = bool(self.get(key))
-        return values
+    @property
+    def chats_folder(self):
+        folder = str(self.get('chats_folder') or '').strip()
+        return Path(os.path.expandvars(folder)) if folder else self.home / 'Chats'
 
 
 def load(home=None):
