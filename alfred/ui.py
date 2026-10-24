@@ -102,6 +102,31 @@ def guard_wheel(root):
         widget.installEventFilter(WHEEL_GUARD)
 
 
+class NumberBox(QSpinBox):
+    """A number box whose value is selected when it gets focus, so typing replaces it (in a plain QSpinBox the digits
+    land wherever the click put the cursor, next to the old number or the unit), and input outside its range is
+    corrected to the nearest allowed value instead of being dropped."""
+
+    def __init__(self):
+        super().__init__()
+        self.setCorrectionMode(QSpinBox.CorrectToNearestValue)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        QTimer.singleShot(0, self.selectAll)  # after the click has placed the cursor
+
+
+# How long Ollama may keep a model loaded after its last use (minutes; ai.keep_alive caps it at a day).
+KEEP_LOADED = (5, 10, 15, 30, 60, 120, 240, 480, 1440)
+
+
+def duration_text(minutes):
+    if minutes < 60 or minutes % 60:
+        return f'{minutes} minutes'
+    hours = minutes // 60
+    return f"{hours} hour{'s' * (hours != 1)}"
+
+
 def fill_effort(combo, note, options, explanation, current):
     """Fill a thinking-effort drop-down with what the selected model supports."""
     combo.blockSignals(True)
@@ -685,24 +710,33 @@ class SearchView(QWidget):
         titles.addWidget(self.p_meta)
         head.addLayout(titles, 1)
         pane.addLayout(head)
+        # A picture or video: its image, AI description and any text read from it, in one column that scrolls as a
+        # whole only when it doesn't fit. Every part takes the height its content needs at the pane's width, nothing
+        # empty holds space, and the buttons below never get pushed out of the panel.
+        media = QWidget()
+        media.setObjectName('clear')
+        column = QVBoxLayout(media)
+        column.setContentsMargins(0, 2, 6, 2)
+        column.setSpacing(8)
         self.image = QLabel()
         self.image.setAlignment(Qt.AlignCenter)
         self.image.hide()
-        pane.addWidget(self.image)
+        self.image_source, self.image_height = None, 0
+        column.addWidget(self.image)
         self.card = DescriptionCard(win)
         self.card.hide()
-        holder = QWidget()
-        holder.setObjectName('clear')
-        stack = QVBoxLayout(holder)
-        stack.setContentsMargins(0, 0, 0, 0)
-        stack.addWidget(self.card)
-        stack.addStretch()
-        self.card_area = QScrollArea()  # a long description scrolls instead of being clipped
-        self.card_area.setWidgetResizable(True)
-        self.card_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.card_area.setWidget(holder)
-        self.card_area.hide()
-        pane.addWidget(self.card_area, 1)
+        column.addWidget(self.card)
+        self.media_text = label('', 'secondary', wrap=True, selectable=True)
+        self.media_text.setTextFormat(Qt.RichText)
+        self.media_text.hide()
+        column.addWidget(self.media_text)
+        column.addStretch()
+        self.media_area = QScrollArea()
+        self.media_area.setWidgetResizable(True)
+        self.media_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.media_area.setWidget(media)
+        self.media_area.hide()
+        pane.addWidget(self.media_area, 1)
         self.excerpt = QTextBrowser()
         self.excerpt.setObjectName('excerpt')
         self.excerpt.setOpenLinks(False)
@@ -823,11 +857,9 @@ class SearchView(QWidget):
         if item.get('kind_row') == 'ask':
             self.big_icon.setPixmap(sparkle_pixmap(52))
             self.set_title('Ask Alfred')
-            self.card.hide()
-            self.card_area.hide()
+            self.media_area.hide()
             self.excerpt.show()
             self.p_meta.setText(f"{ai.ChatProvider(self.win.settings).describe()['summary']}")
-            self.image.hide()
             self.excerpt.setHtml(f"<p style='font-size:11pt'>Alfred searches your indexed files for “{html.escape(self.query)}”, "
                                  "reads the most relevant passages, and writes an answer that cites each source.</p>"
                                  "<p>Press <b>Enter</b> or <b>Tab</b> to ask.</p>")
@@ -846,36 +878,32 @@ class SearchView(QWidget):
         if Path(item['path']).suffix.lower() in IMAGE_SUFFIXES and absolute.is_file():
             pixmap = QPixmap(str(absolute))
             if not pixmap.isNull():
-                dpr = self.devicePixelRatioF()  # exactly the screen's ratio: shown 1:1, not resampled
-                scaled = pixmap.scaled(round(330 * dpr), round(150 * dpr), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                scaled.setDevicePixelRatio(dpr)
-                self.image.setPixmap(_rounded(scaled, 10))
-                self.image.show()
+                self.show_image(pixmap, 150)
         elif Path(item['path']).suffix.lower() in VIDEO_SUFFIXES and absolute.is_file():
             self.image.hide()
+            self.image_source = None
 
             def show_frame(data):
                 if self.list.item() is not item or not data:
                     return
                 pixmap = QPixmap()
                 if pixmap.loadFromData(data, 'PNG'):
-                    dpr = self.devicePixelRatioF()
-                    scaled = pixmap.scaled(round(330 * dpr), round(170 * dpr), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    scaled.setDevicePixelRatio(dpr)
-                    self.image.setPixmap(_rounded(scaled, 10))
-                    self.image.show()
+                    self.show_image(pixmap, 170)
                     fade_in(self.image)
             moment = item.get('seconds') or 0
             run_job(lambda s: video_frame_png(absolute, moment), show_frame)
         else:
             self.image.hide()
+            self.image_source = None
         self.excerpt.setHtml('')
+        self.media_text.clear()
+        self.media_text.hide()
         media = Path(item['path']).suffix.lower() in IMAGE_SUFFIXES | VIDEO_SUFFIXES
         picture = Path(item['path']).suffix.lower() in IMAGE_SUFFIXES
         self.card.setVisible(False)
-        self.excerpt.setVisible(not picture)  # a picture's text goes in the card
-        self.card_area.setVisible(media)
-        self.card_area.verticalScrollBar().setValue(0)
+        self.excerpt.setVisible(not media)  # a picture's or video's text goes in its column
+        self.media_area.setVisible(media)
+        self.media_area.verticalScrollBar().setValue(0)
         self.load_details(item, media, picture)
         fade_in(self.pane)
 
@@ -885,15 +913,46 @@ class SearchView(QWidget):
         def show(ex):
             if self.list.item() is not item:
                 return
-            if not picture:
+            if not media:
                 self.excerpt.setHtml(_highlight(ex['excerpt'], query, self.win.pal) if ex['excerpt'] else '')
+            elif not picture:  # a video: the text read from its frames, under the description
+                self.media_text.setText(_highlight(ex['excerpt'], query, self.win.pal) if ex['excerpt'] else '')
+                self.media_text.setVisible(bool(ex['excerpt']))
             if media:
                 self.card.show_state(ex.get('vision'), ex.get('ocr_text', '') if picture else '', ex.get('description_pending'),
-                                     self.pane.width() - 46)
+                                     self.media_area.viewport().width() - 6)
+                self.fit_image()
                 if ex.get('description_pending') and attempt < 60:  # check back until the description arrives
                     QTimer.singleShot(3000, lambda: self.list.item() is item and self.load_details(item, media, picture, attempt + 1))
         run_job(lambda s: index.read_excerpt(item['path'], segment_id=item.get('segment_id'), max_chars=2400), show,
                 lambda error: self.list.item() is item and self.excerpt.setPlainText(f'Preview unavailable: {error}'))
+
+    IMAGE_WIDTH, IMAGE_MIN_HEIGHT = 330, 96
+
+    def show_image(self, pixmap, height):
+        """Show a picture (or a video frame) at most ``height`` tall; fit_image may shrink it to leave room for its text."""
+        self.image_source, self.image_height = pixmap, height
+        self.image.show()
+        self.fit_image()
+
+    def fit_image(self):
+        """Size the image so the image, description and frame text fit the column without scrolling when they can: the
+        image gives up height first (down to IMAGE_MIN_HEIGHT); only text that still doesn't fit scrolls."""
+        source = self.image_source
+        if source is None or self.image.isHidden():
+            return
+        column = self.media_area.widget().layout()
+        width = self.media_area.viewport().width() - column.contentsMargins().left() - column.contentsMargins().right()
+        others = sum(w.heightForWidth(width) if w.hasHeightForWidth() else w.sizeHint().height()
+                     for w in (self.card, self.media_text) if not w.isHidden())
+        shown = sum(1 for w in (self.card, self.media_text) if not w.isHidden())
+        room = (self.media_area.viewport().height() - column.contentsMargins().top() - column.contentsMargins().bottom()
+                - others - column.spacing() * shown)
+        height = max(self.IMAGE_MIN_HEIGHT, min(self.image_height, room))
+        dpr = self.devicePixelRatioF()  # exactly the screen's ratio: shown 1:1, not resampled
+        scaled = source.scaled(round(self.IMAGE_WIDTH * dpr), round(height * dpr), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled.setDevicePixelRatio(dpr)
+        self.image.setPixmap(_rounded(scaled, 10))
 
     def set_title(self, name):
         """The file name on at most two lines, broken at a natural point and elided in the middle;
@@ -2440,9 +2499,9 @@ class SettingsView(QWidget):
         g.row('Ollama server', self.base_url)
         self.autostart = Toggle(pal)
         g.row('Start Ollama automatically', self.autostart, 'When Alfred starts, start Ollama in the background if it isn’t running')
-        self.keep_minutes = QSpinBox()
-        self.keep_minutes.setRange(5, 240)
-        self.keep_minutes.setSuffix(' min')
+        self.keep_minutes = QComboBox()
+        for minutes in KEEP_LOADED:
+            self.keep_minutes.addItem(duration_text(minutes), minutes)
         g.row('Keep models loaded', self.keep_minutes, 'After the last use; then Ollama unloads them and frees GPU memory')
         body.addWidget(g)
 
@@ -2466,7 +2525,7 @@ class SettingsView(QWidget):
         self.embed_model, self.embed_url = QLineEdit(), QLineEdit()
         self.embed_device = QComboBox()
         self.embed_device.addItems(['Auto (GPU when available)', 'CPU only'])
-        self.embed_batch = QSpinBox()
+        self.embed_batch = NumberBox()
         self.embed_batch.setRange(1, 128)
         for widget in (self.embed_model, self.embed_url, self.embed_device):
             widget.setMinimumWidth(300)
@@ -2487,7 +2546,7 @@ class SettingsView(QWidget):
         self.vision_model = QLineEdit()
         self.vision_model.setMinimumWidth(220)
         g.row('Vision model', self.vision_model, 'An Ollama vision model, e.g. gemma3:4b  ·  ollama pull gemma3:4b')
-        self.video_interval = QSpinBox()
+        self.video_interval = NumberBox()
         self.video_interval.setRange(2, 120)
         self.video_interval.setSuffix(' s')
         g.row('Video: one frame every', self.video_interval,
@@ -2535,7 +2594,7 @@ class SettingsView(QWidget):
             widget.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
         self.embed_batch.valueChanged.connect(lambda _: self.save_timer.start(600))
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
-        self.keep_minutes.valueChanged.connect(lambda _: self.save_timer.start(600))
+        self.keep_minutes.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
         for toggle in (self.embed_enabled, self.ocr_enabled, self.vision_enabled, self.reduce_motion, self.auto_index, self.autostart, self.save_chats,
                        self.beyond, self.rerank_enabled, self.contextual):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
@@ -2565,7 +2624,7 @@ class SettingsView(QWidget):
         self.reduce_motion.setChecked(bool(s.get('reduce_motion')))
         self.auto_index.setChecked(bool(s.get('auto_index', True)))
         self.autostart.setChecked(bool(s.get('ollama_autostart', True)))
-        self.keep_minutes.setValue(max(5, int(s.get('keep_alive_minutes') or 5)))
+        self.show_keep_loaded(int(ai.keep_alive(s)[:-1]))
         self.beyond.setChecked(bool(s.get('answer_beyond_files', True)))
         self.rerank_enabled.setChecked(bool(s.get('rerank_enabled', True)))
         self.rerank_model.setCurrentIndex(max(0, self.rerank_model.findData(s.get('rerank_model') or rerank.DEFAULT)))
@@ -2581,6 +2640,14 @@ class SettingsView(QWidget):
         self.tracked.load()
         self.show_index_info()
         self.loading = False
+
+    def show_keep_loaded(self, minutes):
+        """Select ``minutes`` in the Keep models loaded list (a value saved by hand that isn't listed is added to it)."""
+        index = self.keep_minutes.findData(minutes)
+        if index < 0:
+            index = sum(1 for m in KEEP_LOADED if m < minutes)
+            self.keep_minutes.insertItem(index, duration_text(minutes), minutes)
+        self.keep_minutes.setCurrentIndex(index)
 
     def show_rerank(self):
         if self.rerank_job is not None:
@@ -2929,7 +2996,7 @@ class SettingsView(QWidget):
                   'vision_enabled': self.vision_enabled.isChecked(), 'vision_model': self.vision_model.text().strip() or 'gemma3:4b',
                   'video_interval': self.video_interval.value(), 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
                   'reduce_motion': self.reduce_motion.isChecked(), 'auto_index': self.auto_index.isChecked(),
-                  'ollama_autostart': self.autostart.isChecked(), 'keep_alive_minutes': self.keep_minutes.value(),
+                  'ollama_autostart': self.autostart.isChecked(), 'keep_alive_minutes': self.keep_minutes.currentData(),
                   'save_chat_history': self.save_chats.isChecked(), 'answer_beyond_files': self.beyond.isChecked(),
                   'rerank_enabled': self.rerank_enabled.isChecked(), 'rerank_model': self.rerank_model.currentData() or rerank.DEFAULT,
                   'contextual_chunks': self.contextual.isChecked()})
