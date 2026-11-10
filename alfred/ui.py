@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconPr
                                QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
                                QSystemTrayIcon, QTextBrowser, QToolTip, QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, ai, chats, config, keys, paths, picker, providers, rag, render, rerank, startup
+from . import APP_NAME, __version__, ai, chats, config, keys, opener, paths, picker, providers, rag, render, rerank, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
 from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, app_icon, blurred_backdrop, brand_pixmap, dot_pixmap, fallback_backdrop, icon,
@@ -150,7 +150,15 @@ def fill_effort(combo, note, options, explanation, current):
         note.setText(explanation)
 
 
-def open_path(path):
+def open_path(path, loc=None):
+    """Open a file; with ``loc`` (a result's page / seconds) at that spot when its default app supports it."""
+    if loc and (loc.get('page') or loc.get('seconds') is not None):
+        opener.open_at(path, loc, plain=_open_plain)
+    else:
+        _open_plain(path)
+
+
+def _open_plain(path):
     if os.name == 'nt':
         os.startfile(str(path))
     else:
@@ -1044,7 +1052,7 @@ class SearchView(QWidget):
         try:
             target = self.current_path()
             if target:
-                open_path(target)
+                open_path(target, self.list.item())
                 self.win.hide_panel()
         except (paths.PathError, OSError) as error:
             self.win.toast(f'Cannot open: {error}', 'red')
@@ -1415,7 +1423,7 @@ class SourceRow(QFrame):
 
     def open_file(self):
         try:
-            open_path(self.target())
+            open_path(self.target(), (self.items[0].get('loc') or {}) if self.items else None)
             self.win.hide_panel()
         except (paths.PathError, OSError) as error:
             self.win.toast(f'Cannot open: {error}', 'red')
