@@ -90,5 +90,42 @@ class OverheadTests(Base):
         self.assertEqual(embed.call_count, 1)
 
 
+class IdentifierTests(Base):
+    def test_query_profile_finds_identifiers_and_dates(self):
+        profile = index_module.query_profile
+        self.assertIn(('inv', '2024', '0042'), profile('INV-2024-0042').identifiers[0])
+        self.assertTrue(profile('INV-2024-0042').identifier_only)
+        self.assertIn(('15', 'march', '2024'), profile('2024-03-15').identifiers[0])
+        self.assertIn(('po', '88213'), profile('PO 88213').identifiers[0])
+        self.assertIn(('kx', '7731'), profile('KX7731').identifiers[0])
+        self.assertEqual(profile('order 5551234').identifiers, [[('5551234',)]])
+        mixed = profile('invoice INV-2024-0042 total')
+        self.assertFalse(mixed.identifier_only)
+        self.assertEqual(mixed.semantic_weight, 1.0)
+        self.assertLess(profile('INV-2024-0042').semantic_weight, 1.0)
+        for plain in ('2nd year results', 'Q3 board deck', 'holiday mp4', 'budget 2024', '37 accounts compromised'):
+            self.assertEqual(profile(plain).identifiers, [], plain)
+
+    def test_exact_identifier_ranks_first(self):
+        (self.folder / 'wanted.txt').write_text('Invoice number: INV-2024-0042. Thank you for your business.', encoding='utf-8')
+        (self.folder / 'near.txt').write_text('Invoice INV-2024-0024 and INV-2024-0420, 2024 2024 2024 summary', encoding='utf-8')
+        (self.folder / 'year.txt').write_text('INV list for 2024: 2024 totals, 2024 forecasts, 0042 copies', encoding='utf-8')
+        embedder = FakeEmbedder()
+        self.index.update(embedder=embedder)
+        for query in ('INV-2024-0042', 'inv-2024-0042', 'invoice INV-2024-0042 total'):
+            results = self.index.search(query, embedder=embedder)
+            self.assertEqual(results[0]['filename'], 'wanted.txt', query)
+        self.assertEqual(self.index.retrieve('INV-2024-0042', embedder)[0]['path'], str(self.folder / 'wanted.txt'))
+
+    def test_dates_and_numbers_in_other_written_forms(self):
+        (self.folder / 'minutes.txt').write_text('Meeting held on 15 March 2024 in room 4.', encoding='utf-8')
+        (self.folder / 'other.txt').write_text('Report 2024: 03 items, 15 pages, March plans.', encoding='utf-8')
+        (self.folder / 'order.txt').write_text('Purchase order PO-88213 approved.', encoding='utf-8')
+        (self.folder / 'po.txt').write_text('PO list: 88 items, 213 pending, PO notes.', encoding='utf-8')
+        self.index.update()
+        self.assertEqual(self.index.search('2024-03-15')[0]['filename'], 'minutes.txt')
+        self.assertEqual(self.index.search('PO 88213')[0]['filename'], 'order.txt')
+
+
 if __name__ == '__main__':
     unittest.main()

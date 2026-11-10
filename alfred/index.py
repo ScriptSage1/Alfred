@@ -12,6 +12,7 @@
   when turned on, a sentence or two of AI-written context situating it in its
   document (Anthropic's "contextual retrieval"); the stored text stays as read.
 """
+import functools
 import hashlib
 import itertools
 import json
@@ -22,6 +23,7 @@ import sqlite3
 import stat as file_stat
 import threading
 import time
+import unicodedata
 import weakref
 from pathlib import Path
 
@@ -32,6 +34,8 @@ from .extract import IMAGE_SUFFIXES, VIDEO_SUFFIXES, location_label, video_frame
 
 log = logging.getLogger('alfred')
 RRF_K = 60
+PHRASE_BOOST = 1.0  # per identifier a passage contains exactly; fused RRF scores stay below 2 / RRF_K
+IDENTIFIER_SEMANTIC_WEIGHT = 0.25  # meaning search knows little about codes and numbers: it votes less for them
 DESCRIBE_EMBED_EVERY = 25  # embed new AI descriptions in batches while describing a large folder
 SEMANTIC_BAND = 0.06  # meaning matches must be this close to the best one (EmbeddingGemma cosine)
 ENRICH_VERSION = 'header-v1'  # bump when chunk headers change: search text is rebuilt and passages re-embedded
@@ -694,9 +698,10 @@ class Index:
             return []
         con = self._reader()
         scope = self._scope_ids(con, path) if path else None  # a one-file chat searches only that file
+        profile = query_profile(query)
         keyword = self._keyword(con, query, pool, scope)
         semantic, _ = self._semantic(con, query, pool, embedder, band, scope)
-        ordered = self._fuse(keyword, semantic)
+        ordered = self._fuse(keyword, semantic, self._phrases(con, profile, pool, scope), profile.semantic_weight)
         rows = self._rows(con, [segment_id for segment_id, _ in ordered],
                           "s.path, s.ord, s.kind, s.text, s.location", "f.status='ok'")
         target = paths.canonical(path) if path else None
@@ -718,16 +723,39 @@ class Index:
         return found
 
     @staticmethod
-    def _fuse(keyword, semantic):
-        """Reciprocal-rank fusion of the keyword and meaning lists: [(segment_id, info)] best first."""
+    def _fuse(keyword, semantic, phrases=(), semantic_weight=1.0):
+        """Reciprocal-rank fusion of the keyword and meaning lists: [(segment_id, info)] best first.
+        ``phrases`` holds one ranked list per identifier in the query (passages containing it exactly); each
+        identifier a passage contains lifts it above every passage that contains fewer."""
         fused = {}
-        for channel, ranked in (('keyword', keyword), ('semantic', semantic)):
+        for channel, ranked, weight in (('keyword', keyword, 1.0), ('semantic', semantic, semantic_weight)):
             for rank, (segment_id, raw) in enumerate(ranked):
                 item = fused.setdefault(segment_id, {'score': 0.0})
-                item['score'] += 1.0 / (RRF_K + rank + 1)
+                item['score'] += weight / (RRF_K + rank + 1)
                 item[channel + '_rank'] = rank + 1
                 item[channel + '_score'] = float(raw)
+        for ranked in phrases:
+            for rank, (segment_id, _) in enumerate(ranked):
+                item = fused.setdefault(segment_id, {'score': 0.0})
+                item['score'] += PHRASE_BOOST + 1.0 / (RRF_K + rank + 1)
+                item['exact_matches'] = item.get('exact_matches', 0) + 1
         return sorted(fused.items(), key=lambda kv: -kv[1]['score'])
+
+    @staticmethod
+    def _phrases(con, profile, pool, scope=None):
+        """For each identifier or date in the query, the passages that contain it as a phrase (its pieces
+        adjacent and in order, in any of its written forms), best BM25 first."""
+        within = ' AND rowid IN (SELECT value FROM json_each(?))' if scope is not None else ''
+        extra = (json.dumps(scope),) if scope is not None else ()
+        sql = f'SELECT rowid, bm25(fts, 1.0, 2.5) FROM fts WHERE fts MATCH ?{within} ORDER BY bm25(fts, 1.0, 2.5) LIMIT ?'
+        lists = []
+        for forms in profile.identifiers:
+            match = ' OR '.join('"' + ' '.join(form) + '"' for form in forms)
+            try:
+                lists.append([(rowid, -rank) for rowid, rank in con.execute(sql, (match, *extra, pool))])
+            except sqlite3.OperationalError:
+                lists.append([])
+        return lists
 
     @staticmethod
     def _rows(con, ids, columns, where=''):
@@ -771,11 +799,15 @@ class Index:
             return [dict(result) for result in cached]
         pool = max(limit * 4, 40)
         scope = self._scope_ids(con, path) if path else None
-        keyword = self._keyword(con, query, pool, scope) if mode in ('hybrid', 'keyword') else []
+        profile = query_profile(query)
+        keyword, phrases = [], []
+        if mode in ('hybrid', 'keyword'):
+            keyword = self._keyword(con, query, pool, scope)
+            phrases = self._phrases(con, profile, pool, scope)
         semantic, note = ([], None)
         if mode in ('hybrid', 'semantic'):
             semantic, note = self._semantic(con, query, pool, embedder, scope=scope)
-        ordered = self._fuse(keyword, semantic)
+        ordered = self._fuse(keyword, semantic, phrases, profile.semantic_weight if mode == 'hybrid' else 1.0)
         rows = self._rows(con, [segment_id for segment_id, _ in ordered], 's.path, s.kind, s.text, s.location, f.size, f.mtime_ns')
         results, per = [], {}
         tokens = _tokens(query)
@@ -959,6 +991,111 @@ def _tokens(query):
     words = [t for t in re.findall(r'\w+', query.casefold()) if t]
     meaningful = [t for t in words if t not in STOPWORDS]
     return (meaningful or words)[:16]
+
+
+def _fold(text):
+    """Lower-case without accents, the way the FTS tokenizer (unicode61, remove_diacritics 2) sees text."""
+    text = text.casefold()
+    if text.isascii():
+        return text
+    return ''.join(c for c in unicodedata.normalize('NFKD', text) if not unicodedata.combining(c))
+
+
+def _words(text):
+    """The words the FTS tokenizer makes of ``text``: 'INV-2024-0042' → ['inv', '2024', '0042']."""
+    return re.findall(r'[^\W_]+', _fold(text))
+
+
+MONTHS = ('january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december')
+ORDINAL_NUMBER = re.compile(r'\d+(st|nd|rd|th)')
+
+
+def _date_forms(chunk):
+    """Written forms of a date typed as 2024-03-15, 15/03/2024 or 03.15.2024, as word sequences: the same
+    date in a document may read '2024-03-15', '15/3/2024', '15 March 2024' or 'Mar 15, 2024'."""
+    match = re.fullmatch(r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})', chunk)
+    if match:
+        dates = [(int(match[1]), int(match[2]), int(match[3]))]
+    else:
+        match = re.fullmatch(r'(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})', chunk)
+        if not match:
+            return []
+        a, b, year = int(match[1]), int(match[2]), int(match[3])
+        dates = [(year, b, a), (year, a, b)]  # day first or month first: both are written
+    forms = []
+    for year, month, day in dates:
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            continue
+        y, names = str(year), (MONTHS[month - 1], MONTHS[month - 1][:3])
+        for m in dict.fromkeys((f'{month:02d}', str(month))):
+            for d in dict.fromkeys((f'{day:02d}', str(day))):
+                forms += [(y, m, d), (d, m, y), (m, d, y)]
+        for name in names:
+            for d in dict.fromkeys((str(day), f'{day:02d}')):
+                forms += [(d, name, y), (name, d, y)]
+    return list(dict.fromkeys(forms))
+
+
+def _identifier_forms(chunk):
+    """Word sequences an identifier, number or date typed as one chunk may appear as in a document, or None
+    when the chunk is an ordinary word. 'INV-2024-0042' → [('inv', '2024', '0042'), ('inv20240042',)]."""
+    words = _words(chunk)
+    if not words or all(w.isalpha() or ORDINAL_NUMBER.fullmatch(w) for w in words):
+        return None  # no number in it ('2nd-year' is words, and has equivalents)
+    if len(words) >= 2:  # pieces joined by - _ / . : , #
+        forms = [tuple(words)] + _date_forms(chunk)
+        if any(c.isalpha() for c in chunk) or re.fullmatch(r'\d{1,3}(,\d{3})+', chunk):
+            forms.append((''.join(words),))  # KX-7731 written KX7731; 1,250,000 written 1250000
+        return list(dict.fromkeys(forms))
+    word = words[0]
+    if word.isdigit():
+        return [(word,)] if len(word) >= 5 else None  # long digit runs: order, account and phone numbers
+    if len(word) < 4 or sum(c.isdigit() for c in word) < 2:
+        return None  # 'Q3', 'mp4': too common to demand exactly
+    pieces = tuple(re.findall(r'\d+|[^\W\d_]+', word))  # KX7731 written KX-7731
+    return [(word,)] + ([pieces] if len(pieces) > 1 else [])
+
+
+class QueryProfile:
+    """How a query is matched: its identifiers (each a list of word sequences that count as an exact
+    match), its meaningful words, and how much meaning search should count."""
+    __slots__ = ('query', 'words', 'identifiers', 'terms', 'identifier_only', 'semantic_weight')
+
+    def __init__(self, query):
+        self.query = query
+        self.words = _words(query)  # every word, in order (for "contains the whole query")
+        chunks = [c.strip('.,;:!?()[]{}"\'“”‘’') for c in query.split()]
+        chunks = [c for c in chunks if c]
+        identifiers, plain, skip = [], [], False
+        for number, chunk in enumerate(chunks):
+            if skip:
+                skip = False
+                continue
+            following = chunks[number + 1] if number + 1 < len(chunks) else ''
+            if (chunk.isalpha() and chunk.isupper() and 2 <= len(chunk) <= 4 and re.fullmatch(r'\d{3,}', following)):
+                # 'PO 88213': a short capitalised prefix and its number, written 'PO 88213', 'PO-88213' or 'PO88213'
+                prefix = _fold(chunk)
+                identifiers.append([(prefix, following), (prefix + following,)] + ([(following,)] if len(following) >= 5 else []))
+                skip = True
+                continue
+            forms = _identifier_forms(chunk)
+            if forms:
+                identifiers.append(forms)
+            else:
+                plain.extend(_words(chunk))
+        meaningful = [w for w in plain if w not in STOPWORDS and (len(w) > 1 or w.isdigit())]
+        if not identifiers and not meaningful:
+            meaningful = [w for w in plain if w not in STOPWORDS] or plain  # a query of only common words
+        self.identifiers = identifiers
+        # What has to be found for a keyword match to count: each identifier as a whole, and each meaningful word.
+        self.terms = [('identifier', forms) for forms in identifiers] + [('word', w) for w in dict.fromkeys(meaningful)]
+        self.identifier_only = bool(identifiers) and not meaningful
+        self.semantic_weight = IDENTIFIER_SEMANTIC_WEIGHT if self.identifier_only else 1.0
+
+
+@functools.lru_cache(maxsize=512)
+def query_profile(query):
+    return QueryProfile((query or '').strip())
 
 
 # Documents number things in more than one way: "second semester", "Semester II", "II Sem", "2nd year".
