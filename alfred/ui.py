@@ -40,6 +40,7 @@ SEPARATOR_FADE = 60  # the line under the search bar fades in over the panel's f
 DEFAULT_HOTKEY, FALLBACK_HOTKEYS = 'Ctrl+Alt+L', ['Ctrl+Alt+L', 'Ctrl+Alt+K', 'Ctrl+Alt+A']
 SEARCH, ASK, SETTINGS = range(3)
 PLACEHOLDERS = {SEARCH: 'Search your files', ASK: 'Ask anything about your files', SETTINGS: 'Settings'}
+PENDING_REUSE_SECONDS = 5
 GROUPS = [('PDF Documents', {'pdf'}), ('Presentations', {'pptx'}), ('Spreadsheets', {'xlsx', 'csv'}),
           ('Images', {s.lstrip('.') for s in IMAGE_SUFFIXES}), ('Videos', {s.lstrip('.') for s in VIDEO_SUFFIXES})]
 
@@ -519,6 +520,8 @@ class ResultList(QWidget):
                 p.setBrush(pal['hover'])
                 p.drawRoundedRect(QRectF(6, y + 1 + offset, width - 12, h - 2), 9, 9)
             text = _mix(pal['text'], pal['accent_text'], cover)
+            if value.get('muted'):
+                text = _mix(text, pal['secondary'], 0.6 * (1 - cover))  # weaker matches read quieter
             secondary = _mix(pal['secondary'], QColor(255, 255, 255, 200), cover)
             pixmap = value.get('pixmap')
             if pixmap is not None and not pixmap.isNull():
@@ -671,6 +674,9 @@ class SearchView(QWidget):
         self.generation = 0
         self.query = ''
         self.shown = None  # the query whose results (or "no results") are showing
+        self.weak_open, self.weak_for = False, None  # weaker matches revealed for this query?
+        self.last = None
+        self.pending_seen = (0.0, None)  # (when, answer) of the last disk walk for index changes
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -789,8 +795,14 @@ class SearchView(QWidget):
         def work(signals):
             embedder = ai.Embedder.from_settings(settings)
             down = bool(embedder and embedder.kind == 'ollama' and embedder.local and not ai.ollama_running(embedder.base, 0.6))
-            results = index.search(query, limit=24, mode='hybrid', embedder=embedder)
-            return results, (index.pending_changes() if not results else None), down
+            results = index.search(query, limit=24, mode='hybrid', embedder=embedder, include_weak=True)
+            pending = None
+            if not any(not r.get('weak') for r in results):
+                when, pending = self.pending_seen
+                if time.monotonic() - when > PENDING_REUSE_SECONDS:  # a disk walk: not once per keystroke
+                    pending = index.pending_changes()
+                    self.pending_seen = (time.monotonic(), pending)
+            return results, pending, down
         run_job(work, lambda value: (self.show(value[0], generation, query, value[1]), value[2] and self.heal(generation)),
                 lambda error: generation == self.generation and self.show_error(error))
 
@@ -813,10 +825,23 @@ class SearchView(QWidget):
         if generation != self.generation:
             return
         self.shown = query
-        if not results and pending and any(pending.values()):
+        if query != self.weak_for:
+            self.weak_open, self.weak_for = False, query
+        self.last = (results, generation, query, pending)
+        strong = [r for r in results if not r.get('weak')]
+        weak = [r for r in results if r.get('weak')]
+        results = strong + (weak if self.weak_open else [])
+        if not strong and pending and any(pending.values()):
             count = sum(pending.values())
             self.empty.show_state('Your folder has changed', f'{count} file{"s" * (count != 1)} added, changed or removed since the last '
                                   'index, so results may be missing.', [('Index now', self.win.start_index)], 'refresh')
+            self.stack.setCurrentIndex(0)
+            self.win.update_height()
+            return
+        if not results and weak:
+            count = len(weak)
+            self.empty.show_state(f'No strong matches for “{query}”', f'{count} weaker match{"es" * (count != 1)} found, which may not be what you meant.',
+                                  [(f'Show {count} weaker match{"es" * (count != 1)}', self.show_weak), ('Ask Alfred  ⇥', lambda: self.win.set_mode(ASK))], 'search')
             self.stack.setCurrentIndex(0)
             self.win.update_height()
             return
@@ -830,19 +855,28 @@ class SearchView(QWidget):
         results = [r for r in results if not (r['path'] in seen or seen.add(r['path']))]
 
         def row(result):
-            return ('row', dict(result, kind_row='file', title=result['filename'], pixmap=FileIcons.get(result['path']),
+            return ('row', dict(result, kind_row='file', muted=bool(result.get('weak')), title=result['filename'], pixmap=FileIcons.get(result['path']),
                                 rounded=Path(result['path']).suffix.lower() in IMAGE_SUFFIXES,
                                 subtitle=f"{result['location']} — {result['snippet']}", right=result.get('folder', '')))
-        items.append(('header', 'Top Hit'))
-        items.append(row(results[0]))
+        shown_strong = [r for r in results if not r.get('weak')]
+        shown_weak = [r for r in results if r.get('weak')]
+        if shown_strong:
+            items.append(('header', 'Top Hit'))
+            items.append(row(shown_strong[0]))
         grouped = {}
-        for result in results[1:]:
+        for result in shown_strong[1:]:
             group = next((name for name, types in GROUPS if result['file_type'] in types), 'Documents')
             grouped.setdefault(group, []).append(result)
         for name in ['Documents', 'PDF Documents', 'Presentations', 'Spreadsheets', 'Images', 'Videos']:
             if grouped.get(name):
                 items.append(('header', name))
                 items.extend(row(result) for result in grouped[name])
+        if shown_weak:
+            items.append(('header', 'Weaker matches'))
+            items.extend(row(result) for result in shown_weak)
+        elif weak and not self.weak_open:
+            items.append(('row', dict(kind_row='weak', title=f'Show {len(weak)} weaker match{"es" * (len(weak) != 1)}', pixmap=None,
+                                      subtitle='Partial matches, below the usual confidence', right='')))
         items.append(('header', 'Ask Alfred'))
         items.append(('row', dict(kind_row='ask', title=f'Ask Alfred: “{query}”', pixmap=sparkle_pixmap(30),
                                   subtitle='Get an answer grounded in your files, with citations', right='Tab')))
@@ -851,8 +885,25 @@ class SearchView(QWidget):
         self.stack.setCurrentIndex(1)
         self.win.update_height()
 
+    def show_weak(self):
+        if self.last and self.last[1] == self.generation:
+            self.weak_open = True
+            self.show(*self.last)
+
     def preview(self, item):
         if not item:
+            return
+        if item.get('kind_row') == 'weak':
+            self.big_icon.setPixmap(sparkle_pixmap(52))
+            self.set_title('Weaker matches')
+            self.media_area.hide()
+            self.excerpt.show()
+            self.p_meta.setText('Below the usual confidence')
+            self.excerpt.setHtml("<p style='font-size:11pt'>These passages match only part of what you typed, or only by meaning. "
+                                 "They are listed apart so they don't look like strong results.</p><p>Press <b>Enter</b> to show them.</p>")
+            for widget in (self.open_button, self.reveal_button, self.ask_button):
+                widget.hide()
+            fade_in(self.pane)
             return
         if item.get('kind_row') == 'ask':
             self.big_icon.setPixmap(sparkle_pixmap(52))
@@ -978,6 +1029,8 @@ class SearchView(QWidget):
     def activate_item(self, item):
         if item.get('kind_row') == 'ask':
             self.win.set_mode(ASK)  # carries the typed text over; nothing is sent until Enter
+        elif item.get('kind_row') == 'weak':
+            self.show_weak()
         else:
             self.open_current()
 
