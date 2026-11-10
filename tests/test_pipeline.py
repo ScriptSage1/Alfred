@@ -270,7 +270,8 @@ class IndexTests(Base):
         (self.folder / '.git' / 'config.txt').write_text('remote', encoding='utf-8')
         (self.folder / 'fine.txt').write_text('ordinary words', encoding='utf-8')
         self.index.update()
-        con_files = [r['filename'] for r in self.index.search('hunter2 remote API_KEY BEGIN ordinary')]
+        # One word of five matching is a weak match: ask for those too, so anything indexed would show.
+        con_files = [r['filename'] for r in self.index.search('hunter2 remote API_KEY BEGIN ordinary', include_weak=True)]
         self.assertEqual(con_files, ['fine.txt'])
 
     def test_excerpt_and_resolve_stay_inside_tracked_folders(self):

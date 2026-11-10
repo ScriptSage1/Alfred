@@ -127,5 +127,78 @@ class IdentifierTests(Base):
         self.assertEqual(self.index.search('PO 88213')[0]['filename'], 'order.txt')
 
 
+class Similar:
+    """A fake embedder whose query is equally similar (``score``) to every passage."""
+    batch = 8
+
+    def __init__(self, score, floor=None):
+        self.score, self.confident_similarity = score, floor
+
+    def signature(self):
+        return 'similar'
+
+    def embed_documents(self, texts, titles=None):
+        return [[1.0, 0.0] for _ in texts]
+
+    def embed_query(self, text):
+        return [self.score, (1 - self.score ** 2) ** 0.5]
+
+
+class RelevanceFloorTests(Base):
+    def test_is_confident_rules(self):
+        confident = index_module.is_confident
+        # Keywords: most of the meaningful words, all of them for one or two.
+        self.assertTrue(confident('repair kayak hull', 'How we repair the hull of a kayak'))
+        self.assertTrue(confident('repair leaking kayak hull', 'repair notes for the kayak hull'))  # 3 of 4
+        self.assertFalse(confident('repair leaking kayak hull', 'repair the car'))  # 1 of 4
+        self.assertFalse(confident('kayak hull', 'kayak trip photos'))
+        self.assertTrue(confident('how to repair a kayak', 'kayaks: repair guide'))  # stopwords don't count; plurals do
+        self.assertTrue(confident('the quarterly budget', 'The Quarterly Budget, final'))  # the whole query as a phrase
+        # Typing: the last word may be unfinished.
+        self.assertTrue(confident('kayak hul', 'kayak hull'))
+        self.assertFalse(confident('kayak hul', 'kayak trip'))
+        self.assertFalse(confident('hul kayak', 'kayak hull'))  # only the last word
+        # Identifiers must be there exactly.
+        self.assertTrue(confident('INV-2024-0042', 'Invoice number INV-2024-0042'))
+        self.assertFalse(confident('INV-2024-0042', 'INV-2024-0024 issued in 2024', semantic_similarity=0.99))
+        # Meaning: the model's calibrated floor.
+        self.assertTrue(confident('vehicle upkeep', 'notes on the automobile', 0.80, Similar(0.8, 0.7)))
+        self.assertFalse(confident('vehicle upkeep', 'notes on the automobile', 0.65, Similar(0.65, 0.7)))
+        from alfred import ai
+        gemma = ai.Embedder({'embed_model': 'embeddinggemma-2'})
+        self.assertGreater(index_module.semantic_floor(gemma), gemma.min_similarity)
+
+    def test_unrelated_query_finds_nothing_but_weak_matches_can_be_asked_for(self):
+        (self.folder / 'boat.txt').write_text('Kayak hull repair: sand, patch and seal the leaking seam.', encoding='utf-8')
+        (self.folder / 'garden.txt').write_text('Garden plan: repair the fence before spring planting.', encoding='utf-8')
+        self.index.update()
+        self.assertEqual([r['filename'] for r in self.index.search('repair leaking kayak hull')], ['boat.txt'])
+        self.assertEqual(self.index.search('submarine sonar repair procedure'), [])  # one common word matches
+        weak = self.index.search('submarine sonar repair procedure', include_weak=True)
+        self.assertEqual({r['filename'] for r in weak}, {'boat.txt', 'garden.txt'})
+        self.assertTrue(all(r['weak'] for r in weak))
+        mixed = self.index.search('kayak repair fence', include_weak=True)  # boat: 2 of 3, garden: 2 of 3
+        self.assertEqual({r['filename'] for r in mixed}, {'boat.txt', 'garden.txt'})
+        self.assertNotIn('weak', mixed[0])
+        self.assertEqual(self.index.search('ZQX-99999-NOPE', include_weak=True), [])
+
+    def test_confident_results_come_before_weak_ones(self):
+        (self.folder / 'a.txt').write_text('alpha beta gamma delta', encoding='utf-8')
+        (self.folder / 'b.txt').write_text('alpha alpha alpha alpha alpha epsilon', encoding='utf-8')
+        self.index.update()
+        results = self.index.search('alpha beta gamma', include_weak=True)
+        self.assertEqual([(r['filename'], r.get('weak', False)) for r in results], [('a.txt', False), ('b.txt', True)])
+
+    def test_meaning_matches_need_the_calibrated_similarity(self):
+        (self.folder / 'auto.txt').write_text('notes on the automobile engine', encoding='utf-8')
+        strong, weak = Similar(0.8, floor=0.7), Similar(0.65, floor=0.7)
+        weak.min_similarity = 0.6  # passes the meaning channel's noise floor, not the confidence floor
+        self.index.update(embedder=strong)
+        self.assertEqual([r['filename'] for r in self.index.search('vehicle', embedder=strong)], ['auto.txt'])
+        self.index._query_cache.clear()  # same signature, different similarity: not a real model change
+        self.assertEqual(self.index.search('vehicle', embedder=weak), [])
+        self.assertTrue(self.index.search('vehicle', embedder=weak, include_weak=True)[0]['weak'])
+
+
 if __name__ == '__main__':
     unittest.main()

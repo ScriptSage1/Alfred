@@ -107,6 +107,11 @@ class Embedder:
         # Cosine similarity below which a meaning-only match is noise (measured on EmbeddingGemma 2:
         # related passages score about 0.70+, unrelated ones 0.58–0.65).
         self.min_similarity = 0.66 if self.family == 'gemma' else 0.5
+        # Similarity at which a meaning match alone is confident enough to show (index.is_confident). Calibrated
+        # for EmbeddingGemma 2 on the benchmark's synthetic corpus: the best passage for unrelated queries scored
+        # 0.60-0.65, the relevant passage for paraphrase/meaning queries 0.69+. Other models are not calibrated
+        # and use their noise floor.
+        self.confident_similarity = 0.67 if self.family == 'gemma' else None
 
     @classmethod
     def from_settings(cls, settings):

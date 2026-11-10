@@ -17,6 +17,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -782,8 +783,11 @@ class Index:
         return {sid: matrix[where[sid]] for sid in segment_ids if sid in where}
 
     # ---------------------------------------------------------------- search
-    def search(self, query, limit=10, mode='hybrid', embedder=None, per_file=2, path=None):
-        """Ranked results across all tracked folders."""
+    def search(self, query, limit=10, mode='hybrid', embedder=None, per_file=2, path=None, include_weak=False):
+        """Ranked results across all tracked folders.
+
+        Only confident matches are returned (see is_confident), so an unrelated query finds nothing. With
+        ``include_weak`` the weaker matches follow them (up to ``limit`` in all), each marked 'weak': True."""
         query = (query or '').strip()
         if not query:
             return []
@@ -791,7 +795,7 @@ class Index:
         con = self._reader()
         # The same search on an unchanged index (no commit from any connection since), with the same folders and
         # model, gives the same results: answer it from memory. Lives in _query_cache, so clearing that clears it.
-        cache_key = ('results', query, limit, mode, per_file, paths.canonical(path) if path else None,
+        cache_key = ('results', query, limit, mode, per_file, paths.canonical(path) if path else None, bool(include_weak),
                      embedder.signature() if embedder is not None and mode != 'keyword' else None,
                      self._index_version(con), self._tracked()[0])
         cached = self._query_cache.get(cache_key)
@@ -808,34 +812,55 @@ class Index:
         if mode in ('hybrid', 'semantic'):
             semantic, note = self._semantic(con, query, pool, embedder, scope=scope)
         ordered = self._fuse(keyword, semantic, phrases, profile.semantic_weight if mode == 'hybrid' else 1.0)
-        rows = self._rows(con, [segment_id for segment_id, _ in ordered], 's.path, s.kind, s.text, s.location, f.size, f.mtime_ns')
-        results, per = [], {}
+        rows = self._rows(con, [segment_id for segment_id, _ in ordered],
+                          's.path, s.kind, s.text, s.location, f.size, f.mtime_ns, x.text, x.name')
         tokens = _tokens(query)
         target = paths.canonical(path) if path else None
-        for segment_id, info in ordered:
-            row = rows.get(segment_id)
-            if not row:
-                continue
-            file, kind, text, location, size, mtime = row
-            if target and paths.canonical(file) != target:
-                continue
-            place = self._place(file)
-            if place is None:
-                continue
-            if per.get(file, 0) >= per_file:
-                continue
-            per[file] = per.get(file, 0) + 1
+
+        def result(segment_id, info, row, place, weak):
+            file, kind, text, location, size, mtime = row[:6]
             loc = json.loads(location or '{}')
-            results.append({
+            found = {
                 'segment_id': segment_id, 'path': file, 'filename': Path(file).name, 'folder': place[1],
                 'kind': kind, 'file_type': Path(file).suffix.lower().lstrip('.'), 'location': location_label(kind, loc), **loc,
                 'snippet': _snippet(text, tokens), 'score': round(info['score'], 5),
                 'keyword_rank': info.get('keyword_rank'), 'semantic_rank': info.get('semantic_rank'),
                 'semantic_similarity': round(info['semantic_score'], 4) if 'semantic_score' in info else None, 'size': size,
                 'modified': time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime / 1e9)),
-            })
+            }
+            if weak:
+                found['weak'] = True
+            return found
+
+        results, weak, per = [], [], {}
+        for segment_id, info in ordered:
+            row = rows.get(segment_id)
+            if not row:
+                continue
+            file = row[0]
+            if target and paths.canonical(file) != target:
+                continue
+            place = self._place(file)
+            if place is None:
+                continue
+            seen = '\n'.join(part for part in (row[6], row[7]) if part) or row[2]  # what keyword search saw
+            if not is_confident(profile, seen, info.get('semantic_score'), embedder):
+                if include_weak:
+                    weak.append((segment_id, info, row, place))
+                continue
+            if per.get(file, 0) >= per_file:
+                continue
+            per[file] = per.get(file, 0) + 1
+            results.append(result(segment_id, info, row, place, False))
             if len(results) >= limit:
                 break
+        for segment_id, info, row, place in weak:  # weaker matches after every confident one
+            if len(results) >= limit:
+                break
+            if per.get(row[0], 0) >= per_file:
+                continue
+            per[row[0]] = per.get(row[0], 0) + 1
+            results.append(result(segment_id, info, row, place, True))
         if note and results:
             results[0]['notes'] = [note]
         if note is None:  # a degraded search (meaning search unavailable) is not remembered
@@ -1059,7 +1084,7 @@ def _identifier_forms(chunk):
 class QueryProfile:
     """How a query is matched: its identifiers (each a list of word sequences that count as an exact
     match), its meaningful words, and how much meaning search should count."""
-    __slots__ = ('query', 'words', 'identifiers', 'terms', 'identifier_only', 'semantic_weight')
+    __slots__ = ('query', 'words', 'identifiers', 'terms', 'identifier_only', 'semantic_weight', 'partial')
 
     def __init__(self, query):
         self.query = query
@@ -1091,11 +1116,68 @@ class QueryProfile:
         self.terms = [('identifier', forms) for forms in identifiers] + [('word', w) for w in dict.fromkeys(meaningful)]
         self.identifier_only = bool(identifiers) and not meaningful
         self.semantic_weight = IDENTIFIER_SEMANTIC_WEIGHT if self.identifier_only else 1.0
+        # The last word may still be being typed: it also counts when a word in the passage starts with it.
+        last = _words(chunks[-1]) if chunks and not _identifier_forms(chunks[-1]) else []
+        self.partial = last[-1] if last and len(last[-1]) >= 3 and last[-1] in meaningful else None
 
 
 @functools.lru_cache(maxsize=512)
 def query_profile(query):
     return QueryProfile((query or '').strip())
+
+
+# ------------------------------------------------------------ relevance floor
+CONFIDENT_SHARE = 0.6  # a keyword-only match must contain this share of the query's meaningful words (all of 1-2)
+
+
+def semantic_floor(embedder):
+    """The similarity at which a meaning match alone is worth showing, for this embedding model."""
+    for name in ('confident_similarity', 'min_similarity'):
+        value = getattr(embedder, name, None)
+        if value is not None:
+            return float(value)
+    return 0.5
+
+
+def _contains(words, sequence):
+    """True when ``sequence`` occurs in ``words`` as adjacent words, in order."""
+    size = len(sequence)
+    first = sequence[0]
+    return any(word == first and tuple(words[i:i + size]) == sequence for i, word in enumerate(words))
+
+
+def is_confident(query, text, semantic_similarity=None, embedder=None):
+    """Whether a passage is a strong enough match for ``query`` to show (or to answer from).
+
+    ``text`` is what keyword search saw for the passage (its search text and file name);
+    ``semantic_similarity`` its cosine similarity to the query, when meaning search scored it.
+    * A query that is only identifiers, codes or dates: the passage must contain one of them exactly.
+    * The passage contains the whole query as a phrase: confident.
+    * Meaning: similarity at or above the model's calibrated floor (see semantic_floor).
+    * Keywords: the passage must contain most of the query's meaningful words (all of them for one or two
+      words; an identifier counts as one word); a single common word matching is not enough. The last word
+      may be a prefix, so results keep appearing while a word is being typed.
+    """
+    profile = query if isinstance(query, QueryProfile) else query_profile(query)
+    words = _words(text or '')
+    if profile.identifier_only:
+        return any(_contains(words, form) for forms in profile.identifiers for form in forms)
+    if len(profile.words) >= 2 and _contains(words, tuple(profile.words)):
+        return True
+    if semantic_similarity is not None and semantic_similarity >= semantic_floor(embedder):
+        return True
+    if not profile.terms:
+        return False
+    vocabulary = set(words)
+    found = 0
+    for kind, value in profile.terms:
+        if kind == 'identifier':
+            found += any(_contains(words, form) for form in value)
+        else:
+            found += (any(form in vocabulary for form in _variants(value)) or value + 's' in vocabulary or value + 'es' in vocabulary
+                      or (value == profile.partial and any(word.startswith(value) for word in vocabulary)))
+    count = len(profile.terms)
+    return found >= (count if count <= 2 else math.ceil(CONFIDENT_SHARE * count))
 
 
 # Documents number things in more than one way: "second semester", "Semester II", "II Sem", "2nd year".
