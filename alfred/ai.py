@@ -3,10 +3,12 @@ plus starting Ollama and reporting which device it runs on.
 
 Chat providers (Ollama, Claude, ChatGPT, APIs) live in alfred.providers.
 """
+import http.client
 import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -38,6 +40,33 @@ def _json(url, payload=None, timeout=30):
         raise ProviderError(f'HTTP {error.code}: {detail}') from None
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
         raise ProviderError(f'Cannot reach {urlparse(url).netloc}: {getattr(error, "reason", error)}') from None
+
+
+_KEPT = threading.local()  # {(host, port): HTTPConnection} per thread, for local Ollama only
+
+
+def _json_kept(url, payload, timeout=30):
+    """POST JSON to a local server over a kept-open connection (no new socket or proxy lookup per call).
+    Raises on anything unexpected; the caller falls back to _json, which reports errors properly."""
+    parts = urlparse(url)
+    key = (parts.hostname, parts.port or 80)
+    pool = getattr(_KEPT, 'pool', None)
+    if pool is None:
+        pool = _KEPT.pool = {}
+    con = pool.get(key)
+    if con is None:
+        con = pool[key] = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    try:
+        con.request('POST', parts.path or '/', json.dumps(payload).encode(), {'Content-Type': 'application/json'})
+        response = con.getresponse()
+        body = response.read()
+        if response.status != 200:
+            raise ProviderError(f'HTTP {response.status}')
+        return json.loads(body)
+    except Exception:
+        con.close()
+        pool.pop(key, None)
+        raise
 
 
 def is_local_url(url):
@@ -129,7 +158,19 @@ class Embedder:
             raise
 
     def embed_query(self, text):
-        return self._embed([self.query_prompt(text[:2000])])[0]
+        prompt = self.query_prompt(text[:2000])
+        if self.local:  # one query per keystroke pause: reuse the connection to Ollama
+            payload = {'model': self.model, 'input': [prompt], 'truncate': True, 'keep_alive': self.keep_alive,
+                       'options': _options(self.device)}
+            try:
+                vectors = _json_kept(self.base + '/api/embed', payload, timeout=180).get('embeddings')
+                if vectors and len(vectors) == 1:
+                    return vectors[0]
+            except TimeoutError:
+                raise ProviderError(f'Cannot reach {urlparse(self.base).netloc}: timed out') from None
+            except Exception:
+                pass  # the regular request below reports what went wrong
+        return self._embed([prompt])[0]
 
 
 class Vision:

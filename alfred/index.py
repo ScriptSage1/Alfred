@@ -13,6 +13,7 @@
   document (Anthropic's "contextual retrieval"); the stored text stays as read.
 """
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ import sqlite3
 import stat as file_stat
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +63,29 @@ def connect(db_path):
     con.execute('PRAGMA synchronous=NORMAL')
     con.executescript(SCHEMA)
     return con
+
+
+_MISSING = object()
+_READER_SERIAL = itertools.count(1)
+
+
+class _Reader:
+    """A thread's read connection to the index. Closed when its thread ends (the thread-local holding it is
+    dropped) or when the Index is closed."""
+    __slots__ = ('con', 'serial', '__weakref__')
+
+    def __init__(self, db_path):
+        self.con = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+        self.con.execute('PRAGMA query_only=1')
+        self.serial = next(_READER_SERIAL)
+
+    def close(self):
+        try:
+            self.con.close()
+        except sqlite3.Error:
+            pass
+
+    __del__ = close
 
 
 def name_terms(path):
@@ -114,15 +139,68 @@ class Index:
         self.cancel = threading.Event()
         self._lock = threading.Lock()
         self._vectors = (None, None, None)  # (version, ids, matrix)
-        self._query_cache = {}
-        connect(self.db_path).close()
+        self._query_cache = {}  # query vectors, and recent search results (see search)
+        self._roots_cache = None  # (tracked folders as set, canonical roots, {path: (root, display folder)})
+        self._local = threading.local()  # one read connection per thread (searches run on UI worker threads)
+        self._readers = weakref.WeakSet()
+        connect(self.db_path).close()  # the schema is created here, once; read connections skip it
+
+    def _reader(self):
+        """This thread's read connection, opened once (autocommit: every query sees the latest commit)."""
+        reader = getattr(self._local, 'reader', None)
+        if reader is None:
+            reader = self._local.reader = _Reader(self.db_path)
+            self._readers.add(reader)
+        return reader.con
+
+    def _index_version(self, con):
+        """(this connection, its data_version): changes whenever any other connection commits to the index."""
+        return self._local.reader.serial, con.execute('PRAGMA data_version').fetchone()[0]
+
+    def close(self):
+        """Close the read connections (the database file can then be deleted)."""
+        for reader in list(self._readers):
+            reader.close()
+        self._readers = weakref.WeakSet()
+        self._local = threading.local()
 
     # ---------------------------------------------------------------- folders
+    def _tracked(self):
+        """(key, canonical roots, place memo), rebuilt only when the tracked folders change."""
+        key = tuple(str(folder) for folder in self.settings.get('tracked_folders') or [])
+        cached = self._roots_cache
+        if cached is None or cached[0] != key:
+            cached = (key, [Path(os.path.realpath(folder)) for folder in self.settings.folders], {})
+            self._roots_cache = cached
+        return cached
+
     def roots(self):
-        return [Path(os.path.realpath(folder)) for folder in self.settings.folders]
+        return list(self._tracked()[1])
 
     def root_of(self, path):
         return next((root for root in self.roots() if paths.is_within(root, path)), None)
+
+    def _place(self, path):
+        """(root, display folder) of an indexed file, or None when no tracked folder holds it. Indexed paths are
+        already real paths (see discover), so this is a string comparison, remembered until the folders change."""
+        _, roots, memo = self._tracked()
+        place = memo.get(path, _MISSING)
+        if place is not _MISSING:
+            return place
+        lowered = os.path.normcase(str(path))
+        root = next((r for r in roots if lowered == os.path.normcase(str(r)) or
+                     lowered.startswith(os.path.normcase(str(r)).rstrip(os.sep) + os.sep)), None)
+        if root is None:  # not in real-path form: resolve it the slow way
+            root = next((r for r in roots if paths.is_within(r, path)), None)
+        place = None
+        if root is not None:
+            parent = Path(path).parent
+            rel = parent.parts[len(root.parts):] if len(parent.parts) > len(root.parts) else ()
+            place = (root, ' › '.join([root.name] + list(rel)))
+        if len(memo) > 50000:
+            memo.clear()
+        memo[path] = place
+        return place
 
     def resolve(self, path):
         """The real file behind a search result, only if it is still inside a tracked folder."""
@@ -135,11 +213,8 @@ class Index:
 
     def display_folder(self, path):
         """'Downloads › Reports' for a file in Downloads\\Reports."""
-        root = self.root_of(path)
-        if root is None:
-            return str(Path(path).parent)
-        rel = Path(path).parent.relative_to(root) if paths.is_within(root, Path(path).parent) else Path()
-        return ' › '.join([root.name] + list(rel.parts))
+        place = self._place(str(path))
+        return place[1] if place else str(Path(path).parent)
 
     # ------------------------------------------------------------ enrichment
     def header(self, path, kind, loc):
@@ -617,56 +692,62 @@ class Index:
         query = (query or '').strip()
         if not query:
             return []
-        con = connect(self.db_path)
-        try:
-            scope = self._scope_ids(con, path) if path else None  # a one-file chat searches only that file
-            keyword = self._keyword(con, query, pool, scope)
-            semantic, _ = self._semantic(con, query, pool, embedder, band, scope)
-            fused = {}
-            for channel, ranked in (('keyword', keyword), ('semantic', semantic)):
-                for rank, (segment_id, raw) in enumerate(ranked):
-                    item = fused.setdefault(segment_id, {'score': 0.0})
-                    item['score'] += 1.0 / (RRF_K + rank + 1)
-                    item[channel + '_rank'] = rank + 1
-                    item[channel + '_score'] = float(raw)
-            roots = self.roots()
-            found = []
-            for segment_id, info in sorted(fused.items(), key=lambda kv: -kv[1]['score']):
-                row = con.execute("SELECT s.path, s.ord, s.kind, s.text, s.location FROM segments s JOIN files f ON f.path = s.path "
-                                  "WHERE s.id=? AND f.status='ok'", (segment_id,)).fetchone()
-                if not row or row[2] == 'file':
-                    continue
-                file, order, kind, text, location = row
-                if path and paths.canonical(file) != paths.canonical(path):
-                    continue
-                if not any(paths.is_within(root, file) for root in roots):
-                    continue
-                loc = json.loads(location or '{}')
-                found.append(dict(info, segment_id=segment_id, path=file, ord=order, kind=kind, text=text, loc=loc,
-                                  header=self.header(file, kind, loc)))
-                if len(found) >= keep:
-                    break
-            return found
-        finally:
-            con.close()
+        con = self._reader()
+        scope = self._scope_ids(con, path) if path else None  # a one-file chat searches only that file
+        keyword = self._keyword(con, query, pool, scope)
+        semantic, _ = self._semantic(con, query, pool, embedder, band, scope)
+        ordered = self._fuse(keyword, semantic)
+        rows = self._rows(con, [segment_id for segment_id, _ in ordered],
+                          "s.path, s.ord, s.kind, s.text, s.location", "f.status='ok'")
+        target = paths.canonical(path) if path else None
+        found = []
+        for segment_id, info in ordered:
+            row = rows.get(segment_id)
+            if not row or row[2] == 'file':
+                continue
+            file, order, kind, text, location = row
+            if target and paths.canonical(file) != target:
+                continue
+            if self._place(file) is None:
+                continue
+            loc = json.loads(location or '{}')
+            found.append(dict(info, segment_id=segment_id, path=file, ord=order, kind=kind, text=text, loc=loc,
+                              header=self.header(file, kind, loc)))
+            if len(found) >= keep:
+                break
+        return found
+
+    @staticmethod
+    def _fuse(keyword, semantic):
+        """Reciprocal-rank fusion of the keyword and meaning lists: [(segment_id, info)] best first."""
+        fused = {}
+        for channel, ranked in (('keyword', keyword), ('semantic', semantic)):
+            for rank, (segment_id, raw) in enumerate(ranked):
+                item = fused.setdefault(segment_id, {'score': 0.0})
+                item['score'] += 1.0 / (RRF_K + rank + 1)
+                item[channel + '_rank'] = rank + 1
+                item[channel + '_score'] = float(raw)
+        return sorted(fused.items(), key=lambda kv: -kv[1]['score'])
+
+    @staticmethod
+    def _rows(con, ids, columns, where=''):
+        """{segment id: row of ``columns``} for many passages in one query (s = segments, f = files, x = fts)."""
+        if not ids:
+            return {}
+        fts = ' LEFT JOIN fts x ON x.rowid = s.id' if 'x.' in columns else ''
+        sql = (f'SELECT s.id, {columns} FROM segments s JOIN files f ON f.path = s.path{fts} '
+               f'WHERE s.id IN (SELECT value FROM json_each(?)){" AND " + where if where else ""}')
+        return {row[0]: row[1:] for row in con.execute(sql, (json.dumps(ids),))}
 
     def neighbours(self, path, order, radius=1):
         """Passages next to passage ``order`` of ``path`` (same file, readable text only), in order."""
-        con = connect(self.db_path)
-        try:
-            rows = con.execute("SELECT id, ord, kind, text, location FROM segments WHERE path=? AND ord BETWEEN ? AND ? "
-                               "AND kind NOT IN ('vision', 'file') ORDER BY ord", (str(path), order - radius, order + radius)).fetchall()
-        finally:
-            con.close()
+        rows = self._reader().execute("SELECT id, ord, kind, text, location FROM segments WHERE path=? AND ord BETWEEN ? AND ? "
+                                      "AND kind NOT IN ('vision', 'file') ORDER BY ord", (str(path), order - radius, order + radius)).fetchall()
         return [{'segment_id': sid, 'ord': o, 'kind': kind, 'text': text, 'loc': json.loads(loc or '{}')} for sid, o, kind, text, loc in rows]
 
     def vectors_for(self, segment_ids):
         """{segment_id: unit vector} for the passages that have one (for diversity among answers' sources)."""
-        con = connect(self.db_path)
-        try:
-            ids, matrix = self._matrix(con)
-        finally:
-            con.close()
+        ids, matrix = self._matrix(self._reader())
         if matrix is None or not len(ids):
             return {}
         where = {int(sid): number for number, sid in enumerate(ids)}
@@ -679,60 +760,65 @@ class Index:
         if not query:
             return []
         limit = max(1, min(int(limit), 50))
-        con = connect(self.db_path)
-        try:
-            pool = max(limit * 4, 40)
-            scope = self._scope_ids(con, path) if path else None
-            keyword = self._keyword(con, query, pool, scope) if mode in ('hybrid', 'keyword') else []
-            semantic, note = ([], None)
-            if mode in ('hybrid', 'semantic'):
-                semantic, note = self._semantic(con, query, pool, embedder, scope=scope)
-            fused = {}
-            for channel, ranked in (('keyword', keyword), ('semantic', semantic)):
-                for rank, (segment_id, raw) in enumerate(ranked):
-                    item = fused.setdefault(segment_id, {'score': 0.0})
-                    item['score'] += 1.0 / (RRF_K + rank + 1)
-                    item[channel + '_rank'] = rank + 1
-                    item[channel + '_score'] = round(float(raw), 4)
-            ordered = sorted(fused.items(), key=lambda kv: -kv[1]['score'])
-            results, per = [], {}
-            tokens = _tokens(query)
-            roots = self.roots()
-            for segment_id, info in ordered:
-                row = con.execute('SELECT s.path, s.kind, s.text, s.location, f.size, f.mtime_ns FROM segments s '
-                                  'JOIN files f ON f.path = s.path WHERE s.id=?', (segment_id,)).fetchone()
-                if not row:
-                    continue
-                file, kind, text, location, size, mtime = row
-                if path and paths.canonical(file) != paths.canonical(path):
-                    continue
-                if not any(paths.is_within(root, file) for root in roots):
-                    continue
-                if per.get(file, 0) >= per_file:
-                    continue
-                per[file] = per.get(file, 0) + 1
-                loc = json.loads(location or '{}')
-                results.append({
-                    'segment_id': segment_id, 'path': file, 'filename': Path(file).name, 'folder': self.display_folder(file),
-                    'kind': kind, 'file_type': Path(file).suffix.lower().lstrip('.'), 'location': location_label(kind, loc), **loc,
-                    'snippet': _snippet(text, tokens), 'score': round(info['score'], 5),
-                    'keyword_rank': info.get('keyword_rank'), 'semantic_rank': info.get('semantic_rank'),
-                    'semantic_similarity': info.get('semantic_score'), 'size': size,
-                    'modified': time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime / 1e9)),
-                })
-                if len(results) >= limit:
-                    break
-            if note and results:
-                results[0]['notes'] = [note]
-            return results
-        finally:
-            con.close()
+        con = self._reader()
+        # The same search on an unchanged index (no commit from any connection since), with the same folders and
+        # model, gives the same results: answer it from memory. Lives in _query_cache, so clearing that clears it.
+        cache_key = ('results', query, limit, mode, per_file, paths.canonical(path) if path else None,
+                     embedder.signature() if embedder is not None and mode != 'keyword' else None,
+                     self._index_version(con), self._tracked()[0])
+        cached = self._query_cache.get(cache_key)
+        if cached is not None:
+            return [dict(result) for result in cached]
+        pool = max(limit * 4, 40)
+        scope = self._scope_ids(con, path) if path else None
+        keyword = self._keyword(con, query, pool, scope) if mode in ('hybrid', 'keyword') else []
+        semantic, note = ([], None)
+        if mode in ('hybrid', 'semantic'):
+            semantic, note = self._semantic(con, query, pool, embedder, scope=scope)
+        ordered = self._fuse(keyword, semantic)
+        rows = self._rows(con, [segment_id for segment_id, _ in ordered], 's.path, s.kind, s.text, s.location, f.size, f.mtime_ns')
+        results, per = [], {}
+        tokens = _tokens(query)
+        target = paths.canonical(path) if path else None
+        for segment_id, info in ordered:
+            row = rows.get(segment_id)
+            if not row:
+                continue
+            file, kind, text, location, size, mtime = row
+            if target and paths.canonical(file) != target:
+                continue
+            place = self._place(file)
+            if place is None:
+                continue
+            if per.get(file, 0) >= per_file:
+                continue
+            per[file] = per.get(file, 0) + 1
+            loc = json.loads(location or '{}')
+            results.append({
+                'segment_id': segment_id, 'path': file, 'filename': Path(file).name, 'folder': place[1],
+                'kind': kind, 'file_type': Path(file).suffix.lower().lstrip('.'), 'location': location_label(kind, loc), **loc,
+                'snippet': _snippet(text, tokens), 'score': round(info['score'], 5),
+                'keyword_rank': info.get('keyword_rank'), 'semantic_rank': info.get('semantic_rank'),
+                'semantic_similarity': round(info['semantic_score'], 4) if 'semantic_score' in info else None, 'size': size,
+                'modified': time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime / 1e9)),
+            })
+            if len(results) >= limit:
+                break
+        if note and results:
+            results[0]['notes'] = [note]
+        if note is None:  # a degraded search (meaning search unavailable) is not remembered
+            if len(self._query_cache) > 512:
+                self._query_cache.clear()
+            self._query_cache[cache_key] = [dict(result) for result in results]
+        return results
 
     @staticmethod
     def _scope_ids(con, path):
         """The passage ids of one file (matched the way paths are compared everywhere else)."""
         target = paths.canonical(path)
-        files = [p for (p,) in con.execute('SELECT path FROM files') if paths.canonical(p) == target]
+        indexed = [p for (p,) in con.execute('SELECT path FROM files')]
+        # Indexed paths are real paths: compare them as text first, and resolve each one only if none matches.
+        files = [p for p in indexed if os.path.normcase(p) == target] or [p for p in indexed if paths.canonical(p) == target]
         return [sid for file in files for (sid,) in con.execute('SELECT id FROM segments WHERE path=?', (file,))]
 
     @staticmethod

@@ -106,6 +106,7 @@ class Base(unittest.TestCase):
         self.index = Index(self.settings)
 
     def tearDown(self):
+        self.index.close()  # its read connections keep the database file open
         self.tmp.cleanup()
 
 
