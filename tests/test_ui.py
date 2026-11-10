@@ -10,6 +10,7 @@ from unittest import mock
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 _APP = QApplication.instance() or QApplication([])
@@ -35,6 +36,7 @@ class SearchViewTests(unittest.TestCase):
         self.view = self.win.search_view
 
     def tearDown(self):
+        QThreadPool.globalInstance().waitForDone(10000)  # a search still running must not meet a closed index
         self.win.index.close()
         for patch in reversed(self.patches):
             patch.stop()
@@ -76,6 +78,36 @@ class SearchViewTests(unittest.TestCase):
             self.search('zzzqqq')
             self.search('zzzqqqx')
             self.assertEqual(walk.call_count, 1)
+
+    def test_filters_narrow_a_search_and_clear(self):
+        from alfred import ui
+        (self.folder / 'deck.md').write_text('harbour pilot notes in markdown', encoding='utf-8')
+        os.utime(self.folder / 'harbour.txt', (time.time() - 400 * 86400,) * 2)
+        self.win.index.update()
+        self.view.set_query('harbour pilot')  # what typing does: shows the filter chips and schedules the search
+        self.assertFalse(self.view.filters.isHidden())
+        self.search('harbour pilot')
+        self.view.kind_chips['pdfs'].setChecked(True)  # toggling a chip re-runs the search
+        self.wait_for_empty('No results for')
+        self.assertIn('Clear filters', [b.text() for b in self.view.empty.findChildren(ui.QPushButton)])
+        self.view.clear_filters()
+        self.wait_for_titles('harbour.txt')
+        self.view.cycle_age()  # Past week: the old file drops out, the fresh one stays
+        self.assertEqual(self.view.age_chip.text(), 'Past week')
+        self.wait_for(lambda: 'deck.md' in self.titles() and 'harbour.txt' not in self.titles())
+
+    def wait_for(self, check):
+        deadline = time.monotonic() + 15
+        while not check() and time.monotonic() < deadline:
+            _APP.processEvents()
+            time.sleep(0.01)
+        self.assertTrue(check())
+
+    def wait_for_titles(self, name):
+        self.wait_for(lambda: name in self.titles() and self.view.stack.currentIndex() == 1)
+
+    def wait_for_empty(self, text):
+        self.wait_for(lambda: self.view.stack.currentIndex() == 0 and text in self.view.empty.title.text())
 
 
 if __name__ == '__main__':

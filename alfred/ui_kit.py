@@ -81,6 +81,9 @@ QPushButton#link {{ background: transparent; border: none; color: {acc}; padding
 QPushButton#link:hover {{ text-decoration: underline; }}
 QPushButton#chip {{ background: {f}; border: 1px solid {sep}; border-radius: 13px; padding: 4px 11px 4px 8px; }}
 QPushButton#chip:hover {{ background: {fs}; border-color: {acc}; }}
+QPushButton#filter {{ background: transparent; border: 1px solid {sep}; border-radius: 11px; padding: 2px 10px; font-size: 9pt; color: {s}; }}
+QPushButton#filter:hover {{ background: {fs}; }}
+QPushButton#filter:checked {{ background: {rgba(p['accent'], .16)}; border-color: {acc}; color: {acc}; }}
 QPushButton#ghost {{ background: transparent; border: none; border-radius: 13px; padding: 0; }}
 QPushButton#ghost:hover {{ background: {fs}; }}
 QLabel#name {{ font-weight: 600; }}

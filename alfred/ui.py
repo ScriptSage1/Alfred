@@ -21,7 +21,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (QColor, QKeySequence, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QLinearGradient,
-                           QPainter, QPainterPath, QPen, QPixmap, QRegion)
+                           QPainter, QPainterPath, QPen, QPixmap, QRegion, QShortcut)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconProvider, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
                                QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
@@ -41,6 +41,9 @@ DEFAULT_HOTKEY, FALLBACK_HOTKEYS = 'Ctrl+Alt+L', ['Ctrl+Alt+L', 'Ctrl+Alt+K', 'C
 SEARCH, ASK, SETTINGS = range(3)
 PLACEHOLDERS = {SEARCH: 'Search your files', ASK: 'Ask anything about your files', SETTINGS: 'Settings'}
 PENDING_REUSE_SECONDS = 5
+KIND_FILTERS = [('documents', 'Documents'), ('pdfs', 'PDFs'), ('slides', 'Slides'), ('spreadsheets', 'Sheets'), ('images', 'Images'),
+                ('videos', 'Videos'), ('text', 'Text & data')]
+DATE_FILTERS = [('Any time', 0), ('Past week', 7), ('Past month', 30), ('Past year', 365)]
 GROUPS = [('PDF Documents', {'pdf'}), ('Presentations', {'pptx'}), ('Spreadsheets', {'xlsx', 'csv'}),
           ('Images', {s.lstrip('.') for s in IMAGE_SUFFIXES}), ('Videos', {s.lstrip('.') for s in VIDEO_SUFFIXES})]
 
@@ -685,11 +688,34 @@ class SearchView(QWidget):
         self.weak_open, self.weak_for = False, None  # weaker matches revealed for this query?
         self.last = None
         self.pending_seen = (0.0, None)  # (when, answer) of the last disk walk for index changes
-        outer = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+        self.kinds, self.age = set(), 0  # result filters: file kinds chosen, and the index into DATE_FILTERS
+        self.filters = QWidget()
+        self.filters.setObjectName('clear')
+        bar = QHBoxLayout(self.filters)
+        bar.setContentsMargins(16, 2, 16, 6)
+        bar.setSpacing(6)
+        self.kind_chips = {}
+        for number, (key, name) in enumerate(KIND_FILTERS, 1):
+            chip = button(name, None, 'filter', f'Only {name.lower()}  (Alt+{number})')
+            chip.setCheckable(True)
+            chip.setFocusPolicy(Qt.NoFocus)  # typing stays in the search box; Alt+number toggles from the keyboard
+            chip.toggled.connect(lambda on, k=key: self.set_kind(k, on))
+            self.kind_chips[key] = chip
+            bar.addWidget(chip)
+            QShortcut(QKeySequence(f'Alt+{number}'), win, activated=lambda c=chip: self.keyed(c.toggle))
+        bar.addStretch()
+        self.age_chip = button(DATE_FILTERS[0][0], self.cycle_age, 'filter', 'Modified: click to cycle  (Alt+D)')
+        self.age_chip.setCheckable(True)
+        self.age_chip.setFocusPolicy(Qt.NoFocus)
+        QShortcut(QKeySequence('Alt+D'), win, activated=lambda: self.keyed(self.cycle_age))
+        bar.addWidget(self.age_chip)
+        self.filters.hide()
+        outer.addWidget(self.filters)
         self.stack = QStackedWidget()
-        outer.addWidget(self.stack)
+        outer.addWidget(self.stack, 1)
         self.empty = EmptyState(win)
         self.stack.addWidget(self.empty)
         results = QWidget()
@@ -771,11 +797,47 @@ class SearchView(QWidget):
         self.divider.setStyleSheet(f"background: rgba({self.win.pal['separator'].red()},{self.win.pal['separator'].green()},"
                                    f"{self.win.pal['separator'].blue()},{self.win.pal['separator'].alphaF():.3f});")
 
+    def keyed(self, action):
+        """A filter shortcut: only while the search is showing its filters."""
+        if self.win.mode == SEARCH and len(self.query) >= 2:
+            action()
+
+    def set_kind(self, key, on):
+        self.kinds.discard(key)
+        if on:
+            self.kinds.add(key)
+        self.refilter()
+
+    def cycle_age(self):
+        self.age = (self.age + 1) % len(DATE_FILTERS)
+        self.age_chip.setText(DATE_FILTERS[self.age][0])
+        self.age_chip.setChecked(self.age > 0)
+        self.refilter()
+
+    def refilter(self):
+        if len(self.query) >= 2:
+            self.run()  # the same search under the new filters
+
+    def clear_filters(self):
+        for chip in self.kind_chips.values():
+            chip.blockSignals(True)
+            chip.setChecked(False)
+            chip.blockSignals(False)
+        self.kinds, self.age = set(), 0
+        self.age_chip.setText(DATE_FILTERS[0][0])
+        self.age_chip.setChecked(False)
+        self.refilter()
+
+    def filter_options(self):
+        days = DATE_FILTERS[self.age][1]
+        return {'kinds': set(self.kinds) or None, 'modified_after': time.time() - days * 86400 if days else None}
+
     def wants_expanded(self):
         return len(self.query) >= 2 or self.win.problem_state() is not None
 
     def set_query(self, text):
         self.query = text.strip()
+        self.filters.setVisible(len(self.query) >= 2)
         if len(self.query) < 2:
             self.generation += 1
             self.show_problem_or_collapse()
@@ -800,12 +862,13 @@ class SearchView(QWidget):
         self.generation += 1
         generation, query = self.generation, self.query
         settings, index = self.win.settings, self.win.index
+        options = self.filter_options()
         def work(signals):
             embedder = ai.Embedder.from_settings(settings)
             down = bool(embedder and embedder.kind == 'ollama' and embedder.local and not ai.ollama_running(embedder.base, 0.6))
-            results = index.search(query, limit=24, mode='hybrid', embedder=embedder, include_weak=True)
+            results = index.search(query, limit=24, mode='hybrid', embedder=embedder, include_weak=True, **options)
             pending = None
-            if not any(not r.get('weak') for r in results):
+            if not any(not r.get('weak') for r in results) and not options['kinds'] and not options['modified_after']:
                 when, pending = self.pending_seen
                 if time.monotonic() - when > PENDING_REUSE_SECONDS:  # a disk walk: not once per keystroke
                     pending = index.pending_changes()
@@ -850,6 +913,12 @@ class SearchView(QWidget):
             count = len(weak)
             self.empty.show_state(f'No strong matches for “{query}”', f'{count} weaker match{"es" * (count != 1)} found, which may not be what you meant.',
                                   [(f'Show {count} weaker match{"es" * (count != 1)}', self.show_weak), ('Ask Alfred  ⇥', lambda: self.win.set_mode(ASK))], 'search')
+            self.stack.setCurrentIndex(0)
+            self.win.update_height()
+            return
+        if not results and (self.kinds or self.age):
+            self.empty.show_state(f'No results for “{query}”', 'Nothing matches with the filters on above.',
+                                  [('Clear filters', self.clear_filters)], 'search')
             self.stack.setCurrentIndex(0)
             self.win.update_height()
             return

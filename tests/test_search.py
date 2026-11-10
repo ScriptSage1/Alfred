@@ -143,6 +143,47 @@ class IdentifierTests(Base):
         self.assertFalse(index_module.is_confident('INV-2026-04 paid', 'invoice inv 2026 04417 open'))
 
 
+class FilterTests(Base):
+    def setUp(self):
+        super().setUp()
+        from test_pipeline import make_docx, make_pptx
+        self.now = time.time()
+        for number in range(6):  # many text files rank above the one slide deck: the filter must still find it
+            (self.folder / f'note{number}.txt').write_text(f'quarterly budget review notes {number}', encoding='utf-8')
+        make_pptx(self.folder / 'deck.pptx', ['quarterly budget review slide'])
+        make_docx(self.folder / 'memo.docx', ['quarterly budget review memo'])
+        (self.folder / 'old.txt').write_text('quarterly budget review from long ago', encoding='utf-8')
+        os.utime(self.folder / 'old.txt', (self.now - 400 * 86400, self.now - 400 * 86400))
+        self.index.update()
+
+    def names(self, **options):
+        return sorted(r['filename'] for r in self.index.search('quarterly budget review', limit=20, per_file=1, **options))
+
+    def test_kinds_narrow_the_results(self):
+        self.assertEqual(self.names(kinds={'slides'}), ['deck.pptx'])
+        self.assertEqual(self.names(kinds={'documents'}), ['memo.docx'])
+        self.assertEqual(self.names(kinds={'slides', 'documents'}), ['deck.pptx', 'memo.docx'])
+        self.assertEqual(len(self.names(kinds={'text'})), 7)
+        self.assertEqual(self.names(kinds={'videos'}), [])
+        self.assertEqual(len(self.names(kinds=set())), 9)  # no kinds chosen: everything
+
+    def test_filter_is_applied_before_the_limit(self):
+        found = self.index.search('quarterly budget review', limit=1, kinds={'slides'})
+        self.assertEqual([r['filename'] for r in found], ['deck.pptx'])
+
+    def test_modified_range(self):
+        self.assertNotIn('old.txt', self.names(modified_after=self.now - 30 * 86400))
+        self.assertEqual(self.names(modified_before=self.now - 30 * 86400), ['old.txt'])
+        self.assertEqual(self.names(modified_after=self.now - 500 * 86400, modified_before=self.now - 300 * 86400), ['old.txt'])
+        self.assertEqual(self.names(kinds={'text'}, modified_before=self.now - 30 * 86400), ['old.txt'])
+
+    def test_filters_are_part_of_the_cache_key(self):
+        self.assertEqual(len(self.names()), 9)
+        self.assertEqual(self.names(kinds={'slides'}), ['deck.pptx'])
+        self.assertEqual(len(self.names()), 9)
+        self.assertEqual(self.names(modified_before=self.now - 30 * 86400), ['old.txt'])
+
+
 class Similar:
     """A fake embedder whose query is equally similar (``score``) to every passage."""
     batch = 8

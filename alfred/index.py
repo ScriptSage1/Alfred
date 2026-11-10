@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from . import ai, extract, paths
-from .extract import IMAGE_SUFFIXES, VIDEO_SUFFIXES, location_label, video_frame_png  # noqa: F401 (re-exported for the UI)
+from .extract import IMAGE_SUFFIXES, KIND_SUFFIXES, VIDEO_SUFFIXES, location_label, video_frame_png  # noqa: F401 (re-exported for the UI)
 
 log = logging.getLogger('alfred')
 RRF_K = 60
@@ -787,25 +787,33 @@ class Index:
         return {sid: matrix[where[sid]] for sid in segment_ids if sid in where}
 
     # ---------------------------------------------------------------- search
-    def search(self, query, limit=10, mode='hybrid', embedder=None, per_file=2, path=None, include_weak=False):
+    def search(self, query, limit=10, mode='hybrid', embedder=None, per_file=2, path=None, include_weak=False,
+               kinds=None, modified_after=None, modified_before=None):
         """Ranked results across all tracked folders.
 
         Only confident matches are returned (see is_confident), so an unrelated query finds nothing. With
-        ``include_weak`` the weaker matches follow them (up to ``limit`` in all), each marked 'weak': True."""
+        ``include_weak`` the weaker matches follow them (up to ``limit`` in all), each marked 'weak': True.
+        ``kinds`` (a set of KIND_SUFFIXES names) and ``modified_after`` / ``modified_before`` (timestamps, seconds)
+        narrow the files considered; they apply before the per-file and ``limit`` cut, so the list still fills."""
         query = (query or '').strip()
         if not query:
             return []
         limit = max(1, min(int(limit), 50))
         con = self._reader()
+        suffixes = frozenset(s for kind in (kinds or ()) for s in KIND_SUFFIXES.get(kind, ())) if kinds else None
+        after = modified_after * 1e9 if modified_after is not None else None
+        before = modified_before * 1e9 if modified_before is not None else None
+        filtered = suffixes is not None or after is not None or before is not None
         # The same search on an unchanged index (no commit from any connection since), with the same folders and
         # model, gives the same results: answer it from memory. Lives in _query_cache, so clearing that clears it.
         cache_key = ('results', query, limit, mode, per_file, paths.canonical(path) if path else None, bool(include_weak),
+                     suffixes, after, before,
                      embedder.signature() if embedder is not None and mode != 'keyword' else None,
                      self._index_version(con), self._tracked()[0])
         cached = self._query_cache.get(cache_key)
         if cached is not None:
             return [dict(result) for result in cached]
-        pool = max(limit * 4, 40)
+        pool = max(limit * 4, 40) * (5 if filtered else 1)  # a filter drops candidates after ranking: look further down
         scope = self._scope_ids(con, path) if path else None
         profile = query_profile(query)
         keyword, phrases = [], []
@@ -846,6 +854,9 @@ class Index:
                 continue
             place = self._place(file)
             if place is None:
+                continue
+            if filtered and ((suffixes is not None and Path(file).suffix.lower() not in suffixes)
+                             or (after is not None and row[5] < after) or (before is not None and row[5] >= before)):
                 continue
             seen = '\n'.join(part for part in (row[6], row[7]) if part) or row[2]  # what keyword search saw
             if not is_confident(profile, seen, info.get('semantic_score'), embedder):

@@ -33,6 +33,9 @@ TEXT_SUFFIXES = {'.txt', '.md', '.markdown', '.csv', '.tsv', '.log', '.rst', '.j
 OFFICE_SUFFIXES = {'.docx', '.pptx', '.xlsx'}
 IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff'}
 VIDEO_SUFFIXES = {'.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v', '.wmv', '.mpeg', '.mpg'}
+# The groups a search can be narrowed to (a file type belongs to one); the UI's result groups follow the same split.
+KIND_SUFFIXES = {'documents': {'.docx'}, 'pdfs': {'.pdf'}, 'slides': {'.pptx'}, 'spreadsheets': {'.xlsx', '.csv'},
+                 'images': IMAGE_SUFFIXES, 'videos': VIDEO_SUFFIXES, 'text': TEXT_SUFFIXES - {'.csv'}}
 SUPPORTED = TEXT_SUFFIXES | OFFICE_SUFFIXES | {'.pdf'} | IMAGE_SUFFIXES | VIDEO_SUFFIXES
 LEGACY_OFFICE = {'.doc': 'DOCX', '.ppt': 'PPTX', '.xls': 'XLSX'}
 
