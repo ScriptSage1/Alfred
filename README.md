@@ -56,6 +56,14 @@ listed as unsupported; save them in the newer format to search them.
 Search combines SQLite FTS5 (BM25) keyword matches with EmbeddingGemma 2 vectors through
 reciprocal-rank fusion.
 
+- Only confident matches are listed. If there are none, Alfred says "No strong matches" and offers
+  "Show N weaker matches" instead of showing unrelated files.
+- Identifiers and dates (`INV-2026-04417`, `15 March 2024`) must match exactly, in any written form
+  (`INV 2026 04417`, `2024-03-15`); while you are still typing the last one, it matches as a prefix.
+- Open (Enter) jumps to the cited page or moment when the default app can: PDFs in Edge, Chrome,
+  Firefox, Brave, SumatraPDF or Acrobat, videos in VLC or mpv. Anything else opens normally.
+- Chips above the results narrow them by file kind and by modified date (Alt+1 to Alt+7, Alt+D).
+
 ## Ask Alfred and chat history
 
 Ask Alfred (Ctrl+2 or Tab) can use any of these — pick one from the model button at the top right,
@@ -72,9 +80,8 @@ or under **Settings → AI model**:
 The CLIs are run locked down: print mode, every tool off, no MCP servers or project settings, an empty
 working folder. API keys are stored in Windows Credential Manager, never in Alfred's files. Indexing,
 OCR, picture descriptions and search always stay on your PC; with a cloud model only your questions
-(and, once Alfred answers from your documents, the passages found for them) are sent — Alfred asks
-once per provider before it does. Answers from your documents are the next feature; until then Ask
-Alfred says so.
+(and the passages found for them, when Alfred answers from your documents) are sent — Alfred asks
+once per provider before it does.
 
 Chats are saved as one JSON file each in `%LOCALAPPDATA%\Alfred\Chats` (change the folder, open it,
 or delete all chats under **Settings → Chats**). The history panel (Ctrl+H) lists them by day; hover a
@@ -104,6 +111,6 @@ These talk to the running Alfred.
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
 
-`alfred/rag.py` (answers from your documents) is still a placeholder that reports "coming next". More components to start at sign-in go in `TASKS` in `alfred/startup.py`.
+`alfred/rag.py` answers questions from your documents: it retrieves and reranks passages, then asks the model to cite them (the top of that file describes each step). More components to start at sign-in go in `TASKS` in `alfred/startup.py`.
 
 Settings, the index and logs live in `%LOCALAPPDATA%\Alfred` (override with `ALFRED_HOME`).
