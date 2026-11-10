@@ -750,12 +750,16 @@ class Index:
         extra = (json.dumps(scope),) if scope is not None else ()
         sql = f'SELECT rowid, bm25(fts, 1.0, 2.5) FROM fts WHERE fts MATCH ?{within} ORDER BY bm25(fts, 1.0, 2.5) LIMIT ?'
         lists = []
-        for forms in profile.identifiers:
-            match = ' OR '.join('"' + ' '.join(form) + '"' for form in forms)
-            try:
-                lists.append([(rowid, -rank) for rowid, rank in con.execute(sql, (match, *extra, pool))])
-            except sqlite3.OperationalError:
-                lists.append([])
+        for number, forms in enumerate(profile.identifiers):
+            phrases = ['"' + ' '.join(form) + '"' for form in forms]
+            matches = [' OR '.join(phrases)]
+            if number == profile.typing:  # being typed: its last piece may be a prefix; whole matches stay ahead (they are in both lists)
+                matches.append(' OR '.join(phrase + ' *' for phrase in phrases))
+            for match in matches:
+                try:
+                    lists.append([(rowid, -rank) for rowid, rank in con.execute(sql, (match, *extra, pool))])
+                except sqlite3.OperationalError:
+                    lists.append([])
         return lists
 
     @staticmethod
@@ -1084,7 +1088,7 @@ def _identifier_forms(chunk):
 class QueryProfile:
     """How a query is matched: its identifiers (each a list of word sequences that count as an exact
     match), its meaningful words, and how much meaning search should count."""
-    __slots__ = ('query', 'words', 'identifiers', 'terms', 'identifier_only', 'semantic_weight', 'partial')
+    __slots__ = ('query', 'words', 'identifiers', 'terms', 'identifier_only', 'semantic_weight', 'partial', 'typing')
 
     def __init__(self, query):
         self.query = query
@@ -1092,6 +1096,7 @@ class QueryProfile:
         chunks = [c.strip('.,;:!?()[]{}"\'“”‘’') for c in query.split()]
         chunks = [c for c in chunks if c]
         identifiers, plain, skip = [], [], False
+        self.typing = None  # index of the identifier that is the query's last chunk (it may be half typed)
         for number, chunk in enumerate(chunks):
             if skip:
                 skip = False
@@ -1101,11 +1106,15 @@ class QueryProfile:
                 # 'PO 88213': a short capitalised prefix and its number, written 'PO 88213', 'PO-88213' or 'PO88213'
                 prefix = _fold(chunk)
                 identifiers.append([(prefix, following), (prefix + following,)] + ([(following,)] if len(following) >= 5 else []))
+                if number + 2 == len(chunks):
+                    self.typing = len(identifiers) - 1
                 skip = True
                 continue
             forms = _identifier_forms(chunk)
             if forms:
                 identifiers.append(forms)
+                if number + 1 == len(chunks):
+                    self.typing = len(identifiers) - 1
             else:
                 plain.extend(_words(chunk))
         meaningful = [w for w in plain if w not in STOPWORDS and (len(w) > 1 or w.isdigit())]
@@ -1146,6 +1155,18 @@ def _contains(words, sequence):
     return any(word == first and tuple(words[i:i + size]) == sequence for i, word in enumerate(words))
 
 
+def _starts(words, sequence):
+    """Like _contains, but the last word of ``sequence`` may be only the start of a word (a half-typed identifier)."""
+    size = len(sequence)
+    head, last = sequence[:-1], sequence[-1]
+    return any(tuple(words[i:i + size - 1]) == head and len(words) > i + size - 1 and words[i + size - 1].startswith(last)
+               for i in range(len(words) - size + 1))
+
+
+def _has_identifier(words, forms, typing):
+    return any((_starts if typing else _contains)(words, form) for form in forms)
+
+
 def is_confident(query, text, semantic_similarity=None, embedder=None):
     """Whether a passage is a strong enough match for ``query`` to show (or to answer from).
 
@@ -1161,7 +1182,7 @@ def is_confident(query, text, semantic_similarity=None, embedder=None):
     profile = query if isinstance(query, QueryProfile) else query_profile(query)
     words = _words(text or '')
     if profile.identifier_only:
-        return any(_contains(words, form) for forms in profile.identifiers for form in forms)
+        return any(_has_identifier(words, forms, number == profile.typing) for number, forms in enumerate(profile.identifiers))
     if len(profile.words) >= 2 and _contains(words, tuple(profile.words)):
         return True
     if semantic_similarity is not None and semantic_similarity >= semantic_floor(embedder):
@@ -1172,7 +1193,7 @@ def is_confident(query, text, semantic_similarity=None, embedder=None):
     found = 0
     for kind, value in profile.terms:
         if kind == 'identifier':
-            found += any(_contains(words, form) for form in value)
+            found += _has_identifier(words, value, profile.typing is not None and value is profile.identifiers[profile.typing])
         else:
             found += (any(form in vocabulary for form in _variants(value)) or value + 's' in vocabulary or value + 'es' in vocabulary
                       or (value == profile.partial and any(word.startswith(value) for word in vocabulary)))

@@ -126,6 +126,22 @@ class IdentifierTests(Base):
         self.assertEqual(self.index.search('2024-03-15')[0]['filename'], 'minutes.txt')
         self.assertEqual(self.index.search('PO 88213')[0]['filename'], 'order.txt')
 
+    def test_half_typed_identifier_matches_as_a_prefix_and_exact_ranks_first(self):
+        (self.folder / 'exact.txt').write_text('Invoice INV-2026-04 was paid.', encoding='utf-8')
+        (self.folder / 'longer.txt').write_text('Invoice INV-2026-04417 is open.', encoding='utf-8')
+        (self.folder / 'other.txt').write_text('Invoice INV-2026-09 and INV-2025-04417.', encoding='utf-8')
+        self.index.update()
+        self.assertEqual(self.index.search('INV-2026-04417')[0]['filename'], 'longer.txt')
+        names = [r['filename'] for r in self.index.search('INV-2026-04')]
+        self.assertEqual(names[0], 'exact.txt')  # the whole-word match outranks the prefix match
+        self.assertIn('longer.txt', names)
+        self.assertNotIn('other.txt', names)
+        self.assertEqual([r['filename'] for r in self.index.search('INV-2026-045')], [])  # a prefix of nothing
+        # only the last chunk may be a prefix
+        self.assertNotIn('longer.txt', [r['filename'] for r in self.index.search('INV-2026-04 paid')])
+        self.assertTrue(index_module.is_confident('INV-2026-04', 'invoice inv 2026 04417 open'))
+        self.assertFalse(index_module.is_confident('INV-2026-04 paid', 'invoice inv 2026 04417 open'))
+
 
 class Similar:
     """A fake embedder whose query is equally similar (``score``) to every passage."""
