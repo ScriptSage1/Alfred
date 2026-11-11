@@ -87,8 +87,39 @@ def keep_alive(settings):
     return f'{max(5, min(minutes, 24 * 60))}m'
 
 
-def _options(device):
-    return {'num_gpu': 0} if device == 'cpu' else {}
+def _options(device, threads=0):
+    """Ollama request options: a model asked to run on the CPU gets no GPU layers and, when the indexing thread
+    budget is set (setting index_threads), that many threads."""
+    if device != 'cpu':
+        return {}
+    options = {'num_gpu': 0}
+    if threads and int(threads) > 0:
+        options['num_thread'] = int(threads)
+    return options
+
+
+def _threads(settings):
+    try:
+        return max(0, int(settings.get('index_threads') or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+PICTURE_SIDE = 512  # pictures are embedded at this size: larger costs the same and finds nothing more
+PICTURE_BATCH = 8
+_picture_support = {}  # (base, model) -> bool, probed once per process
+
+
+def picture_jpeg(image, side=PICTURE_SIDE):
+    """Base64 JPEG (quality 88) of a PIL image, RGB, its longest side at most ``side``."""
+    import base64
+    import io
+    picture = image.convert('RGB')
+    if max(picture.size) > side:
+        picture.thumbnail((side, side))
+    buffer = io.BytesIO()
+    picture.save(buffer, 'JPEG', quality=88)
+    return base64.b64encode(buffer.getvalue()).decode('ascii')
 
 
 # -------------------------------------------------------------- embeddings
@@ -112,6 +143,11 @@ class Embedder:
         # 0.60-0.65, the relevant passage for paraphrase/meaning queries 0.69+. Other models are not calibrated
         # and use their noise floor.
         self.confident_similarity = 0.67 if self.family == 'gemma' else None
+        # The same for a picture vector (a text query against a picture). Measured on the benchmark's medium corpus:
+        # the right picture for a query about what it shows scored 0.715-0.858, the best picture for queries with no
+        # picture answer at most 0.709. Uncalibrated models: picture matches are never confident.
+        self.confident_picture_similarity = 0.712 if self.family == 'gemma' else None
+        self.threads = _threads(settings)
 
     @classmethod
     def from_settings(cls, settings):
@@ -140,7 +176,7 @@ class Embedder:
         return text
 
     def _embed(self, texts):
-        payload = {'model': self.model, 'input': texts, 'truncate': True, 'keep_alive': self.keep_alive, 'options': _options(self.device)}
+        payload = {'model': self.model, 'input': texts, 'truncate': True, 'keep_alive': self.keep_alive, 'options': _options(self.device, self.threads)}
         try:
             result = _json(self.base + '/api/embed', payload, timeout=180)
         except ProviderError as error:
@@ -166,7 +202,7 @@ class Embedder:
         prompt = self.query_prompt(text[:2000])
         if self.local:  # one query per keystroke pause: reuse the connection to Ollama
             payload = {'model': self.model, 'input': [prompt], 'truncate': True, 'keep_alive': self.keep_alive,
-                       'options': _options(self.device)}
+                       'options': _options(self.device, self.threads)}
             try:
                 vectors = _json_kept(self.base + '/api/embed', payload, timeout=180).get('embeddings')
                 if vectors and len(vectors) == 1:
@@ -176,6 +212,55 @@ class Embedder:
             except Exception:
                 pass  # the regular request below reports what went wrong
         return self._embed([prompt])[0]
+
+    # Pictures: the same model embeds a picture into the space of its text vectors (EmbeddingGemma 2 is
+    # multimodal), so a text query finds a picture by what it shows. Pictures are sent as `input: [{"image": b64}]`;
+    # Ollama silently ignores the `images` field of /api/embed, so it is never used.
+    def embed_pictures(self, images):
+        """Vectors for PIL images (or base64 JPEG strings), in batches of PICTURE_BATCH; raises ProviderError."""
+        payloads = [image if isinstance(image, str) else picture_jpeg(image) for image in images]
+        vectors = []
+        for start in range(0, len(payloads), PICTURE_BATCH):
+            batch = payloads[start:start + PICTURE_BATCH]
+            payload = {'model': self.model, 'input': [{'image': data} for data in batch], 'truncate': True,
+                       'keep_alive': self.keep_alive, 'options': _options(self.device, self.threads)}
+            try:
+                result = _json(self.base + '/api/embed', payload, timeout=300)
+            except ProviderError as error:
+                if 'HTTP 404' in str(error):
+                    raise ProviderError(f'The embedding model “{self.model}” is not installed. Run: ollama pull {self.model}') from None
+                raise
+            found = result.get('embeddings')
+            if not found or len(found) != len(batch):
+                raise ProviderError('Ollama returned an unexpected picture embedding response')
+            vectors += found
+        return vectors
+
+    def supports_pictures(self):
+        """Whether this model embeds pictures: probed once per process and model by embedding two small, different
+        generated pictures (a model that reads only text returns an error, or the same vector for both)."""
+        key = (self.base, self.model)
+        if key in _picture_support:
+            return _picture_support[key]
+        from PIL import Image, ImageDraw
+        first = Image.new('RGB', (96, 96), 'white')
+        ImageDraw.Draw(first).ellipse((16, 16, 80, 80), fill=(200, 30, 30))
+        second = Image.new('RGB', (96, 96), (20, 60, 160))
+        draw = ImageDraw.Draw(second)
+        for x in range(0, 96, 16):
+            draw.rectangle((x, 0, x + 7, 95), fill=(240, 220, 40))
+        try:
+            a, b = self.embed_pictures([first, second])
+        except ProviderError as error:
+            if 'Cannot reach' in str(error):
+                return False  # Ollama is down: not an answer about the model, ask again next time
+            _picture_support[key] = False
+            return False
+        import math
+        dot = sum(x * y for x, y in zip(a, b))
+        norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)) or 1e-12
+        _picture_support[key] = bool(len(a) == len(b) and dot / norm < 0.98)
+        return _picture_support[key]
 
 
 class Vision:
@@ -198,6 +283,7 @@ class Vision:
         self.base = _ollama_base(settings.get('vision_base_url') or settings.get('embed_base_url'))
         self.device = settings.get('vision_device', 'auto')
         self.keep_alive = keep_alive(settings)
+        self.threads = _threads(settings)
 
     @classmethod
     def from_settings(cls, settings):
@@ -225,7 +311,7 @@ class Vision:
     def describe(self, image):
         """{'caption', 'description', 'tags'} for a PIL image; raises ProviderError."""
         payload = {'model': self.model, 'prompt': self.PROMPT, 'images': [self.jpeg(image)], 'stream': False, 'format': self.SCHEMA,
-                   'keep_alive': self.keep_alive, 'options': dict(_options(self.device), temperature=0.2, num_predict=400)}
+                   'keep_alive': self.keep_alive, 'options': dict(_options(self.device, self.threads), temperature=0.2, num_predict=400)}
         try:
             result = _json(self.base + '/api/generate', payload, timeout=240)
         except ProviderError as error:
@@ -266,6 +352,7 @@ class Contextualizer:
         self.base = _ollama_base(settings.get('vision_base_url') or settings.get('embed_base_url'))
         self.device = settings.get('vision_device', 'auto')
         self.keep_alive = keep_alive(settings)
+        self.threads = _threads(settings)
 
     @classmethod
     def from_settings(cls, settings):
@@ -276,7 +363,7 @@ class Contextualizer:
 
     def situate(self, title, document, passage):
         payload = {'model': self.model, 'prompt': self.PROMPT.format(title=title, document=document[:12000], passage=passage[:3000]),
-                   'stream': False, 'keep_alive': self.keep_alive, 'options': dict(_options(self.device), temperature=0.0, num_predict=90)}
+                   'stream': False, 'keep_alive': self.keep_alive, 'options': dict(_options(self.device, self.threads), temperature=0.0, num_predict=90)}
         try:
             result = _json(self.base + '/api/generate', payload, timeout=180)
         except ProviderError as error:
@@ -344,7 +431,7 @@ def warm_up(settings, progress=lambda text: None):
         report['started'] = ensure_ollama(embedder.base)['started']
     progress('Loading the search model…')
     _json(embedder.base + '/api/embed', {'model': embedder.model, 'input': 'warm up', 'keep_alive': embedder.keep_alive,
-                                         'options': _options(embedder.device)}, timeout=180)
+                                         'options': _options(embedder.device, embedder.threads)}, timeout=180)
     report['loaded'].append(embedder.model)
     return report
 
@@ -379,6 +466,33 @@ def detect_gpus():
         return {'available': bool(gpus), 'gpus': gpus, 'note': '' if gpus else 'nvidia-smi reported no GPUs'}
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         return {'available': False, 'gpus': [], 'note': f'nvidia-smi failed: {error}'}
+
+
+_gpu_present = None
+
+
+def has_discrete_gpu():
+    """Whether a discrete (NVIDIA) GPU is present: detect_gpus, asked once per process."""
+    global _gpu_present
+    if _gpu_present is None:
+        try:
+            _gpu_present = bool(detect_gpus().get('available'))
+        except Exception:
+            _gpu_present = False
+    return _gpu_present
+
+
+def vision_background(settings):
+    """Whether pictures are described while indexing (True) or only when one is previewed (False, lazy).
+    'auto' describes in the background when a discrete GPU is present, the vision model may use it, and the PC
+    is on mains power. Applies only when picture descriptions are turned on."""
+    mode = (settings.get('vision_mode') or 'auto').lower()
+    if mode == 'background':
+        return True
+    if mode == 'lazy':
+        return False
+    from . import power
+    return has_discrete_gpu() and settings.get('vision_device', 'auto') != 'cpu' and not power.on_battery()
 
 
 def diagnostics(settings, probe=False):
