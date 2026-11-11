@@ -56,14 +56,25 @@ class Unsupported(ValueError):
     """The file type can't be searched (the message says why)."""
 
 
-def extract(path, ocr_enabled=True, video_interval=10, progress=None, cancel=None, pdf_tables=True):
+def unsupported_reason(path):
+    """Why a file of this type can't be searched, or None when its type is supported."""
+    suffix = Path(path).suffix.lower()
+    if suffix in LEGACY_OFFICE:
+        return f'Old {suffix} format — save it as {LEGACY_OFFICE[suffix]} to make it searchable'
+    if suffix not in SUPPORTED:
+        return f'{suffix or "Files without an extension"} can’t be searched'
+    return None
+
+
+def extract(path, ocr_enabled=True, video_interval=10, progress=None, cancel=None, pdf_tables=True, deferred=None):
+    """Passages of one file. ``deferred`` (a list), for a PDF: pages that would need OCR are not read but their
+    numbers appended to it, so the text of the rest is searchable at once and OCR can run later."""
     path = Path(path)
     suffix = path.suffix.lower()
     size = path.stat().st_size
-    if suffix in LEGACY_OFFICE:
-        raise Unsupported(f'Old {suffix} format — save it as {LEGACY_OFFICE[suffix]} to make it searchable')
-    if suffix not in SUPPORTED:
-        raise Unsupported(f'{suffix or "Files without an extension"} can’t be searched')
+    reason = unsupported_reason(path)
+    if reason:
+        raise Unsupported(reason)
     if suffix in IMAGE_SUFFIXES or suffix in VIDEO_SUFFIXES:
         if not ocr_enabled:
             raise Unsupported('Turn on “Read text in images and videos” to search this file')
@@ -77,7 +88,7 @@ def extract(path, ocr_enabled=True, video_interval=10, progress=None, cancel=Non
     if suffix in TEXT_SUFFIXES:
         return text_file(path)
     if suffix == '.pdf':
-        return pdf(path, ocr_enabled, pdf_tables)
+        return pdf(path, ocr_enabled, pdf_tables, deferred)
     return {'.docx': docx, '.pptx': pptx, '.xlsx': xlsx}[suffix](path)
 
 
@@ -380,9 +391,10 @@ def _cell(cell, shared):
 TABLE_WORKERS = max(1, min(8, (os.cpu_count() or 2) // 2))
 
 
-def pdf(path, ocr_enabled=True, tables=True):
+def pdf(path, ocr_enabled=True, tables=True, deferred=None):
     """Passages of a PDF, page by page. With ``tables``, ruled tables are read row by row (slower: pages
-    with a grid of lines are searched for tables, several at once in worker processes)."""
+    with a grid of lines are searched for tables, several at once in worker processes). With ``deferred`` (a
+    list), pages with too little text are not OCR'd: their numbers are appended to it."""
     import pymupdf
     passages = []
     with pymupdf.open(path) as document:
@@ -396,6 +408,8 @@ def pdf(path, ocr_enabled=True, tables=True):
             text = clean(page.get_text('text'))
             if len(text) >= 20:
                 passages += [('page', piece, {'page': number}) for piece in _split(text)]
+            elif deferred is not None:
+                deferred.append(number)
             elif ocr_enabled:
                 pixmap = page.get_pixmap(dpi=200)
                 from PIL import Image
@@ -404,6 +418,22 @@ def pdf(path, ocr_enabled=True, tables=True):
                 if meaningful(text):
                     passages += [('page', piece, {'page': number, 'ocr': True}) for piece in _split(text)]
     return passages
+
+
+def pdf_page_images(path, pages, side=512):
+    """[(page number, PIL image)] for ``pages`` of a PDF, each rendered so its longest side is ``side`` pixels."""
+    import pymupdf
+    from PIL import Image
+    found = []
+    with pymupdf.open(path) as document:
+        for number in pages:
+            if not 1 <= number <= document.page_count:
+                continue
+            page = document[number - 1]
+            zoom = side / max(page.rect.width, page.rect.height, 1)
+            pixmap = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+            found.append((number, Image.open(io.BytesIO(pixmap.tobytes('png'))).convert('RGB')))
+    return found
 
 
 def _split(text):
@@ -636,7 +666,7 @@ def video_frame_png(path, seconds, width=660):
 def video(path, interval=10, progress=None, cancel=None):
     """OCR one frame every ``interval`` seconds (stretched so long videos stay under
     MAX_VIDEO_FRAMES); near-identical frames and repeated text are read once."""
-    from PIL import Image, ImageChops, ImageStat
+    from PIL import Image
     duration = video_duration(path)
     step = max(float(interval or 10), duration / MAX_VIDEO_FRAMES, 1.0)
     passages, previous_thumb, previous_text = [], None, ''
@@ -653,7 +683,7 @@ def video(path, interval=10, progress=None, cancel=None):
             seconds = round(min(number * step + step / 2, duration), 1)  # the fps filter samples mid-interval
             with Image.open(frame) as picture:
                 thumb = picture.convert('L').resize((160, 90))
-                if previous_thumb is not None and ImageStat.Stat(ImageChops.difference(thumb, previous_thumb)).mean[0] < 0.6:
+                if _same_picture(thumb, previous_thumb):
                     continue  # same picture as the last frame (a still slide, a paused screen)
                 previous_thumb = thumb
                 text = clean(ocr.read_text(picture.copy()))
@@ -661,6 +691,34 @@ def video(path, interval=10, progress=None, cancel=None):
                 passages.append(('video', text, {'seconds': seconds, 'ocr': True}))
                 previous_text = text
     return passages
+
+
+def _same_picture(thumb, previous):
+    """Whether two 160×90 greyscale thumbnails show the same picture (a still slide, a paused screen)."""
+    from PIL import ImageChops, ImageStat
+    return previous is not None and ImageStat.Stat(ImageChops.difference(thumb, previous)).mean[0] < 0.6
+
+
+def video_keyframes(path, count=8, width=512):
+    """[(seconds, PIL image)]: up to ``count`` frames spread over a video (one ffmpeg call), scaled to ``width``
+    pixels wide, with near-identical neighbours dropped."""
+    from PIL import Image
+    duration = video_duration(path)
+    step = max(duration / max(1, count), 0.04)
+    found, previous = [], None
+    with tempfile.TemporaryDirectory(prefix='alfred-keyframes-') as folder:
+        subprocess.run([ffmpeg(), '-hide_banner', '-loglevel', 'error', '-i', str(path), '-vf', f'fps=1/{step:.3f},scale={int(width)}:-2',
+                        '-frames:v', str(count), str(Path(folder) / 'k%03d.png')],
+                       capture_output=True, timeout=max(120, int(duration)), **hidden())
+        for number, frame in enumerate(sorted(Path(folder).glob('k*.png'))):
+            with Image.open(frame) as picture:
+                picture = picture.convert('RGB')
+            thumb = picture.convert('L').resize((160, 90))
+            if _same_picture(thumb, previous):
+                continue
+            previous = thumb
+            found.append((round(min(number * step + step / 2, duration), 1), picture))
+    return found
 
 
 def _similar(a, b):
@@ -677,6 +735,10 @@ def clock(seconds):
 
 
 def location_label(kind, loc):
+    if kind == 'picture' or loc.get('visual'):
+        if 'seconds' in loc:
+            return f'picture at {clock(loc["seconds"])}'
+        return f'page {loc["page"]} (picture)' if 'page' in loc else 'picture'
     if kind == 'vision' or loc.get('ai'):
         return 'AI description' + (f' at {clock(loc["seconds"])}' if 'seconds' in loc else '')
     ocr_note = ' (text read from image)' if loc.get('ocr') else ''
@@ -700,6 +762,10 @@ def location_label(kind, loc):
 
 def short_location(kind, loc):
     """Compact place for a citation row: 'p. 3', 'slide 2', 'October, rows 2–3', 'lines 10–24', 'at 00:25'."""
+    if kind == 'picture' or loc.get('visual'):
+        if 'seconds' in loc:
+            return f'picture at {clock(loc["seconds"])}'
+        return f'p. {loc["page"]} (picture)' if 'page' in loc else 'picture'
     if kind == 'vision' or loc.get('ai'):
         return 'picture description' + (f' at {clock(loc["seconds"])}' if 'seconds' in loc else '')
     if 'seconds' in loc:
