@@ -306,6 +306,7 @@ class VisionTests(Base):
     def setUp(self):
         super().setUp()
         self.settings['vision_enabled'] = True
+        self.settings['vision_mode'] = 'background'  # described while indexing ('auto' depends on the PC's GPU and power)
         from PIL import Image
         Image.new('RGB', (640, 480), (200, 150, 60)).save(self.folder / 'IMG_1234.jpg')
 

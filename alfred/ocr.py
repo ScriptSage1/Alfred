@@ -27,7 +27,7 @@ _dml_failed = False   # DirectML failed its self-check (or to load) once: the CP
 
 def _quiet():
     for name in ('RapidOCR', 'rapidocr'):
-        logging.getLogger(name).setLevel(logging.WARNING)
+        logging.getLogger(name).setLevel(logging.ERROR)
 
 
 def thread_plan(budget):
