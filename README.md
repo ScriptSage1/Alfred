@@ -105,6 +105,26 @@ python -m alfred --status
 
 These talk to the running Alfred.
 
+## Use Alfred from Claude Code and similar tools
+
+Alfred can serve your files to other AI tools (Claude Code, Codex and others that speak MCP). Add it once:
+
+```
+claude mcp add alfred -- "C:\path\to\Alfred\.venv\Scripts\python.exe" -m alfred --mcp
+```
+
+(Settings → Other AI tools shows this line with your own Python path, and a Copy button.) The tool starts Alfred's
+small search server itself; Alfred does not need to be open. It has two tools, both read-only:
+
+- `search_files` finds passages in your tracked folders, by keyword and by meaning, in the same order as Alfred's own
+  results. Each result says whether Alfred is confident in it.
+- `read_passage` reads the indexed text of one file from a search result. Files outside your tracked folders cannot be read.
+
+The first time a tool searches, Alfred asks you in a Windows box whether to allow it. The answer is kept; change it,
+or remove the tool, under **Settings → Other AI tools**. Every call (when, which tool, what it asked for, which files
+it got) is listed there and written to `mcp_calls.jsonl` in Alfred's data folder, next to `mcp_clients.json`.
+Nothing is indexed, changed or opened by the server. Text from your files is handed over as data, with a note saying so.
+
 ## Development
 
 ```

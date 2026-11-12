@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconPr
                                QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
                                QSystemTrayIcon, QTextBrowser, QToolTip, QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, ai, chats, config, keys, opener, paths, picker, power, providers, rag, render, rerank, startup
+from . import APP_NAME, __version__, ai, chats, config, keys, mcp_server, opener, paths, picker, power, providers, rag, render, rerank, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
 from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, app_icon, blurred_backdrop, brand_pixmap, dot_pixmap, fallback_backdrop, icon,
@@ -2752,6 +2752,21 @@ class SettingsView(QWidget):
               'Frames that look the same (a still slide) are read once. Long videos are capped at 120 frames.')
         body.addWidget(g)
 
+        g = Group(win, 'OTHER AI TOOLS', 'Claude Code, Codex and similar tools can search your tracked folders through Alfred and read passages '
+                                         'from them (read-only, this PC only). Each tool is asked once before it may. Every call is listed here.')
+        self.mcp_command = label('', 'caption', wrap=True, selectable=True)
+        command = QVBoxLayout()
+        command.addWidget(button('Copy', self.copy_mcp_command))
+        g.row('Add Alfred to a tool', command, 'Run this in a terminal (for Claude Code); other tools take the same program and arguments')
+        g.outer.addWidget(self.mcp_command)
+        self.mcp_clients = QVBoxLayout()
+        holder = QWidget()
+        holder.setLayout(self.mcp_clients)
+        g.add(holder)
+        self.mcp_calls = label('', 'caption', wrap=True, selectable=True)
+        g.add(self.mcp_calls)
+        body.addWidget(g)
+
         g = Group(win, 'DIAGNOSTICS', 'A detected GPU is not the same as an accelerated model. Device facts come from nvidia-smi and from Ollama’s own report — nothing is inferred.')
         row = QHBoxLayout()
         row.addWidget(button('Check status', lambda: self.diagnose(False)))
@@ -2835,10 +2850,52 @@ class SettingsView(QWidget):
         self.load_effort()
         self.show_chats_info()
         self.show_hotkey()
+        self.show_other_tools()
         run_job(lambda s: startup.enabled(), self.show_start_login)
         self.tracked.load()
         self.show_index_info()
         self.loading = False
+
+    def mcp_command_line(self):
+        exe = sys.executable
+        if getattr(sys, 'frozen', False):
+            return f'claude mcp add alfred -- "{exe}" --mcp'
+        return f'claude mcp add alfred -- "{exe}" -m alfred --mcp'
+
+    def copy_mcp_command(self):
+        QApplication.clipboard().setText(self.mcp_command_line())
+
+    def show_other_tools(self):
+        """The command, the known AI tools (Allowed / Remove) and the last 50 calls, read from the data folder."""
+        home = self.win.settings.home
+        self.mcp_command.setText(self.mcp_command_line())
+        while self.mcp_clients.count():
+            item = self.mcp_clients.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        clients = mcp_server.list_clients(home)
+        if not clients:
+            self.mcp_clients.addWidget(label('No AI tool has asked yet.', 'caption'))
+        for name, info in clients:
+            line = QWidget()
+            row = QHBoxLayout(line)
+            row.setContentsMargins(0, 4, 0, 4)
+            row.addWidget(label(name), 1)
+            allowed = Toggle(lambda: self.win.pal)
+            allowed.setChecked(info.get('allowed') is True)
+            allowed.toggled.connect(lambda on, n=name: mcp_server.set_allowed(home, n, on))
+            row.addWidget(label('Allowed', 'caption'))
+            row.addWidget(allowed)
+            row.addWidget(button('Remove', lambda _=False, n=name: (mcp_server.remove_client(home, n), self.show_other_tools()),
+                                 None, 'Forget this tool; it is asked again next time'))
+            self.mcp_clients.addWidget(line)
+        lines = []
+        for call in mcp_server.recent_calls(home, 50):
+            what = call.get('query') or call.get('path') or ''
+            outcome = '' if call.get('outcome') == 'ok' else f" · {call.get('outcome')}"
+            lines.append(f"{call.get('time', '')} · {call.get('client', '')} · {call.get('tool', '')} · {what} · "
+                         f"{call.get('count', 0)} files{outcome}")
+        self.mcp_calls.setText('\n'.join(lines) if lines else 'No calls yet.')
 
     def show_keep_loaded(self, minutes):
         """Select ``minutes`` in the Keep models loaded list (a value saved by hand that isn't listed is added to it)."""

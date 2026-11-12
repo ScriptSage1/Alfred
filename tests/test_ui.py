@@ -56,6 +56,21 @@ class SearchViewTests(unittest.TestCase):
         return [value for kind, value in self.view.list.items if kind == 'header'] + \
                [value.get('title') for kind, value in self.view.list.items if kind == 'row']
 
+    def test_settings_lists_ai_tools_and_their_calls(self):
+        from alfred import mcp_server, ui
+        home, view = self.win.settings.home, self.win.settings_view
+        mcp_server.set_allowed(home, 'some-tool', True)
+        mcp_server.log_call(home, {'time': '2026-01-01 10:00:00', 'client': 'some-tool', 'tool': 'search_files', 'query': 'tides',
+                                   'count': 2, 'outcome': 'ok'})
+        view.show_other_tools()
+        holder = view.mcp_clients.parentWidget()
+        self.assertIn('-m alfred --mcp', view.mcp_command.text())
+        self.assertIn('some-tool', [w.text() for w in holder.findChildren(ui.QLabel)])
+        self.assertIn('tides', view.mcp_calls.text())
+        [remove] = [b for b in holder.findChildren(ui.QPushButton) if b.text() == 'Remove']
+        remove.click()
+        self.assertEqual(mcp_server.list_clients(home), [])
+
     def test_window_builds_and_search_lists_results(self):
         self.search('harbour pilot')
         self.assertIn('harbour.txt', self.titles())
