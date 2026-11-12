@@ -266,6 +266,26 @@ class ConsentAndLogTests(McpBase):
         self.assertEqual(entries[1]['path'], str(self.dir / 'nowhere.txt'))
         self.assertEqual(mcp_server.recent_calls(self.settings.home, 2)[0]['outcome'], 'denied')  # newest first
 
+    def test_a_call_that_cannot_be_logged_returns_nothing(self):
+        (self.settings.home / 'mcp_calls.jsonl').mkdir()  # a folder in the log's place: the line cannot be written
+        result = self.search()
+        self.assertTrue(result['isError'])
+        self.assertNotIn('harbour', result['content'][0]['text'])
+
+    def test_an_index_from_another_version_is_refused_and_left_alone(self):
+        import sqlite3
+        con = sqlite3.connect(self.settings.db_path)
+        con.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+        con.commit()
+        con.close()
+        server = mcp_server.Server(self.settings, ask=lambda name: True)
+        result = server.handle(call('search_files', {'query': 'harbour'}))['result']
+        self.assertTrue(result['isError'])
+        self.assertIn('Open Alfred once', result['content'][0]['text'])
+        con = sqlite3.connect(self.settings.db_path)
+        self.assertEqual(con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], '1')
+        con.close()
+
     def test_log_rotates_past_five_megabytes(self):
         log = self.settings.home / 'mcp_calls.jsonl'
         log.write_bytes(b'x' * (5 * 1024 ** 2 + 1))

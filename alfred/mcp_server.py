@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import ai, config, extract, paths
-from .index import Index
+from .index import SCHEMA_VERSION, Index
 
 PROTOCOLS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
 SERVER_INFO = {'name': 'alfred', 'version': '0.1.0'}
@@ -84,6 +84,20 @@ def _save_clients(home, clients):
     temp.replace(target)
 
 
+def _schema_version(db_path):
+    """The index's schema version, read without writing anything (None when it cannot be read)."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(Path(db_path).as_uri() + '?mode=ro', uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
 def _now():
     return time.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -119,7 +133,8 @@ def remove_client(home, name):
 
 
 def log_call(home, entry):
-    """Append one line to the call log (past 5 MB the file becomes mcp_calls.1.jsonl, one old file kept)."""
+    """Append one line to the call log (past 5 MB the file becomes mcp_calls.1.jsonl, one old file kept).
+    False when the line could not be written."""
     log = Path(home) / CALLS_FILE
     try:
         if log.exists() and log.stat().st_size > MAX_LOG_BYTES:
@@ -128,6 +143,8 @@ def log_call(home, entry):
             handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
     except OSError as error:
         print(f'alfred mcp: could not write the call log: {error}', file=sys.stderr)
+        return False
+    return True
 
 
 def recent_calls(home, count=50):
@@ -319,7 +336,9 @@ class Server:
             result = {'content': [{'type': 'text', 'text': 'Alfred could not finish that search. Try again, or open Alfred.'}],
                       'isError': True}
         entry.update(files=files, count=len(files), ms=round((time.perf_counter() - started) * 1000), outcome=outcome)
-        log_call(self.home, entry)  # before the reply goes out
+        if not log_call(self.home, entry) and outcome == 'ok':  # before the reply goes out; nothing leaves unlogged
+            result = {'content': [{'type': 'text', 'text': 'Alfred could not write its call log, so it returned nothing.'}],
+                      'isError': True}
         return self._reply(ident, result)
 
     def _consent(self):
@@ -337,6 +356,8 @@ class Server:
         if self.index is None:
             if not self.settings.db_path.exists():  # Index() would create an empty one
                 raise ToolError('Nothing is indexed yet. Open Alfred and track a folder first.')
+            if _schema_version(self.settings.db_path) != SCHEMA_VERSION:  # Index() would upgrade it: the app's job
+                raise ToolError('The index was made by a different version of Alfred. Open Alfred once to update it.')
             self.index = Index(self.settings)
         return self.index
 
@@ -438,5 +459,5 @@ def run(stdout):
             stream.reconfigure(**options)
     import logging
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
-    serve(sys.stdin, stdout, Server(config.load()))
+    serve(sys.stdin, stdout, Server(config.load(retire=False)))
     return 0

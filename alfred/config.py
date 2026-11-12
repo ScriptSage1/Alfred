@@ -100,13 +100,14 @@ def retire_legacy(home):
 class Settings(dict):
     """Dict of settings; ``save()`` persists atomically."""
 
-    def __init__(self, home=None):
+    def __init__(self, home=None, retire=True):
         super().__init__(DEFAULTS)
         self['tracked_folders'] = []
         self.home = Path(home) if home else data_home()
         self.home.mkdir(parents=True, exist_ok=True)
         self.path = self.home / 'settings.json'
-        retire_legacy(self.home)
+        if retire:  # the MCP server only reads: it never moves an earlier Alfred's files
+            retire_legacy(self.home)
         if self.path.exists():
             try:
                 loaded = json.loads(self.path.read_text(encoding='utf-8-sig'))
@@ -136,5 +137,5 @@ class Settings(dict):
         return Path(os.path.expandvars(folder)) if folder else self.home / 'Chats'
 
 
-def load(home=None):
-    return Settings(home)
+def load(home=None, retire=True):
+    return Settings(home, retire)
