@@ -456,6 +456,11 @@ def lookup(value, ev):
         if value['parts'][0][0] == 'Q':  # Q3 2024 written as 'Q3 … 2024'
             _, year, quarter = value['parts'][0]
             return 'equivalent' if _index._contains(ev.words, (f'q{quarter}',)) and str(year) in ev.words else None
+        year, month, day = value['parts'][0]
+        if year and month and day is None:  # January 2027 written as 'the 2027 renewal in January'
+            short = next(m for m, n in MONTH_NUMBER.items() if n == month and len(m) == 3)
+            if any({short, str(year)} <= s['words'] for sentences in ev.sentences for s in sentences):
+                return 'equivalent'
         return None
     if form in ('email', 'file'):
         return None
@@ -671,7 +676,10 @@ def _value_cover(claim):
 
 
 def _weak(value):
-    """A small whole number or a bare year: in too many passages to place a citation on its own ('3', '2027')."""
+    """A small whole number, a bare year or a date without its day or year: in too many passages to place a citation
+    on its own ('3', '2027', 'January 2027' also matches any day of that month)."""
+    if value['type'] == 'date':
+        return any(part[0] != 'Q' and (part[0] is None or part[2] is None) for part in value['parts'])
     if value['type'] != 'number' or value.get('form') != 'number' or value.get('suffix') or not value['text'][:1].isdigit():
         return False
     number = value['value']

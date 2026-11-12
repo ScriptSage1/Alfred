@@ -233,6 +233,13 @@ class WeakValueTests(unittest.TestCase):
         self.assertEqual(checked.flags[0]['reasons'], ['value_not_in_sources'])
         self.assertEqual(checked.flags[0]['values'], ['3'])
 
+    def test_a_month_and_year_does_not_add_a_file_that_only_has_a_day_in_that_month(self):
+        sources = {1: source('From the 2027 renewal in January, an annual parking permit costs $420.', 'permit.docx'),
+                   2: source('Our team will move to the Harbor Point building on 2027-01-15.', 'move.docx')}
+        checked = proof.check('The permit costs $420 from January 2027 [1].', sources, 'What does the permit cost?')
+        self.assertEqual([c['number'] for c in checked.cited], [1])  # its own sentence names the month and the year
+        self.assertEqual(checked.flags, [])
+
     def test_a_strong_value_still_moves_it(self):
         sources = {1: self.FLAT[1], 2: source('sensor,reading\nTMP-88231,24.2', 'readings.csv')}
         checked = proof.check('The sensor read 24.2 [1].', sources, 'What did the sensor read?')
