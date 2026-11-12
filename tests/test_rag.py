@@ -332,23 +332,24 @@ class CitationTests(unittest.TestCase):
         out, _ = self.run_stream('Use the [Save] button; array[0] stays.', {1})
         self.assertEqual(out, 'Use the [Save] button; array[0] stays.')
 
-    def test_verify_moves_misnumbered_and_drops_unsupported(self):
-        sources = {1: {'text': 'Travel plan: flight departs Friday from Hyderabad.'},
-                   2: {'text': 'SwiftCart uses a layered three-tier design with a presentation layer.'}}
-        self.assertEqual(rag.verify_citations('SwiftCart uses a layered three-tier design [1].', sources),
-                         'SwiftCart uses a layered three-tier design [2].')
-        self.assertEqual(rag.verify_citations('Your files don’t mention your passport number [1].', sources),
-                         'Your files don’t mention your passport number.')
-        self.assertEqual(rag.verify_citations('The flight departs Friday from Hyderabad [1].', sources),
+    def test_check_moves_misnumbered_and_drops_unsupported(self):
+        """The cases the old verify_citations covered, now through proof.check (renumbered by first appearance)."""
+        from alfred import proof
+        sources = {1: {'text': 'Travel plan: flight departs Friday from Hyderabad.', 'filename': 'trip.txt'},
+                   2: {'text': 'SwiftCart uses a layered three-tier design with a presentation layer.', 'filename': 'design.md'}}
+        moved = proof.check('SwiftCart uses a layered three-tier design [1].', sources)
+        self.assertEqual((moved.answer, [c['number'] for c in moved.cited]), ('SwiftCart uses a layered three-tier design [1].', [2]))
+        self.assertEqual(proof.check('Your files don’t mention your passport number [1].', sources).refused, 'unverified')
+        self.assertEqual(proof.check('The flight departs Friday from Hyderabad [1].', sources).answer,
                          'The flight departs Friday from Hyderabad [1].')
-        self.assertEqual(rag.verify_citations('Paris is lovely [2].', sources), 'Paris is lovely.')
-        self.assertEqual(rag.verify_citations('It departs Friday [1].\n\n**Beyond your files**\n', sources), 'It departs Friday [1].')
+        lovely = proof.check('Paris is lovely [2]. The flight departs Friday from Hyderabad [1].', sources)
+        self.assertEqual(lovely.answer, 'Paris is lovely. The flight departs Friday from Hyderabad [1].')
+        self.assertEqual(lovely.flags[0]['reasons'], ['no_source'])
+        self.assertEqual(proof.check('It departs Friday [1].\n\n**Beyond your files**\n', sources).answer, 'It departs Friday [1].')
 
     def test_highlight_finds_supporting_sentence(self):
         passage = 'Welcome to the briefing. Budget review: 18,000 rupees approved. Deadline moved to December 5.'
         self.assertEqual(rag.highlight(passage, ['The deadline is December 5']), 'Deadline moved to December 5.')
-        claims = rag.claims_by_source('The budget is 18,000 rupees [1]. The deadline is December 5 [2].')
-        self.assertEqual(sorted(claims), [1, 2])
 
 
 class AskTests(RetrievalTests):
@@ -364,6 +365,9 @@ class AskTests(RetrievalTests):
         self.assertEqual((cited['marker'], cited['filename']), (1, 'service.txt'))
         self.assertEqual(cited['highlight'], 'The mechanic replaced the spark plugs and changed the oil.')
         self.assertIn(('cite', 1), [(e[0], e[1]) for e in events if isinstance(e, tuple)])
+        self.assertEqual((result['proof']['claims'], result['proof']['verified'], result['flags'], result['conflicts'], result['refused']),
+                         (1, 1, [], [], None))
+        self.assertIn('check', result['timings'])
         prompt = provider.sent[0][-1]['content']
         self.assertIn('<sources>', prompt)
         self.assertIn('Question: What did the mechanic replace?', prompt)

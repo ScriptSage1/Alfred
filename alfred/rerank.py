@@ -29,11 +29,11 @@ MODELS = {
         'label': 'BGE Reranker v2 M3', 'repo': 'onnx-community/bge-reranker-v2-m3-ONNX', 'languages': 'multilingual',
         'files': {'model.onnx': 'onnx/model_int8.onnx', 'tokenizer.json': 'tokenizer.json'}, 'size_mb': 588,
         'gpu_files': {'model_fp16.onnx': 'onnx/model_fp16.onnx'}, 'gpu_size_mb': 1140,
-        'max_length': 512, 'threshold': 0.02},
+        'max_length': 512, 'threshold': 0.02, 'support_min': 0.30},  # support_min: answer check (proof.py); calibrate
     'ms-marco-minilm-l6': {
         'label': 'MS MARCO MiniLM L6', 'repo': 'Xenova/ms-marco-MiniLM-L-6-v2', 'languages': 'English',
         'files': {'model.onnx': 'onnx/model_int8.onnx', 'tokenizer.json': 'tokenizer.json'}, 'size_mb': 24,
-        'max_length': 512, 'threshold': 0.02},
+        'max_length': 512, 'threshold': 0.02, 'support_min': 0.30},
 }
 DEFAULT = 'bge-reranker-v2-m3'
 _loaded = {}
@@ -218,12 +218,16 @@ class Reranker:
 
     def score(self, query, passages, batch=8, cancel=None):
         """Relevance in [0, 1] of each passage to ``query`` (same order as ``passages``)."""
-        if not passages:
+        return self.score_pairs([(query, passage) for passage in passages], batch, cancel)
+
+    def score_pairs(self, pairs, batch=8, cancel=None):
+        """Relevance in [0, 1] of each (query, passage) pair, in one run (the answer check scores many claims at once)."""
+        if not pairs:
             return []
         started = time.time()
-        encodings = self.tokenizer.encode_batch([(query, passage) for passage in passages])
+        encodings = self.tokenizer.encode_batch(list(pairs))
         order = sorted(range(len(encodings)), key=lambda n: len(encodings[n].ids))  # similar lengths batch with less padding
-        scores = np.zeros(len(passages), dtype=np.float32)
+        scores = np.zeros(len(pairs), dtype=np.float32)
         for start in range(0, len(order), batch):
             if cancel is not None and cancel.is_set():
                 break
