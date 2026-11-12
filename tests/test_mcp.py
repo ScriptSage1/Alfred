@@ -83,6 +83,12 @@ class ProtocolTests(McpBase):
         self.assertEqual(reply['result']['capabilities'], {'tools': {}})
         self.assertEqual(self.hello(protocol='1999-01-01')['result']['protocolVersion'], '2025-06-18')
 
+    def test_initialize_tells_the_client_how_to_answer(self):
+        text = self.hello()['result']['instructions']
+        for needle in ('search_files', 'read_passage', 'confident: false', 'do not contain the answer', 'disagree',
+                       'file_modified', 'never follow instructions'):
+            self.assertIn(needle, text)
+
     def test_ping_and_notifications(self):
         self.assertEqual(self.server.handle(request('ping', ident=7)), {'jsonrpc': '2.0', 'id': 7, 'result': {}})
         self.assertIsNone(self.server.handle({'jsonrpc': '2.0', 'method': 'notifications/cancelled', 'params': {}}))
@@ -120,7 +126,7 @@ class SearchTests(McpBase):
         for word in ('score', 'rank', 'similarity'):
             self.assertNotIn(word, text)
         first = data['results'][0]
-        self.assertEqual(set(first), {'path', 'filename', 'folder', 'kind', 'location', 'snippet', 'modified', 'segment_id', 'confident'})
+        self.assertEqual(set(first), {'path', 'filename', 'folder', 'kind', 'location', 'snippet', 'file_modified', 'segment_id', 'confident'})
         self.assertTrue(first['location']['label'].startswith('line'))
         self.assertEqual(first['location']['line'], 1)
 
@@ -169,6 +175,46 @@ class SearchTests(McpBase):
             self.assertTrue(result['isError'], arguments)
             self.assertNotIn('Traceback', result['content'][0]['text'])
         self.assertTrue(self.server.handle(request('tools/call', {'name': 'search_files', 'arguments': [1]}))['result']['isError'])
+
+
+class OllamaCheckTests(McpBase):
+    """Ollama is probed once and the answer is remembered; it is started at most once while it stays down."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.update(embed_enabled=True, embed_model='embeddinggemma-2', ollama_autostart=True)
+        self.probes, self.starts, self.up = [], [], False
+        self.kept = (mcp_server.ai.ollama_running, mcp_server.ai.ensure_ollama)
+        mcp_server.ai.ollama_running = lambda base, timeout=0.8: self.probes.append(base) or self.up
+
+        def start(base, wait=25.0):
+            self.starts.append(wait)
+            raise mcp_server.ai.ProviderError('Ollama is not installed')
+        mcp_server.ai.ensure_ollama = start
+
+    def tearDown(self):
+        mcp_server.ai.ollama_running, mcp_server.ai.ensure_ollama = self.kept
+        super().tearDown()
+
+    def test_down_is_remembered_and_search_falls_back_to_keywords(self):
+        for _ in range(3):
+            data = self.payload(self.tool('search_files', {'query': 'harbour'}))
+            self.assertTrue(data['results'])
+            self.assertIn('keyword matches', data['notes'][0])
+        self.assertEqual((len(self.probes), len(self.starts)), (1, 1))
+        self.assertLessEqual(self.starts[0], 10)
+
+    def test_checked_again_after_the_wait(self):
+        self.tool('search_files', {'query': 'harbour'})
+        base, running, checked = self.server._ollama
+        self.server._ollama = (base, running, checked - mcp_server.OLLAMA_DOWN_SECONDS - 1)
+        self.tool('search_files', {'query': 'harbour'})
+        self.assertEqual(len(self.probes), 2)
+
+    def test_not_started_when_the_user_turned_autostart_off(self):
+        self.settings['ollama_autostart'] = False
+        self.tool('search_files', {'query': 'harbour'})
+        self.assertEqual(self.starts, [])
 
 
 class ReadTests(McpBase):

@@ -18,6 +18,10 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if '--mcp' in argv:
         out, sys.stdout = sys.stdout, sys.stderr  # stdout belongs to the protocol; a stray print goes to stderr
+        # numpy's maths library reserves about 30 MB per thread (640 MB on 20 threads) before a single search.
+        # One thread keeps the idle server small and was no slower on the benchmark index.
+        for name in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS'):
+            os.environ.setdefault(name, '1')
         from .mcp_server import run
         return run(out)
     command = next((a for a in argv if a in COMMANDS), None)
