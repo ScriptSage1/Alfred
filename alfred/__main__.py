@@ -5,6 +5,7 @@
     python -m alfred --track FOLDER   ask the running Alfred to track a folder
     python -m alfred --search QUERY   search with the running Alfred and print JSON
     python -m alfred --status         print the running Alfred's index status
+    python -m alfred --mcp            serve search_files and read_passage to other AI tools over stdio (no window)
 """
 import json
 import os
@@ -15,6 +16,10 @@ COMMANDS = {'--track': 'track', '--search': 'search', '--status': 'status'}
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if '--mcp' in argv:
+        out, sys.stdout = sys.stdout, sys.stderr  # stdout belongs to the protocol; a stray print goes to stderr
+        from .mcp_server import run
+        return run(out)
     command = next((a for a in argv if a in COMMANDS), None)
     if command is None:
         from .ui import run
