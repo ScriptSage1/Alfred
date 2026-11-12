@@ -8,7 +8,7 @@ text inside images and videos — by keyword and by meaning. Everything runs on 
 ## Install (from a clone)
 
 1. Install Python 3.11 or newer.
-2. For search by meaning and picture descriptions, install [Ollama](https://ollama.com) and run
+2. For search by meaning and a local chat model, install [Ollama](https://ollama.com) and run
    `ollama pull embeddinggemma-2` and `ollama pull gemma3:4b`.
    Without it, keyword search still works.
 3. Double-click `Setup-Alfred.cmd`. It creates `.venv`, installs the requirements, adds Alfred to the Start menu
@@ -45,12 +45,9 @@ AppData, and it skips hidden files, dot-folders, symlinks and files that look li
 | .png .jpg .webp .bmp .gif .tiff | OCR (RapidOCR, local) | image text |
 | .mp4 .mkv .mov .avi .webm … | OCR on a frame every 10 s (up to 120 frames) | at 01:23 |
 
-Pictures (and one frame of each video) are also described by a local Ollama vision model
-(**gemma3:4b**; `ollama pull gemma3:4b`): a caption, a short description and tags, shown under the
-picture in the preview and labelled as an AI description. So "kid on a bench in autumn" finds the
-photo. Each picture is described once (again only if it changes or you switch model); turn it off
-under **Settings → Images & videos → Describe images with AI**. Photos without text stay findable by
-their file name. Old `.doc/.ppt/.xls` files are
+Pictures, up to 8 keyframes of each video and scanned PDF pages are also found by what they show:
+the search model (EmbeddingGemma 2) turns each into a picture vector that your words are compared
+with, so "kid on a bench in autumn" finds the photo. Old `.doc/.ppt/.xls` files are
 listed as unsupported; save them in the newer format to search them.
 
 Search combines SQLite FTS5 (BM25) keyword matches with EmbeddingGemma 2 vectors through
@@ -79,7 +76,7 @@ or under **Settings → AI model**:
 
 The CLIs are run locked down: print mode, every tool off, no MCP servers or project settings, an empty
 working folder. API keys are stored in Windows Credential Manager, never in Alfred's files. Indexing,
-OCR, picture descriptions and search always stay on your PC; with a cloud model only your questions
+OCR and search always stay on your PC; with a cloud model only your questions
 (and the passages found for them, when Alfred answers from your documents) are sent — Alfred asks
 once per provider before it does.
 

@@ -16,7 +16,7 @@
   and pictures get a vector of what they show (the embedding model reads pictures). Each layer is committed
   as it completes, so a stopped run loses nothing. Only the update thread writes to the database.
 * Pictures by what they show: a text query is compared with picture vectors too ('picture' results, with
-  their own confidence floor); AI captions are optional enrichment, written in the background or on demand.
+  their own confidence floor) and by the text OCR reads in them.
 """
 import collections
 import functools
@@ -45,7 +45,7 @@ log = logging.getLogger('alfred')
 RRF_K = 60
 PHRASE_BOOST = 1.0  # per identifier a passage contains exactly; fused RRF scores stay below 2 / RRF_K
 IDENTIFIER_SEMANTIC_WEIGHT = 0.25  # meaning search knows little about codes and numbers: it votes less for them
-DESCRIBE_EMBED_EVERY = 25  # embed new AI descriptions in batches while describing a large folder
+CONTEXT_EMBED_EVERY = 25  # re-embed passages in batches while writing their AI contexts for a large folder
 SEMANTIC_BAND = 0.06  # meaning matches must be this close to the best one (EmbeddingGemma cosine)
 ENRICH_VERSION = 'header-v1'  # bump when chunk headers change: search text is rebuilt and passages re-embedded
 PDF_READER = 'tables-v1'  # bump when PDF tables are read differently: every PDF's tables are read again
@@ -60,7 +60,6 @@ CREATE INDEX IF NOT EXISTS segments_path ON segments(path);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(text, name, tokenize='unicode61 remove_diacritics 2');
 CREATE TABLE IF NOT EXISTS vectors(segment_id INTEGER PRIMARY KEY, dim INTEGER, vector BLOB);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS descriptions(path TEXT PRIMARY KEY, signature TEXT, status TEXT, error TEXT, seconds REAL, described_at REAL);
 CREATE TABLE IF NOT EXISTS contexts(key TEXT PRIMARY KEY, signature TEXT, context TEXT);
 CREATE TABLE IF NOT EXISTS pdf_tables(path TEXT PRIMARY KEY, reader TEXT);
 CREATE TABLE IF NOT EXISTS layers(path TEXT, layer TEXT, signature TEXT, status TEXT, error TEXT, detail TEXT,
@@ -69,11 +68,11 @@ CREATE TABLE IF NOT EXISTS media_cache(hash TEXT, layer TEXT, signature TEXT, pa
                                        PRIMARY KEY(hash, layer, signature));
 '''
 # files.status: 'pending' (found, text not read yet) | 'ok' | 'error' | 'unsupported'.
-# segments.kind: 'file' (name only), 'text', 'page', 'slide', 'sheet', 'ocr', 'video', 'vision' (AI description, ord -1)
+# segments.kind: 'file' (name only), 'text', 'page', 'slide', 'sheet', 'ocr', 'video'
 # and 'picture' (a picture vector: no text and no fts row, ord -2, -3, …).
 # layers: per file, the 'ocr' and 'picture' layers (status 'pending' | 'ok' | 'error'; detail {"pages": [...]} for the
 # pages of a PDF that need OCR / a picture vector). media_cache: OCR passages and picture vectors by content hash.
-SCHEMA_VERSION = '2'
+SCHEMA_VERSION = '3'  # 2: OCR and picture layers; 3: AI picture descriptions removed
 OCR_VERSION = 'rapidocr-v1'
 PICTURE_VERSION = 'picture-v1:512'
 CACHE_DAYS = 180
@@ -97,8 +96,10 @@ def connect(db_path):
 
 
 def _upgrade(con):
-    """Bring an index built by an older Alfred to SCHEMA_VERSION. Pictures, videos and PDFs it read with OCR are
-    marked as OCR'd (nothing is read again); their picture vectors are simply missing, and added by layer 5."""
+    """Bring an index built by an older Alfred to SCHEMA_VERSION. Before version 2: pictures, videos and PDFs it
+    read with OCR are marked as OCR'd (nothing is read again); their picture vectors are simply missing, and added
+    by layer 5. Before version 3: AI picture descriptions ('vision' passages and the descriptions table) are
+    removed; nothing else changes and nothing is read again."""
     row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if row and row[0] == SCHEMA_VERSION:
         return
@@ -106,8 +107,11 @@ def _upgrade(con):
         meta = dict(con.execute('SELECT key,value FROM meta'))
         if meta.get('schema_version') == SCHEMA_VERSION:
             return
+        _drop_descriptions(con)
         media = meta.get('media_signature') or ''
-        if media.startswith('ocr:True'):
+        if meta.get('schema_version') == '2':
+            pass  # already has its OCR and picture layers
+        elif media.startswith('ocr:True'):
             interval = media.rsplit('video:', 1)[-1] if 'video:' in media else '10'
             now = time.time()
             for (path,) in list(con.execute("SELECT path FROM files WHERE status='ok'")):
@@ -119,6 +123,25 @@ def _upgrade(con):
         elif media:
             con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('ocr_enabled', '0'))
         con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('schema_version', SCHEMA_VERSION))
+
+
+def _drop_descriptions(con):
+    """Remove what AI picture descriptions left in an older index: every 'vision' passage with its vector and
+    full-text row, and the descriptions table. Safe to run again (nothing left to remove)."""
+    _delete_segments(con, [segment_id for (segment_id,) in con.execute("SELECT id FROM segments WHERE kind='vision'")])
+    con.execute('DROP TABLE IF EXISTS descriptions')
+
+
+def _delete_segments(con, ids):
+    """Delete these passages with their full-text rows and vectors."""
+    for start in range(0, len(ids), 500):
+        batch = ids[start:start + 500]
+        marks = ','.join('?' * len(batch))
+        con.execute(f'DELETE FROM fts WHERE rowid IN ({marks})', batch)
+        con.execute(f'DELETE FROM vectors WHERE segment_id IN ({marks})', batch)
+        con.execute(f'DELETE FROM segments WHERE id IN ({marks})', batch)
+    if ids:
+        con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('vectors_version', str(time.time())))
 
 
 def ocr_signature(path, interval=10):
@@ -406,8 +429,6 @@ class Index:
         self._vectors = (None, None, None, None)  # (version, ids, matrix, which rows are picture vectors)
         self._pause_check = None  # while a background update runs: True when it should pause (on battery)
         self._interval = 10
-        self._describe_lock = threading.Lock()
-        self._describing = {}  # path -> Event, while describe_now describes it
         self._query_cache = {}  # query vectors, and recent search results (see search)
         self._roots_cache = None  # (tracked folders as set, canonical roots, {path: (root, display folder)})
         self._local = threading.local()  # one read connection per thread (searches run on UI worker threads)
@@ -537,7 +558,6 @@ class Index:
             meta = dict(con.execute('SELECT key,value FROM meta'))
             segments = con.execute('SELECT count(*) FROM segments').fetchone()[0]
             vectors = con.execute('SELECT count(*) FROM vectors').fetchone()[0]
-            described, describe_seconds = con.execute("SELECT count(*), avg(seconds) FROM descriptions WHERE status='ok'").fetchone()
         finally:
             con.close()
         roots = self.roots()
@@ -546,7 +566,6 @@ class Index:
                 'files': counts.get('ok', 0), 'pending': counts.get('pending', 0),
                 'errors': counts.get('error', 0), 'unsupported': counts.get('unsupported', 0),
                 'segments': segments, 'vectors': vectors, 'last_indexed': meta.get('last_indexed'),
-                'described': described, 'describe_seconds': round(describe_seconds or 0, 2),
                 'embed_model': meta.get('embed_signature'), 'contexts': self._context_count()}
 
     def _context_count(self):
@@ -615,10 +634,10 @@ class Index:
             con.close()
 
     # -------------------------------------------------------------- indexing
-    def rebuild(self, progress=lambda state: None, embedder=None, vision=None):
-        return self.update(progress, embedder, force=True, vision=vision)
+    def rebuild(self, progress=lambda state: None, embedder=None):
+        return self.update(progress, embedder, force=True)
 
-    def update(self, progress=lambda state: None, embedder=None, force=False, vision=None, roots=None, background=False):
+    def update(self, progress=lambda state: None, embedder=None, force=False, roots=None, background=False):
         """Bring the index up to date with the tracked folders (or just ``roots``). Returns a summary.
 
         Runs in layers, each committed as it completes (see the module notes): names, text, meaning, OCR (on
@@ -630,7 +649,7 @@ class Index:
         try:
             con = connect(self.db_path)
             try:
-                return self._update(con, progress, embedder, force, roots, vision, background)
+                return self._update(con, progress, embedder, force, roots, background)
             finally:
                 self._pause_check = None
                 con.close()
@@ -656,10 +675,10 @@ class Index:
         check = self._pause_check
         return bool(check and check())
 
-    def _update(self, con, progress, embedder, force, only, vision=None, background=False):
+    def _update(self, con, progress, embedder, force, only, background=False):
         started = time.time()
         summary = {'found': 0, 'changed': 0, 'unchanged': 0, 'removed': 0, 'indexed': 0, 'errors': 0, 'unsupported': 0,
-                   'embedded': 0, 'described': 0, 'warnings': [], 'seconds_to_names': None, 'seconds_to_text': None,
+                   'embedded': 0, 'warnings': [], 'seconds_to_names': None, 'seconds_to_text': None,
                    'seconds_to_core': None, 'ocr_device': 'off', 'ocr_read': 0, 'pictures_embedded': 0, 'cache_hits': 0,
                    'paused': None}
         run = _Run(self, con, progress, summary)
@@ -756,8 +775,6 @@ class Index:
             if not self._stopping():
                 summary['seconds_to_core'] = round(time.time() - started, 2)
             # Layer 7: enrichment, timed separately.
-            if vision is not None and not self._stopping() and ai.vision_background(self.settings):
-                self._describe_missing(con, vision, embedder, run.emit, summary)
             writer = ai.Contextualizer.from_settings(self.settings)
             if writer is not None and not self._stopping():
                 self._contextualize_missing(con, writer, embedder, run.emit, summary)
@@ -872,14 +889,13 @@ class Index:
     def _write(self, con, root, path, st, status, error, passages, clear, pdf_tables=None, layers=()):
         """Store a file's text passages; the one writer for layer 2, OCR results and PDF tables.
 
-        ``clear`` (layer 2 on a changed file): everything about the file goes first, its pictures, description
-        and layer rows too. Otherwise only its text passages are replaced, and its picture vectors and AI
-        description stay. Either way, passages that read the same as before keep their vectors: an edited file
+        ``clear`` (layer 2 on a changed file): everything about the file goes first, its pictures and layer rows
+        too. Otherwise only its text passages are replaced, and its picture vectors stay. Either way, passages that read the same as before keep their vectors: an edited file
         (or one read again by a newer reader) only re-embeds what changed."""
         with con:
             kept = {text: (dim, vector) for text, dim, vector in con.execute(
                 'SELECT f.text, v.dim, v.vector FROM segments s JOIN fts f ON f.rowid = s.id '
-                "JOIN vectors v ON v.segment_id = s.id WHERE s.path=? AND s.kind NOT IN ('picture', 'vision')", (path,))}
+                "JOIN vectors v ON v.segment_id = s.id WHERE s.path=? AND s.kind != 'picture'", (path,))}
             if clear:
                 self._delete_passages(con, [path])
             else:
@@ -904,19 +920,12 @@ class Index:
                             (path, layer, signature, layer_status, layer_error, detail, round(seconds or 0, 3), time.time()))
 
     def _delete_text_passages(self, con, path):
-        """Remove a file's text passages (everything but its picture vectors and AI description)."""
-        ids = [row[0] for row in con.execute("SELECT id FROM segments WHERE path=? AND kind NOT IN ('picture', 'vision')", (path,))]
+        """Remove a file's text passages (everything but its picture vectors)."""
+        ids = [row[0] for row in con.execute("SELECT id FROM segments WHERE path=? AND kind != 'picture'", (path,))]
         self._delete_segments(con, ids)
 
     def _delete_segments(self, con, ids):
-        for start in range(0, len(ids), 500):
-            batch = ids[start:start + 500]
-            marks = ','.join('?' * len(batch))
-            con.execute(f'DELETE FROM fts WHERE rowid IN ({marks})', batch)
-            con.execute(f'DELETE FROM vectors WHERE segment_id IN ({marks})', batch)
-            con.execute(f'DELETE FROM segments WHERE id IN ({marks})', batch)
-        if ids:
-            con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('vectors_version', str(time.time())))
+        _delete_segments(con, ids)
 
     def _ocr_switch(self, con, ocr_on, meta):
         """OCR turned off: passages read by OCR leave the index (a picture keeps its name). Turned back on:
@@ -930,7 +939,7 @@ class Index:
                 self._delete_segments(con, [segment_id for segment_id, _ in rows])
                 con.execute("DELETE FROM layers WHERE layer='ocr'")
                 for path in {path for _, path in rows}:
-                    left = con.execute("SELECT count(*) FROM segments WHERE path=? AND kind NOT IN ('picture', 'vision')", (path,)).fetchone()[0]
+                    left = con.execute("SELECT count(*) FROM segments WHERE path=? AND kind != 'picture'", (path,)).fetchone()[0]
                     if not left:
                         kind, text, loc = _name_only(path)
                         cursor = con.execute('INSERT INTO segments(path,ord,kind,text,location) VALUES(?,?,?,?,?)', (path, 0, kind, text, json.dumps(loc)))
@@ -1211,177 +1220,9 @@ class Index:
                 con.execute(f'DELETE FROM fts WHERE rowid IN ({marks})', batch)
                 con.execute(f'DELETE FROM vectors WHERE segment_id IN ({marks})', batch)
             con.execute('DELETE FROM segments WHERE path=?', (path,))
-            con.execute('DELETE FROM descriptions WHERE path=?', (path,))
             con.execute('DELETE FROM pdf_tables WHERE path=?', (path,))
             con.execute('DELETE FROM layers WHERE path=?', (path,))
         con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('vectors_version', str(time.time())))
-
-    # ------------------------------------------------------------- captions
-    def _describe_missing(self, con, vision, embedder, progress, summary):
-        """Describe pictures (and one representative frame per video) that have no description from
-        this model yet. Runs once per file version: re-indexing a changed file clears its description."""
-        signature = vision.signature()
-        media = tuple(IMAGE_SUFFIXES | VIDEO_SUFFIXES)
-        rows = [(p, root) for p, root in con.execute(
-            "SELECT f.path, f.root FROM files f LEFT JOIN descriptions d ON d.path = f.path "
-            "WHERE f.status = 'ok' AND (d.signature IS NULL OR d.signature != ?)", (signature,)) if p.lower().endswith(media)]
-        tracked = {str(r) for r in self.roots()}
-        rows = [(p, root) for p, root in rows if root in tracked]
-        pending_embeds = 0
-        for number, (path, root) in enumerate(rows):
-            if self._stopping():
-                break
-            progress({'phase': 'describing', 'done': number, 'total': len(rows), 'current': path, 'root': root})
-            try:
-                described = self._describe_one(con, path, vision, signature)
-            except ai.ProviderError as error:
-                summary['warnings'].append(f'Picture descriptions paused: {error}')
-                break  # Ollama or the model is unavailable: try again on the next run
-            if described is None:
-                continue
-            summary['described'] += 1
-            pending_embeds += 1
-            if embedder is not None and pending_embeds >= DESCRIBE_EMBED_EVERY:
-                summary['embedded'] += self._embed_missing(con, embedder, lambda state: None, summary)
-                pending_embeds = 0
-        if embedder is not None and pending_embeds:
-            summary['embedded'] += self._embed_missing(con, embedder, lambda state: None, summary)
-
-    def _describe_one(self, con, path, vision, signature):
-        """Describe one picture or video and store its 'vision' passage: (text, segment id), or None when this
-        file could not be described (recorded, so it isn't tried again until it changes). Raises ProviderError
-        when Ollama or the model is unavailable."""
-        began = time.time()
-        try:
-            image, seconds = self._picture(path)
-            described = vision.describe(image)
-        except ai.ProviderError as error:
-            if 'Cannot reach' in str(error) or 'not installed' in str(error):
-                raise
-            self._record_description(con, path, signature, 'error', str(error)[:300], time.time() - began)
-            return None
-        except Exception as error:  # an unreadable picture never stops the run
-            self._record_description(con, path, signature, 'error', (str(error) or type(error).__name__)[:300], time.time() - began)
-            return None
-        location = dict(ai=True, model=vision.model, **described)
-        if seconds is not None:
-            location['seconds'] = seconds
-        text = '\n'.join(part for part in (described['caption'], described['description'],
-                                            'Tags: ' + ', '.join(described['tags']) if described['tags'] else '') if part)
-        with con:
-            old = [row[0] for row in con.execute("SELECT id FROM segments WHERE path=? AND kind='vision'", (path,))]
-            self._delete_segments(con, old)
-            cursor = con.execute('INSERT INTO segments(path,ord,kind,text,location) VALUES(?,?,?,?,?)',
-                                 (path, -1, 'vision', text, json.dumps(location)))
-            con.execute('INSERT INTO fts(rowid,text,name) VALUES(?,?,?)',
-                        (cursor.lastrowid, self._search_text(con, path, 'vision', text, location, None), name_terms(path)))
-        self._record_description(con, path, signature, 'ok', '', time.time() - began)
-        return text, cursor.lastrowid
-
-    def describe_now(self, path, vision, embedder=None):
-        """Describe one picture or video now (lazy captions: when its preview opens) and return the description,
-        or None. Embeds the new passage when ``embedder`` is given. Safe while update() runs (its own connection,
-        not the indexing lock); two calls for the same file describe it once."""
-        key = str(path)
-        if Path(key).suffix.lower() not in MEDIA:
-            return None
-        with self._describe_lock:
-            event = self._describing.get(key)
-            owner = event is None
-            if owner:
-                event = self._describing[key] = threading.Event()
-        if not owner:
-            event.wait(300)
-            return self._stored_description(key, vision.signature())
-        try:
-            con = connect(self.db_path)
-            try:
-                signature = vision.signature()
-                existing = self._stored_description(key, signature, con)
-                if existing is not None:
-                    return existing
-                row = con.execute('SELECT status FROM files WHERE path=?', (key,)).fetchone()
-                if row is None or row[0] != 'ok' or self._place(key) is None:
-                    return None
-                try:
-                    described = self._describe_one(con, key, vision, signature)
-                except ai.ProviderError as error:
-                    log.info('Could not describe %s now: %s', key, error)
-                    return None
-                if described is None:
-                    return None
-                if embedder is not None:
-                    try:
-                        self._embed_segments(con, embedder, [described[1]])
-                    except Exception as error:  # the description is searchable by keyword already
-                        log.info('Could not embed the description of %s: %s', key, error)
-                return described[0]
-            finally:
-                con.close()
-        finally:
-            with self._describe_lock:
-                self._describing.pop(key, None)
-            event.set()
-
-    def _stored_description(self, path, signature, con=None):
-        own = con is None
-        con = con or connect(self.db_path)
-        try:
-            row = con.execute("SELECT s.text FROM segments s JOIN descriptions d ON d.path = s.path WHERE s.path=? AND s.kind='vision' "
-                              "AND d.signature=? AND d.status='ok'", (path, signature)).fetchone()
-            return row[0] if row else None
-        finally:
-            if own:
-                con.close()
-
-    def _embed_segments(self, con, embedder, ids):
-        """Embed just these passages (when the index's vectors are from this model)."""
-        meta = dict(con.execute("SELECT key,value FROM meta WHERE key='embed_signature'"))
-        if meta.get('embed_signature') != self.vector_signature(embedder) or not ids:
-            return 0
-        rows = list(con.execute('SELECT s.id, s.path, f.text FROM segments s JOIN fts f ON f.rowid = s.id '
-                                'WHERE s.id IN (SELECT value FROM json_each(?))', (json.dumps(ids),)))
-        if not rows:
-            return 0
-        vectors = embedder.embed_documents([text for _, _, text in rows], [Path(p).stem for _, p, _ in rows])
-        with con:
-            for (segment_id, _, _), vector in zip(rows, vectors):
-                array = np.asarray(vector, dtype=np.float32)
-                array /= max(float(np.linalg.norm(array)), 1e-12)
-                con.execute('INSERT OR REPLACE INTO vectors VALUES(?,?,?)', (segment_id, array.size, array.tobytes()))
-            con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('vectors_version', str(time.time())))
-        return len(rows)
-
-    @staticmethod
-    def _picture(path):
-        """(PIL image, seconds or None) to describe: the picture itself, or a frame a fifth into a video."""
-        from PIL import Image
-        import io
-        if Path(path).suffix.lower() in VIDEO_SUFFIXES:
-            duration = extract.video_duration(path)
-            seconds = round(min(duration * 0.2, 30.0), 1)
-            return Image.open(io.BytesIO(video_frame_png(path, seconds, width=896))), seconds
-        with Image.open(path) as image:
-            image.seek(0)
-            from PIL import ImageOps
-            return ImageOps.exif_transpose(image).copy(), None
-
-    @staticmethod
-    def _record_description(con, path, signature, status, error, seconds):
-        with con:
-            con.execute('INSERT OR REPLACE INTO descriptions VALUES(?,?,?,?,?,?)', (path, signature, status, error, round(seconds, 2), time.time()))
-
-    def description_pending(self, path):
-        """True while a picture is waiting for its AI description."""
-        if not self.settings.get('vision_enabled') or Path(path).suffix.lower() not in IMAGE_SUFFIXES | VIDEO_SUFFIXES:
-            return False
-        signature = ai.Vision(self.settings).signature()
-        con = connect(self.db_path)
-        try:
-            row = con.execute('SELECT signature FROM descriptions WHERE path=?', (str(path),)).fetchone()
-        finally:
-            con.close()
-        return row is None or row[0] != signature
 
     # ------------------------------------------------------------- meaning
     def _embed_missing(self, con, embedder, progress, summary, between=None):
@@ -1449,7 +1290,7 @@ class Index:
                 con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('vectors_version', str(time.time())))
             summary['contextualized'] = summary.get('contextualized', 0) + 1
             pending += 1
-            if embedder is not None and pending >= DESCRIBE_EMBED_EVERY:
+            if embedder is not None and pending >= CONTEXT_EMBED_EVERY:
                 summary['embedded'] += self._embed_missing(con, embedder, lambda state: None, summary)
                 pending = 0
         if embedder is not None and pending:
@@ -1541,7 +1382,7 @@ class Index:
     def neighbours(self, path, order, radius=1):
         """Passages next to passage ``order`` of ``path`` (same file, readable text only), in order."""
         rows = self._reader().execute("SELECT id, ord, kind, text, location FROM segments WHERE path=? AND ord BETWEEN ? AND ? "
-                                      "AND ord >= 0 AND kind NOT IN ('vision', 'file', 'picture') ORDER BY ord",
+                                      "AND ord >= 0 AND kind NOT IN ('file', 'picture') ORDER BY ord",
                                       (str(path), order - radius, order + radius)).fetchall()
         return [{'segment_id': sid, 'ord': o, 'kind': kind, 'text': text, 'loc': json.loads(loc or '{}')} for sid, o, kind, text, loc in rows]
 
@@ -1767,9 +1608,7 @@ class Index:
                 'SELECT id,kind,text,location FROM segments WHERE path=? ORDER BY ord', (key,))]
         finally:
             con.close()
-        vision = next(({k: loc.get(k) for k in ('caption', 'description', 'tags', 'model', 'seconds')}
-                       for _, kind, _, loc in passages if kind == 'vision'), None)
-        passages = [p for p in passages if p[1] not in ('vision', 'file', 'picture')]  # shown separately / just the name / no text
+        passages = [p for p in passages if p[1] not in ('file', 'picture')]  # just the name / no text
         start = 0
         for number, (sid, _, _, loc) in enumerate(passages):
             if (segment_id and sid == segment_id) or (page and loc.get('page') == page) or \
@@ -1787,9 +1626,8 @@ class Index:
             last = location_label(kind, loc)
         return {'path': key, 'filename': Path(key).name, 'location': first if first == last else f'{first} to {last}',
                 'excerpt': '\n\n'.join(parts), 'truncated': used >= max_chars or start + len(parts) < len(passages),
-                'segments_in_file': len(passages), 'vision': vision,
-                'ocr_text': '\n'.join(text for _, kind, text, _ in passages if kind == 'ocr'),
-                'description_pending': vision is None and self.description_pending(key)}
+                'segments_in_file': len(passages),
+                'ocr_text': '\n'.join(text for _, kind, text, _ in passages if kind == 'ocr')}
 
 
 def _document_window(passages, order, chars=9000):

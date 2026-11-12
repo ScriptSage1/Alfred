@@ -1,11 +1,10 @@
-"""Layered-indexing UI: progress text, the partial-index notice, background runs, battery resume and lazy captions.
+"""Layered-indexing UI: progress text, the partial-index notice, background runs and battery resume.
 Pure helpers are tested directly; window methods run against fakes or a headless window (no network, no Ollama)."""
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -78,8 +77,6 @@ class FakeWindow:
         self.visible, self.indexing, self.index_background, self.priority_low = visible, False, False, False
         self.paused, self.started = None, []
         self.battery_timer = mock.Mock()
-        self.captioning = set()
-        self.settings = {'vision_enabled': True}
         self.index = mock.Mock()
 
     def isVisible(self):
@@ -90,7 +87,6 @@ class FakeWindow:
 
     sync_priority = ui.AlfredWindow.sync_priority
     battery_tick = ui.AlfredWindow.battery_tick
-    lazy_caption = ui.AlfredWindow.lazy_caption
 
 
 class PriorityTests(unittest.TestCase):
@@ -140,64 +136,6 @@ class BatteryTests(unittest.TestCase):
         self.assertIsNone(win.paused)
 
 
-class LazyCaptionTests(unittest.TestCase):
-    def run_sync(self, fn, done=None, failed=None, **_):
-        try:
-            result = fn(mock.Mock())
-        except Exception as error:
-            failed and failed(error)
-        else:
-            done and done(result)
-
-    def test_described_once_per_path_while_in_flight(self):
-        win = FakeWindow()
-        win.index.description_pending.return_value = True
-        win.index.describe_now.return_value = {'caption': 'x'}
-        jobs = []
-        with mock.patch.object(ui, 'run_job', lambda fn, done=None, failed=None, **k: jobs.append((fn, done, failed))), \
-                mock.patch.object(ui.ai.Vision, 'from_settings', staticmethod(lambda s: SimpleNamespace(base='b'))), \
-                mock.patch.object(ui.ai.Embedder, 'from_settings', staticmethod(lambda s: None)), \
-                mock.patch.object(ui.ai, 'ollama_running', return_value=True):
-            self.assertTrue(win.lazy_caption('C:/p/a.jpg'))
-            self.assertFalse(win.lazy_caption('C:/p/a.jpg'))  # already in flight
-            self.assertEqual(len(jobs), 1)
-            fn, done, failed = jobs[0]
-            done(fn(mock.Mock()))
-            win.index.describe_now.assert_called_once()
-            self.assertNotIn('C:/p/a.jpg', win.captioning)
-
-    def test_refresh_callback_runs_when_caption_written(self):
-        win = FakeWindow()
-        win.index.description_pending.return_value = True
-        win.index.describe_now.return_value = {'caption': 'x'}
-        refreshed = []
-        with mock.patch.object(ui, 'run_job', self.run_sync), \
-                mock.patch.object(ui.ai.Vision, 'from_settings', staticmethod(lambda s: SimpleNamespace(base='b'))), \
-                mock.patch.object(ui.ai.Embedder, 'from_settings', staticmethod(lambda s: None)), \
-                mock.patch.object(ui.ai, 'ollama_running', return_value=True):
-            win.lazy_caption('a.jpg', lambda: refreshed.append(1))
-        self.assertEqual(refreshed, [1])
-
-    def test_nothing_when_captions_off_or_not_pending(self):
-        win = FakeWindow()
-        win.settings['vision_enabled'] = False
-        with mock.patch.object(ui, 'run_job', self.run_sync):
-            self.assertFalse(win.lazy_caption('a.jpg'))
-        win.index.describe_now.assert_not_called()
-        win.settings['vision_enabled'] = True
-        win.index.description_pending.return_value = False
-        with mock.patch.object(ui, 'run_job', self.run_sync):
-            win.lazy_caption('a.jpg')
-        win.index.describe_now.assert_not_called()
-
-    def test_failure_is_silent(self):
-        win = FakeWindow()
-        win.index.description_pending.side_effect = RuntimeError('boom')
-        with mock.patch.object(ui, 'run_job', self.run_sync):
-            win.lazy_caption('a.jpg')
-        self.assertEqual(win.captioning, set())
-
-
 class ForegroundBackgroundTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -221,7 +159,6 @@ class ForegroundBackgroundTests(unittest.TestCase):
         self.win.index.update = mock.Mock(return_value=summary)
         with mock.patch.object(ui, 'run_job', lambda fn, done=None, failed=None, progress=None, **k: jobs.append((fn, done, failed))), \
                 mock.patch.object(ui.ai.Embedder, 'from_settings', staticmethod(lambda s: None)), \
-                mock.patch.object(ui.ai.Vision, 'from_settings', staticmethod(lambda s: None)), \
                 mock.patch.object(ui.power, 'background_priority') as priority:
             self.win.start_index(**kwargs)
             fn, done, failed = jobs[0]

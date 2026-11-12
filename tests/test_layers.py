@@ -1,8 +1,8 @@
-"""Indexing in layers (M2): names first, text, meaning, OCR on worker threads, picture vectors, lazy captions,
+"""Indexing in layers (M2): names first, text, meaning, OCR on worker threads, picture vectors,
 background mode, the content cache and the upgrade of an older index.
 
 Run from the repository folder:  .venv\\Scripts\\python -m unittest discover -s tests -v
-No Ollama, GPU or real OCR: OCR, the embedder and the vision model are fakes.
+No Ollama, GPU or real OCR: OCR and the embedder are fakes.
 """
 import json
 import math
@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from alfred import extract, ocr, power  # noqa: E402
 from alfred.index import Index, connect  # noqa: E402
-from test_pipeline import Base, FakeEmbedder, FakeVision, make_docx, make_text_image  # noqa: E402
+from test_pipeline import Base, FakeEmbedder, make_docx, make_text_image  # noqa: E402
 
 
 class FakeOcr:
@@ -139,24 +139,24 @@ class LayerTests(Base):
         self.assertLess(order.index('indexing'), order.index('reading pictures'))
         self.assertEqual(phases[-1]['layers']['text'], [3, 3])
 
-    def test_picture_is_name_only_first_then_ocr_keeps_its_picture_vector_and_description(self):
-        self.settings.update(ocr_enabled=False, vision_mode='background')
+    def test_picture_is_name_only_first_then_ocr_keeps_its_picture_vector(self):
+        self.settings.update(ocr_enabled=False)
         path = self.folder / 'receipt.png'
         picture(path)
-        embedder, vision = PictureEmbedder(), FakeVision()
-        summary = self.index.update(embedder=embedder, vision=vision)
+        embedder = PictureEmbedder()
+        summary = self.index.update(embedder=embedder)
         self.assertEqual(summary['ocr_device'], 'off')
-        self.assertEqual(kinds(self.index, path), ['file', 'picture', 'vision'])
+        self.assertEqual(kinds(self.index, path), ['file', 'picture'])
         self.assertEqual(self.ocr.files, [])
         self.settings['ocr_enabled'] = True
-        summary = self.index.update(embedder=embedder, vision=vision)
+        summary = self.index.update(embedder=embedder)
         self.assertEqual(summary['ocr_read'], 1)
-        self.assertEqual(kinds(self.index, path), ['ocr', 'picture', 'vision'])
-        self.assertEqual((len(vision.calls), embedder.pictures), (1, 1))  # neither described nor embedded again
+        self.assertEqual(kinds(self.index, path), ['ocr', 'picture'])
+        self.assertEqual(embedder.pictures, 1)  # not embedded again
         self.assertEqual(self.index.search('Hyderabad invoice')[0]['kind'], 'ocr')
         self.settings['ocr_enabled'] = False  # off again: the OCR text leaves, the picture keeps its name
-        self.index.update(embedder=embedder, vision=vision)
-        self.assertEqual(kinds(self.index, path), ['file', 'picture', 'vision'])
+        self.index.update(embedder=embedder)
+        self.assertEqual(kinds(self.index, path), ['file', 'picture'])
 
     def test_ocr_result_for_a_file_that_changed_meanwhile_is_dropped(self):
         path = self.folder / 'receipt.png'
@@ -264,48 +264,6 @@ class PictureSearchTests(Base):
         self.assertEqual(extract.short_location('picture', {'visual': True}), 'picture')
 
 
-class SlowVision(FakeVision):
-    def describe(self, image):
-        time.sleep(0.3)
-        return super().describe(image)
-
-
-class CaptionTests(Base):
-    def setUp(self):
-        super().setUp()
-        self.settings.update(vision_enabled=True, ocr_enabled=False)
-        picture(self.folder / 'IMG_1234.jpg')
-        self.path = str(self.folder / 'IMG_1234.jpg')
-
-    def test_lazy_mode_describes_on_demand_once(self):
-        self.settings['vision_mode'] = 'lazy'
-        vision, embedder = SlowVision(), FakeEmbedder()
-        summary = self.index.update(embedder=embedder, vision=vision)
-        self.assertEqual((summary['described'], vision.calls), (0, []))
-        self.assertTrue(self.index.description_pending(self.path))
-        answers = []
-        threads = [threading.Thread(target=lambda: answers.append(self.index.describe_now(self.path, vision, embedder))) for _ in range(2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        self.assertEqual(len(vision.calls), 1)
-        self.assertEqual(len(answers), 2)
-        self.assertTrue(answers[0] and answers[0] == answers[1] and 'bench' in answers[0])
-        self.assertEqual(self.index.search('kid on a bench in autumn')[0]['location'], 'AI description')
-        con = connect(self.index.db_path)
-        embedded = con.execute("SELECT count(*) FROM vectors v JOIN segments s ON s.id = v.segment_id WHERE s.kind='vision'").fetchone()[0]
-        con.close()
-        self.assertEqual(embedded, 1)
-        self.assertEqual(self.index.describe_now(self.path, vision), answers[0])  # already described
-        self.assertEqual(len(vision.calls), 1)
-
-    def test_background_mode_describes_while_indexing(self):
-        self.settings['vision_mode'] = 'background'
-        vision = FakeVision()
-        self.assertEqual(self.index.update(vision=vision)['described'], 1)
-
-
 class BackgroundTests(Base):
     def setUp(self):
         super().setUp()
@@ -363,6 +321,57 @@ class UpgradeTests(Base):
         self.assertEqual((summary['ocr_read'], summary['embedded']), (0, 0))
         self.assertEqual(summary['pictures_embedded'], 1)
         self.assertEqual(kinds(index, self.folder / 'receipt.png'), ['ocr', 'picture'])
+
+    def test_old_ai_descriptions_are_removed_and_nothing_else_changes(self):
+        import sqlite3
+        FakeOcr({'receipt.png': 'Invoice total 4250 rupees delivered to Hyderabad'}).patch(self)
+        picture(self.folder / 'receipt.png')
+        (self.folder / 'notes.txt').write_text('harbour pilot schedule', encoding='utf-8')
+        embedder = PictureEmbedder('fake')
+        self.index.update(embedder=embedder)
+        self.index.close()
+
+        def snapshot(con):
+            return (sorted(con.execute('SELECT id, path, ord, kind, text, location FROM segments')),
+                    sorted(con.execute('SELECT segment_id, dim, vector FROM vectors')),
+                    sorted(con.execute('SELECT rowid, text, name FROM fts')))
+
+        def found(index):
+            return [(r['filename'], r['kind'], r['segment_id']) for r in index.search('receipt Hyderabad invoice', include_weak=True)]
+        con = sqlite3.connect(self.index.db_path)  # not connect(): that would upgrade the index
+        before = snapshot(con)
+        results = found(self.index)
+        self.index.close()
+        path = str(self.folder / 'receipt.png')
+        with con:  # what an index with an AI description looked like (schema version 2)
+            dim, vector = con.execute('SELECT dim, vector FROM vectors LIMIT 1').fetchone()
+            cursor = con.execute('INSERT INTO segments(path,ord,kind,text,location) VALUES(?,?,?,?,?)',
+                                 (path, -1, 'vision', 'A receipt on a desk in Hyderabad.\nTags: receipt, invoice',
+                                  json.dumps({'ai': True, 'model': 'gemma3:4b', 'caption': 'A receipt on a desk in Hyderabad.'})))
+            con.execute('INSERT INTO fts(rowid,text,name) VALUES(?,?,?)', (cursor.lastrowid, 'A receipt on a desk in Hyderabad', 'receipt'))
+            con.execute('INSERT INTO vectors VALUES(?,?,?)', (cursor.lastrowid, dim, vector))
+            con.execute('CREATE TABLE descriptions(path TEXT PRIMARY KEY, signature TEXT, status TEXT, error TEXT, seconds REAL, described_at REAL)')
+            con.execute('INSERT INTO descriptions VALUES(?,?,?,?,?,?)', (path, 'ollama:gemma3:4b:describe-v1', 'ok', '', 1.5, time.time()))
+            con.execute("INSERT OR REPLACE INTO meta VALUES('schema_version', '2')")
+        con.close()
+
+        self.index = index = Index(self.settings)  # opening the index upgrades it (tearDown closes it)
+        con = sqlite3.connect(self.index.db_path)
+        try:
+            self.assertEqual(snapshot(con), before)
+            self.assertIsNone(con.execute("SELECT name FROM sqlite_master WHERE name='descriptions'").fetchone())
+            self.assertEqual(con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], '3')
+        finally:
+            con.close()
+        self.assertEqual(found(index), results)
+        Index(self.settings).close()  # a second open changes nothing
+        con = sqlite3.connect(self.index.db_path)
+        try:
+            self.assertEqual(snapshot(con), before)
+        finally:
+            con.close()
+        summary = index.update(embedder=embedder)  # nothing is read or embedded again
+        self.assertEqual((summary['changed'], summary['ocr_read'], summary['embedded'], summary['pictures_embedded']), (0, 0, 0, 0))
 
 
 class DeferredPdfTests(Base):

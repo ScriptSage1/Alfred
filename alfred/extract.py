@@ -739,8 +739,6 @@ def location_label(kind, loc):
         if 'seconds' in loc:
             return f'picture at {clock(loc["seconds"])}'
         return f'page {loc["page"]} (picture)' if 'page' in loc else 'picture'
-    if kind == 'vision' or loc.get('ai'):
-        return 'AI description' + (f' at {clock(loc["seconds"])}' if 'seconds' in loc else '')
     ocr_note = ' (text read from image)' if loc.get('ocr') else ''
     if 'seconds' in loc:
         return f'at {clock(loc["seconds"])}{ocr_note}'
@@ -766,8 +764,6 @@ def short_location(kind, loc):
         if 'seconds' in loc:
             return f'picture at {clock(loc["seconds"])}'
         return f'p. {loc["page"]} (picture)' if 'page' in loc else 'picture'
-    if kind == 'vision' or loc.get('ai'):
-        return 'picture description' + (f' at {clock(loc["seconds"])}' if 'seconds' in loc else '')
     if 'seconds' in loc:
         return f'at {clock(loc["seconds"])}'
     if 'slide' in loc:

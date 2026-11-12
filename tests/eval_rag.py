@@ -94,11 +94,11 @@ def history_of(pairs):
 
 def prepare(home, samples):
     settings = config.load(home)
-    settings.update(tracked_folders=[str(samples)], embed_enabled=True, vision_enabled=True)
+    settings.update(tracked_folders=[str(samples)], embed_enabled=True)
     settings.save()
     index = Index(settings)
     embedder = ai.Embedder.from_settings(settings)
-    summary = index.update(embedder=embedder, vision=ai.Vision.from_settings(settings))
+    summary = index.update(embedder=embedder)
     print(f"Index: {index.status()['files']} files, {index.status()['segments']} passages ({summary['seconds']} s)")
     return settings, index, embedder
 

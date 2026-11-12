@@ -101,7 +101,7 @@ def completer(settings, provider):
     model = provider.model if provider.kind == 'ollama' else None
     if model is None and ai.is_local_url(base) and ai.ollama_running(base, 0.5):
         installed = {m['model'] for m in ai.available_models(settings)}
-        model = next((m for m in (settings.get('vision_model'), settings.get('context_model')) if m and m.removesuffix(':latest') in installed),
+        model = next((m for m in (ai.DEFAULT_CONTEXT_MODEL, settings.get('context_model')) if m and m.removesuffix(':latest') in installed),
                      None) or next(iter(sorted(installed)), None)
     if model:
         def complete(messages, cancel=None):

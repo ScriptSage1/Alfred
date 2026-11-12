@@ -91,7 +91,6 @@ QLabel#badge {{ background: {fs}; border-radius: 7px; padding: 1px 7px; color: {
 QLabel#bubble {{ background: {rgba(p['accent'], .20)}; border-radius: 14px; padding: 8px 13px; font-size: 10.5pt; }}
 QPushButton#pill {{ background: {f}; border: 1px solid {sep}; border-radius: 14px; padding: 5px 13px; }}
 QPushButton#pill:hover {{ background: {fs}; }}
-QLabel#tag {{ background: {fs}; border-radius: 9px; padding: 2px 9px; color: {s}; font-size: 9pt; }}
 QPushButton#source {{ background: {f}; border: 1px solid {sep}; border-radius: 9px; padding: 6px 10px; text-align: left; }}
 QPushButton#source:hover {{ background: {fs}; }}
 QPushButton#source[used="false"] {{ color: {s}; }}

@@ -33,7 +33,7 @@ DEFAULTS = {
     'rerank_enabled': True,      # reorder candidate passages with the local reranker once it's downloaded
     'rerank_model': 'bge-reranker-v2-m3',
     'contextual_chunks': False,  # a local model writes a line of context for every passage while indexing (slow, better recall)
-    'context_model': '',         # empty = the vision model (gemma3:4b)
+    'context_model': '',         # empty = gemma3:4b (alfred.ai.DEFAULT_CONTEXT_MODEL)
     # Chat history: one JSON file per chat. Empty folder = %LOCALAPPDATA%\Alfred\Chats.
     'save_chat_history': True,
     'chats_folder': '',
@@ -50,12 +50,6 @@ DEFAULTS = {
     'video_interval': 10,        # seconds between sampled video frames
     # Pictures, video keyframes and scanned PDF pages are found by what they show (the embedding model's picture vectors).
     'picture_search': True,
-    # Captions, descriptions and tags for pictures (and one frame per video) from a local Ollama vision model.
-    'vision_enabled': True,
-    'vision_model': 'gemma3:4b',
-    'vision_base_url': '',       # empty = the same Ollama as embeddings
-    'vision_device': 'auto',
-    'vision_mode': 'auto',       # 'auto' | 'lazy' (describe a picture when it is previewed) | 'background' (while indexing)
     # Indexing
     'index_threads': 0,          # CPU threads indexing may use; 0 = all but two (a quarter in the background)
     'index_on_battery': False,   # background indexing past the text layer also runs on battery
