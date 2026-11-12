@@ -361,6 +361,9 @@ class Evidence:
                 self.times.add(value['key'])
             elif value['type'] == 'number':
                 self.numbers.append(value)
+        for word in set(self.words) & set(NUMBER_WORDS):  # a source that says 'three rooms' holds the number 3
+            number = Decimal(NUMBER_WORDS[word])
+            self.numbers.append({'text': word, 'value': number, 'alts': {number}, 'suffix': None, 'scaled': None})
         self.name_words = set(_index._words(f'{name} {label}'))
         self.sentences = []  # per part: [{'text', 'flat', 'words'}]
         for part_text, _ in (parts or [(text or '', None)]):
@@ -646,22 +649,33 @@ def check(answer, sources, question='', reranker=None, not_found=NOT_FOUND):
 def _value_cover(claim):
     """For a claim with values found somewhere: the sources to cite (cited ones holding a value first, then the fewest
     others that hold the rest). None when the claim has no value found in any source."""
-    values, found = claim['values'], claim['found']
+    values, found, scores = claim['values'], claim['found'], claim['scores']
     if not values or not any(any(found[n]) for n in found):
         return None
     cited = [n for n in claim['unit']['final'] if n in found]
     keep = [n for n in cited if any(found[n])]
     covered = {i for n in keep for i, status in enumerate(found[n]) if status}
     others = [n for n in found if n not in keep]
+
+    def holds(n, i):  # a source the claim does not cite is added for a weak value only if its words also support the claim
+        return bool(found[n][i]) and (not _weak(values[i]) or scores[n][1])
     while True:
-        missing = {i for i, _ in enumerate(values) if i not in covered and any(found[n][i] for n in found)}
+        missing = {i for i, _ in enumerate(values) if i not in covered and any(holds(n, i) for n in others)}
         if not missing:
             break
-        best = max(others, key=lambda n: (len({i for i in missing if found[n][i]}), -others.index(n)))
+        best = max(others, key=lambda n: (len({i for i in missing if holds(n, i)}), -others.index(n)))
         keep.append(best)
         others.remove(best)
         covered |= {i for i, status in enumerate(found[best]) if status}
-    return keep
+    return keep or None
+
+
+def _weak(value):
+    """A small whole number or a bare year: in too many passages to place a citation on its own ('3', '2027')."""
+    if value['type'] != 'number' or value.get('form') != 'number' or value.get('suffix') or not value['text'][:1].isdigit():
+        return False
+    number = value['value']
+    return number == number.to_integral_value() and (number < 100 or 1900 <= number <= 2100)
 
 
 def _decide(claim, numbers):
@@ -686,7 +700,7 @@ def _decide(claim, numbers):
     unit['final'] = final
     unit['moves'] = _moves(cited, final)
     for i, value in enumerate(claim['values']):
-        holders = [n for n in final if claim['found'][n][i]] or [n for n in numbers if claim['found'][n][i]]
+        holders = [n for n in final if claim['found'][n][i]]  # a value only in a source the claim does not cite is missing
         status = claim['found'][holders[0]][i] if holders else 'missing'
         unit['values'].append({'text': value['text'], 'type': value['type'], 'status': status, 'source': holders[0] if holders else None})
     if any(v['status'] == 'missing' for v in unit['values']):

@@ -217,6 +217,28 @@ class RerankerTests(unittest.TestCase):
         self.assertEqual([c['number'] for c in checked.cited], [3])
 
 
+class WeakValueTests(unittest.TestCase):
+    FLAT = {1: source('The flat on Elm Street has three bedrooms and a garden.', 'flat.txt'),
+            2: source('Invoice 3 of the roofing job is unpaid.', 'roof.txt')}
+
+    def test_a_number_word_in_the_source_holds_the_digit(self):
+        checked = proof.check('The flat has 3 bedrooms [1].', self.FLAT, 'How many bedrooms?')
+        self.assertEqual([c['number'] for c in checked.cited], [1])
+        self.assertEqual(checked.flags, [])
+
+    def test_a_small_number_alone_does_not_move_a_citation(self):
+        sources = {1: source('The flat on Elm Street has several bedrooms and a garden.', 'flat.txt'), 2: self.FLAT[2]}
+        checked = proof.check('The flat has 3 bedrooms and a garden [1].', sources, 'How many bedrooms?')
+        self.assertEqual([c['number'] for c in checked.cited], [1])  # kept by its words; not moved to the invoice for its '3'
+        self.assertEqual(checked.flags[0]['reasons'], ['value_not_in_sources'])
+        self.assertEqual(checked.flags[0]['values'], ['3'])
+
+    def test_a_strong_value_still_moves_it(self):
+        sources = {1: self.FLAT[1], 2: source('sensor,reading\nTMP-88231,24.2', 'readings.csv')}
+        checked = proof.check('The sensor read 24.2 [1].', sources, 'What did the sensor read?')
+        self.assertEqual([c['number'] for c in checked.cited], [2])
+
+
 class SpeedTests(unittest.TestCase):
     def test_ten_sentences_eight_sources_well_under_300_ms(self):
         prose = ' '.join(f'Item {n} of the plan costs ${n * 37},00{n % 10} and ships on 2026-0{1 + n % 9}-1{n % 10}.' for n in range(60))
