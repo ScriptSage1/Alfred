@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconPr
                                QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
                                QSystemTrayIcon, QTextBrowser, QToolTip, QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, ai, chats, config, keys, opener, paths, picker, providers, rag, render, rerank, startup
+from . import APP_NAME, __version__, ai, chats, config, keys, opener, paths, picker, power, providers, rag, render, rerank, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
 from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, app_icon, blurred_backdrop, brand_pixmap, dot_pixmap, fallback_backdrop, icon,
@@ -44,6 +44,53 @@ PENDING_REUSE_SECONDS = 5
 KIND_FILTERS = [('documents', 'Documents'), ('pdfs', 'PDFs'), ('slides', 'Slides'), ('spreadsheets', 'Sheets'), ('images', 'Images'),
                 ('videos', 'Videos'), ('text', 'Text & data')]
 DATE_FILTERS = [('Any time', 0), ('Past week', 7), ('Past month', 30), ('Past year', 365)]
+LAYERS = ('names', 'text', 'meaning', 'pictures')  # the index's layers, in the order they become searchable
+PHASE_LABELS = {'scanning': 'Looking for files', 'names': 'Listing files', 'indexing': 'Reading', 'embedding': 'Learning meaning',
+                'reading pictures': 'Reading pictures', 'embedding pictures': 'Learning pictures', 'reading video': 'Reading video',
+                'describing': 'Describing pictures', 'reading tables': 'Reading tables', 'adding context': 'Adding context',
+                'done': 'Finishing'}
+BATTERY_TEXT = 'Paused on battery — names and text are searchable'
+
+
+def phase_label(phase):
+    return PHASE_LABELS.get(phase, phase or 'Indexing')
+
+
+def layer_done(pair):
+    """True when a [done, total] pair is complete (an empty layer has nothing left to do)."""
+    done, total = pair
+    return total <= 0 or done >= total
+
+
+def layer_percent(pair):
+    """Whole percent of a [done, total] pair, rounded down: 100 only when the layer is truly complete."""
+    done, total = pair
+    return 100 if layer_done(pair) else max(0, min(99, int(done * 100 // total)))
+
+
+def layers_text(layers, unfinished_only=False):
+    """'names ✓ · text ✓ · meaning 62% · pictures 10%' from {'names': [done, total], ...}; '' when unknown.
+    ``unfinished_only`` leaves the finished layers out ('meaning 62% · pictures 10%'), for the narrow status line."""
+    parts = [f"{name} {'✓' if layer_done(layers[name]) else str(layer_percent(layers[name])) + '%'}" for name in LAYERS
+             if layers and name in layers and not (unfinished_only and layer_done(layers[name]))]
+    return ' · '.join(parts)
+
+
+def layers_incomplete(layers):
+    return any(not layer_done(layers[name]) for name in LAYERS if layers and name in layers)
+
+
+def layers_notice(layers):
+    """The quiet line under the search box while indexing is unfinished; '' when every layer is complete."""
+    for name in LAYERS:
+        if layers and name in layers and not layer_done(layers[name]):
+            return f'Still indexing — {name} {layer_percent(layers[name])}%. Results may be incomplete.'
+    return ''
+
+
+def result_subtitle(result):
+    """A result row's second line: where it sits, then the matching text (picture hits have none)."""
+    return ' — '.join(part for part in (result.get('location'), (result.get('snippet') or '').strip()) if part)
 GROUPS = [('PDF Documents', {'pdf'}), ('Presentations', {'pptx'}), ('Spreadsheets', {'xlsx', 'csv'}),
           ('Images', {s.lstrip('.') for s in IMAGE_SUFFIXES}), ('Videos', {s.lstrip('.') for s in VIDEO_SUFFIXES})]
 
@@ -714,6 +761,10 @@ class SearchView(QWidget):
         bar.addWidget(self.age_chip)
         self.filters.hide()
         outer.addWidget(self.filters)
+        self.notice = label('', 'caption')  # "Still indexing — …": quiet, only while a layer is unfinished
+        self.notice.setContentsMargins(18, 0, 16, 6)
+        self.notice.hide()
+        outer.addWidget(self.notice)
         self.stack = QStackedWidget()
         outer.addWidget(self.stack, 1)
         self.empty = EmptyState(win)
@@ -835,8 +886,15 @@ class SearchView(QWidget):
     def wants_expanded(self):
         return len(self.query) >= 2 or self.win.problem_state() is not None
 
+    def update_notice(self):
+        text = layers_notice(self.win.layers) if len(self.query) >= 2 else ''
+        if text != self.notice.text():
+            self.notice.setText(text)
+        self.notice.setVisible(bool(text))
+
     def set_query(self, text):
         self.query = text.strip()
+        self.update_notice()
         self.filters.setVisible(len(self.query) >= 2)
         if len(self.query) < 2:
             self.generation += 1
@@ -934,7 +992,7 @@ class SearchView(QWidget):
         def row(result):
             return ('row', dict(result, kind_row='file', muted=bool(result.get('weak')), title=result['filename'], pixmap=FileIcons.get(result['path']),
                                 rounded=Path(result['path']).suffix.lower() in IMAGE_SUFFIXES,
-                                subtitle=f"{result['location']} — {result['snippet']}", right=result.get('folder', '')))
+                                subtitle=result_subtitle(result), right=result.get('folder', '')))
         shown_strong = [r for r in results if not r.get('weak')]
         shown_weak = [r for r in results if r.get('weak')]
         if shown_strong:
@@ -1002,7 +1060,7 @@ class SearchView(QWidget):
         self.set_title(item['filename'])
         size = item.get('size') or 0
         nice = f'{size / 1024:.0f} KB' if size >= 1024 else f'{size} bytes'
-        self.p_meta.setText(f"{item['file_type'].upper()} · {nice} · {item['location']} · modified {item['modified']}")
+        self.p_meta.setText(' · '.join(part for part in (item['file_type'].upper(), nice, item['location'], f"modified {item['modified']}") if part))
         if Path(item['path']).suffix.lower() in IMAGE_SUFFIXES and absolute.is_file():
             pixmap = QPixmap(str(absolute))
             if not pixmap.isNull():
@@ -1037,6 +1095,8 @@ class SearchView(QWidget):
 
     def load_details(self, item, media, picture, attempt=0):
         query, index = self.query, self.win.index
+        if media and attempt == 0:  # a caption not written yet is written now, for the picture being looked at
+            self.win.lazy_caption(item['path'], lambda: self.list.item() is item and self.load_details(item, media, picture, 1))
 
         def show(ex):
             if self.list.item() is not item:
@@ -2466,6 +2526,8 @@ class TrackedFolders(QWidget):
                     row.set_status(f"Reading video {state.get('frame', 0)}/{state.get('frames', 0)}", 'accent')
                 elif phase == 'reading tables':
                     row.set_status(f"Reading tables in PDFs {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
+                elif phase in ('names', 'reading pictures', 'embedding pictures', 'adding context'):
+                    row.set_status(f"{phase_label(phase)} {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
                 else:
                     row.set_status(f"Indexing {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
             elif self.win.indexing and key not in stats:
@@ -2475,10 +2537,17 @@ class TrackedFolders(QWidget):
                 row.set_status(text + ' · up to date' if self.win.status.get('initialized') else text, 'green' if info['files'] else 'secondary')
         if self.win.indexing:
             phase = (state or {}).get('phase')
-            text = f"Learning meaning {state.get('done', 0)}/{state.get('total', 0)}" if phase == 'embedding' else 'Indexing…'
-            self.summary.setText(f"<span style='color:{self.win.pal['accent'].name()}'>●</span>&nbsp; {text}")
+            text = (f"{phase_label(phase)} {state.get('done', 0)}/{state.get('total', 0)}"
+                    if phase in ('embedding', 'names', 'reading pictures', 'embedding pictures', 'adding context') else 'Indexing…')
+            layers = layers_text(self.win.layers)
+            self.summary.setText(f"<span style='color:{self.win.pal['accent'].name()}'>●</span>&nbsp; {text}" + (f' · {layers}' if layers else ''))
         else:
-            self.summary.setText(f'{total:,} searchable file{"s" * (total != 1)}' if folders else '')
+            text = f'{total:,} searchable file{"s" * (total != 1)}' if folders else ''
+            if folders and self.win.paused == 'battery':
+                text += ' · ' + BATTERY_TEXT
+            elif folders and layers_incomplete(self.win.layers):
+                text += ' · ' + layers_text(self.win.layers)
+            self.summary.setText(text)
 
     # ------------------------------------------------------------- motion
     def set_open(self, on):
@@ -3272,6 +3341,10 @@ class AlfredWindow(QWidget):
         self.indexing, self.progress, self.mode, self.hiding = False, None, SEARCH, False
         self.active_hotkey = ''
         self.tray, self.reindex_pending = None, False
+        self.layers, self.layers_loading = None, False  # {'names': [done, total], ...}: live while indexing, else from the database
+        self.index_background, self.priority_low, self.paused = False, False, None
+        self.captioning = set()  # paths whose caption is being written right now
+        self.battery_timer = QTimer(self, interval=60000, timeout=self.battery_tick)
         self.hotkey, self.open_action = None, None
         self.warming = False
         self.watcher = FolderWatcher(parent=self)
@@ -3665,6 +3738,29 @@ class AlfredWindow(QWidget):
             QTimer.singleShot(160, self.maybe_hide)
         return super().event(event)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.sync_priority()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.sync_priority()
+
+    def sync_priority(self):
+        """The one rule for process priority: below normal only while an automatic run goes on with the window hidden."""
+        low = bool(self.indexing and self.index_background and not self.isVisible())
+        if low != self.priority_low:
+            self.priority_low = low
+            power.background_priority(low)
+
+    def battery_tick(self):
+        """Once a minute while a run is paused on battery: when mains power returns, carry on in the background."""
+        if power.on_battery():
+            return
+        self.battery_timer.stop()
+        self.paused = None
+        self.start_index(quiet=True, auto=True)
+
     def maybe_hide(self):
         if QApplication.activeWindow() is None and QApplication.activeModalWidget() is None and not self.hiding:
             self.hide_panel()
@@ -3776,7 +3872,57 @@ class AlfredWindow(QWidget):
         elif self.tray is not None:
             self.tray.showMessage('Alfred', text, app_icon(), 5000)
 
+    def load_layers(self):
+        """Read the layer progress from the database off the UI thread (never while a run reports it live)."""
+        if self.indexing or self.layers_loading:
+            return
+        self.layers_loading = True
+        index = self.index
+
+        def done(layers):
+            self.layers_loading = False
+            if not self.indexing:
+                self.set_layers(layers)
+
+        run_job(lambda s: index.layer_status(), done, lambda error: setattr(self, 'layers_loading', False))
+
+    def set_layers(self, layers):
+        self.layers = layers
+        self.search_view.update_notice()
+
+    def lazy_caption(self, path, done=None):
+        """Write the caption of the picture or video being previewed, if it has none yet. One job per path at a time;
+        failures are only logged. ``done`` runs when a caption was written."""
+        path = str(path)
+        if not self.settings.get('vision_enabled') or path in self.captioning:
+            return False
+        self.captioning.add(path)
+        index, settings = self.index, self.settings
+
+        def work(signals):
+            if not index.description_pending(path):
+                return None
+            vision = ai.Vision.from_settings(settings)
+            if vision is None or not ai.ollama_running(vision.base, 1.5):
+                return None
+            embedder = ai.Embedder.from_settings(settings)
+            if embedder is not None and not ai.ollama_running(embedder.base, 1.5):
+                embedder = None
+            return index.describe_now(path, vision, embedder)
+
+        def finished(result):
+            self.captioning.discard(path)
+            if result and done:
+                done()
+
+        def failed(error):
+            self.captioning.discard(path)
+            logging.getLogger('alfred').info('Caption for %s not written: %s', path, error)
+        run_job(work, finished, failed)
+        return True
+
     def refresh_status(self):
+        self.load_layers()
         self.status = self.index.status()
         self.folder_stats = self.index.folder_stats()
         if not self.toasting:
@@ -3792,6 +3938,8 @@ class AlfredWindow(QWidget):
         dot = lambda color: f"<span style='color:{pal[color].name()}'>●</span>&nbsp; "
         if self.indexing:
             return dot('accent') + 'Indexing…'
+        if self.paused == 'battery' and st['files']:
+            return dot('orange') + BATTERY_TEXT
         if not st['folders']:
             return dot('orange') + 'No folders tracked yet'
         if not st['root_exists']:
@@ -3827,7 +3975,9 @@ class AlfredWindow(QWidget):
         self.update_hints()
         fade_in(self.status_label)
 
-    def start_index(self, force=False, quiet=False, auto=False, roots=None):
+    def start_index(self, force=False, quiet=False, auto=False, roots=None, background=None):
+        """``background``: an automatic run (smaller thread budget, names and text only on battery, low priority while
+        hidden); by default the same as ``auto``. Index now / Rescan / adding a folder run in the foreground."""
         if self.indexing:
             self.reindex_pending = True  # picked up right after the current run
             return
@@ -3835,7 +3985,12 @@ class AlfredWindow(QWidget):
             if not quiet:
                 self.toast('Track a folder first', 'orange', ('Track folder…', self.choose_folder))
             return
+        background = auto if background is None else bool(background)
+        self.battery_timer.stop()
+        self.paused = None
         self.indexing, self.progress, self.live_refresh = True, None, time.monotonic()
+        self.index_background = background
+        self.sync_priority()
         self.shimmer.start()
         self.status_label.setText(self.status_text())
         index, settings = self.index, self.settings
@@ -3844,13 +3999,18 @@ class AlfredWindow(QWidget):
         def progress(state):
             total, done = state.get('total', 0), state.get('done', 0)
             self.progress = done / total if total else None
-            phase = {'scanning': 'Looking for files', 'indexing': 'Reading', 'embedding': 'Learning meaning', 'reading video': 'Reading video',
-                     'describing': 'Describing pictures', 'reading tables': 'Reading tables',
-                     'done': 'Finishing'}.get(state.get('phase'), state.get('phase'))
+            phase = phase_label(state.get('phase'))
+            if state.get('layers'):
+                before = layers_notice(self.layers)
+                self.layers = state['layers']
+                if layers_notice(self.layers) != before:
+                    self.search_view.update_notice()
             if not self.toasting:
                 where = f" · {html.escape(Path(state['current']).name)}" if state.get('current') else ''
                 count = f' {done}/{total}' if total else ''
-                self.status_label.setText(f"<span style='color:{self.pal['accent'].name()}'>●</span>&nbsp; {phase}{count}{where}")
+                layers = layers_text(self.layers, unfinished_only=True)  # the line is narrow: unfinished layers, or the file name
+                self.status_label.setText(f"<span style='color:{self.pal['accent'].name()}'>●</span>&nbsp; {phase}{count}"
+                                          + (f' · {layers}' if layers else where))
             now = time.monotonic()
             if now - self.live_refresh > 2:  # files become searchable as they are read: keep counts live
                 self.live_refresh = now
@@ -3863,6 +4023,10 @@ class AlfredWindow(QWidget):
 
         def done(summary):
             self.indexing = False
+            self.sync_priority()
+            self.paused = summary.get('paused')
+            if self.paused == 'battery':
+                self.battery_timer.start()
             self.shimmer.stop()
             logging.getLogger('alfred').info('Indexed: %s', {k: summary.get(k) for k in ('found', 'indexed', 'removed', 'errors', 'unsupported',
                                                                                         'embedded', 'described', 'seconds', 'warnings')})
@@ -3887,6 +4051,7 @@ class AlfredWindow(QWidget):
 
         def failed(error):
             self.indexing = False
+            self.sync_priority()
             self.shimmer.stop()
             self.refresh_status()
             if not isinstance(error, IndexBusy):
@@ -3906,7 +4071,7 @@ class AlfredWindow(QWidget):
             vision = ai.Vision.from_settings(settings)
             if vision is not None and not ai.ollama_running(vision.base, 1.5):
                 vision = None  # described on a later run, once Ollama is up
-            return index.update(signals.progress.emit, embedder, force=force, roots=roots, vision=vision)
+            return index.update(signals.progress.emit, embedder, force=force, roots=roots, vision=vision, background=background)
         run_job(work, done, failed, progress=progress)
 
     def after_index(self):
@@ -4113,7 +4278,7 @@ def run():
         QTimer.singleShot(startup.TASK_DELAY_MS, lambda: startup.run_tasks(window))
     else:
         window.show_panel()
-        QTimer.singleShot(700, lambda: window.start_index(quiet=True))
+        QTimer.singleShot(700, lambda: window.start_index(quiet=True, background=True))
     if window.active_hotkey:
         tray.showMessage('Alfred is ready' if at_sign_in else 'Alfred is running',
                          f'Press {window.active_hotkey} anywhere to open Alfred. Esc hides it.', app_icon(), 4000)
