@@ -1593,6 +1593,16 @@ class Index:
         ordered = self._fuse(keyword, semantic, phrases, profile.semantic_weight if mode == 'hybrid' else 1.0)
         rows = self._rows(con, [segment_id for segment_id, _ in ordered],
                           's.path, s.kind, s.text, s.location, f.size, f.mtime_ns, x.text, x.name')
+        picture_floor = getattr(embedder, 'confident_picture_similarity', None)
+        if mode == 'hybrid' and picture_floor is not None:
+            # A picture has no words, so it can never be in the keyword list and would always rank below a passage
+            # that is in both lists, however weakly. A confident picture match counts for both.
+            lifted = [info for segment_id, info in ordered if segment_id in rows and rows[segment_id][1] == 'picture'
+                      and info.get('semantic_score', 0.0) >= picture_floor]
+            for info in lifted:
+                info['score'] *= 2
+            if lifted:
+                ordered.sort(key=lambda item: -item[1]['score'])
         tokens = _tokens(query)
         target = paths.canonical(path) if path else None
 

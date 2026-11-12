@@ -235,6 +235,18 @@ class PictureSearchTests(Base):
         [hit] = self.index.search('sunset over the harbour', embedder=weak, include_weak=True)
         self.assertEqual((hit['kind'], hit['weak']), ('picture', True))
 
+    def test_confident_picture_is_not_outranked_for_having_no_words(self):
+        (self.folder / 'notes.txt').write_text('sunset over the harbour', encoding='utf-8')  # keyword list only
+        strong = Angle(0.75)
+        self.index.update(embedder=strong)
+        hits = self.index.search('sunset over the harbour', embedder=strong)
+        self.assertEqual([hit['kind'] for hit in hits], ['picture', 'text'])  # the picture is only in the meaning list
+        self.assertGreater(hits[0]['score'], hits[1]['score'])
+        weak = Angle(0.70)  # below the picture floor: no lift, and it is a weaker match
+        self.index._query_cache.clear()
+        hits = self.index.search('sunset over the harbour', embedder=weak, include_weak=True)
+        self.assertEqual([(hit['kind'], hit.get('weak', False)) for hit in hits], [('text', False), ('picture', True)])
+
     def test_layer_status_counts_pictures(self):
         self.settings['embed_enabled'] = True
         embedder = Angle(0.75)
