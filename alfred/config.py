@@ -40,6 +40,7 @@ DEFAULTS = {
     'embed_device': 'auto',      # the indexing device: 'auto' (the GPU once its check passed) | 'cpu'
     'search_on_gpu': False,      # search runs on the CPU (--device none -ngl 0 -t 4) unless this is on
     'embed_batch': 16,
+    'model_download_asked': False,  # the first-run question "Download the search model and engine?" was answered
     # Text in images, scanned PDF pages and video frames, read by a local OCR model.
     'ocr_enabled': True,
     'ocr_device': 'auto',        # 'auto' (DirectML on a discrete GPU, else CPU) | 'gpu' | 'cpu'

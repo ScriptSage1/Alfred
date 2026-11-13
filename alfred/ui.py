@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconPr
                                QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
                                QSystemTrayIcon, QTextBrowser, QToolTip, QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, ai, chats, config, keys, mcp_server, opener, paths, picker, power, providers, rag, render, rerank, startup
+from . import APP_NAME, __version__, ai, chats, config, keys, mcp_server, models, opener, paths, picker, power, providers, rag, render, rerank, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
 from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, app_icon, blurred_backdrop, brand_pixmap, dot_pixmap, fallback_backdrop, icon,
@@ -2537,6 +2537,67 @@ class TrackedFolders(QWidget):
         row.fade_out(gone)
 
 
+# Settings rows for the files Alfred runs locally: key -> (row title, name in a sentence, caption).
+DOWNLOAD_ROWS = {'embed-text': ('Search model', 'the search model', 'EmbeddingGemma 2: search by meaning'),
+                 'embed-pictures': ('Picture part', 'the picture part', 'EmbeddingGemma 2: find pictures by what they show'),
+                 models.ENGINE: ('Engine', 'the engine', 'llama.cpp: runs the models on this PC'),
+                 'answer': ('Answer model', 'the answer model', 'gemma3:4b: answers on this PC')}
+
+
+class ModelDownloads(QObject):
+    """Downloads of the model files and the engine, each on a worker thread (run_job); one at a time per file."""
+    changed = Signal(str)           # a download of this key started, moved on or ended
+    finished = Signal(str, object)  # key, the error (None when the file is in place)
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.jobs, self.progress = {}, {}  # key -> cancel Event; key -> (bytes done, total)
+
+    def running(self, key):
+        return key in self.jobs
+
+    def start(self, key):
+        if key in self.jobs:
+            return
+        cancel = threading.Event()
+        self.jobs[key] = cancel
+        self.progress[key] = (0, models.size_of(key))
+        home = self.win.settings.home
+        self.changed.emit(key)
+
+        def work(signals):
+            report = lambda done, total: signals.progress.emit((done, total))
+            if key == models.ENGINE:
+                return models.download_engine(home, report, cancel)
+            return models.download(key, home, report, cancel)
+
+        def moved(value):
+            if key in self.progress:
+                self.progress[key] = value
+                self.changed.emit(key)
+
+        def ended(error=None):
+            self.jobs.pop(key, None)
+            self.progress.pop(key, None)
+            self.changed.emit(key)
+            self.finished.emit(key, error)
+        run_job(work, lambda _: ended(), ended, progress=moved)
+
+    def cancel(self, key):
+        if key in self.jobs:
+            self.jobs[key].set()
+
+    def status_text(self):
+        """One short line for the status bar (about 60 characters fit), or None when nothing downloads."""
+        if not self.progress:
+            return None
+        done = sum(value[0] for value in self.progress.values())
+        total = sum(value[1] for value in self.progress.values())
+        what = DOWNLOAD_ROWS[next(iter(self.progress))][1] if len(self.progress) == 1 else f'{len(self.progress)} files'
+        return f'Downloading {what}… {done / 1e6:,.0f} of {total / 1e6:,.0f} MB'
+
+
 class SettingsView(QWidget):
     def __init__(self, win):
         super().__init__()
@@ -2565,10 +2626,10 @@ class SettingsView(QWidget):
         self.model = picker.ModelButton(win, compact=False)
         self.model.setMinimumWidth(300)
         self.model.clicked.connect(lambda: self.win.ask_view.show_model_menu(self.model))
-        models = QHBoxLayout()
-        models.addWidget(self.model)
-        models.addWidget(button('', self.refresh_models, None, 'Check accounts and refresh the model list', icon('refresh', 14, QColor(140, 140, 150))))
-        g.row('Chat model', models, 'Also in the model button at the top of Ask Alfred')
+        chat_row = QHBoxLayout()
+        chat_row.addWidget(self.model)
+        chat_row.addWidget(button('', self.refresh_models, None, 'Check accounts and refresh the model list', icon('refresh', 14, QColor(140, 140, 150))))
+        g.row('Chat model', chat_row, 'Also in the model button at the top of Ask Alfred')
         self.effort = QComboBox()
         self.effort.setMinimumWidth(300)
         self.effort_note = label('', 'caption', wrap=True)
@@ -2626,6 +2687,17 @@ class SettingsView(QWidget):
 
         g = Group(win, 'ON THIS PC', 'Alfred runs its local models itself (llama.cpp): the answer model when you choose it, plus the '
                                      'search model (which also reads pictures). Nothing runs until it is needed.')
+        self.file_status, self.file_button, self.file_states = {}, {}, {}
+        for key, (title, _, caption) in DOWNLOAD_ROWS.items():
+            self.file_status[key] = label('Checking…', 'caption')
+            self.file_button[key] = button('Download…', lambda _=False, k=key: self.file_action(k))
+            self.file_button[key].hide()
+            line = QHBoxLayout()
+            line.addWidget(self.file_status[key])
+            line.addWidget(self.file_button[key])
+            g.row(title, line, caption)
+        win.downloads.changed.connect(self.show_file)
+        win.downloads.finished.connect(self.file_finished)
         self.device = QComboBox()
         self.device.addItems(['Auto (GPU when available)', 'CPU only'])
         self.device.setMinimumWidth(260)
@@ -2771,6 +2843,7 @@ class SettingsView(QWidget):
         for widget in self.findChildren(QWidget):
             widget.blockSignals(False)
         self.show_rerank()
+        self.load_files()
         self.load_models()
         self.load_effort()
         self.show_chats_info()
@@ -2930,6 +3003,82 @@ class SettingsView(QWidget):
                 run_job(lambda s: rerank.for_settings(dict(self.win.settings)) and None)
         run_job(lambda s: rerank.download(name, lambda d, t: s.progress.emit((d, t)), cancel, gpu=True), lambda r: finished(r),
                 lambda e: finished(error=e), progress=progress)
+
+    def load_files(self):
+        """Where each model file and the engine are (finding Ollama's copy may hash it once: in the background)."""
+        home = self.win.settings.home
+
+        def shown(states):
+            self.file_states.update(states)
+            for key in DOWNLOAD_ROWS:
+                self.show_file(key)
+        run_job(lambda s: {key: models.state(key, home) for key in DOWNLOAD_ROWS}, shown,
+                lambda error: logging.getLogger('alfred').warning('Model files: %s', error))
+
+    def show_file(self, key):
+        status, action = self.file_status[key], self.file_button[key]
+        downloads = self.win.downloads
+        if downloads.running(key):
+            done, total = downloads.progress.get(key, (0, models.size_of(key)))
+            status.setText(f'Downloading… {done / 1e6:,.0f} of {total / 1e6:,.0f} MB')
+            action.setText('Cancel')
+            action.show()
+            return
+        state = self.file_states.get(key)
+        if state is None:
+            status.setText('Checking…')
+            action.hide()
+            return
+        size = f"{state['size'] / 1e6:,.0f} MB"
+        where = state['where']
+        if where == 'alfred':
+            status.setText(f'Alfred’s copy · {size}')
+            action.setText('Remove…')
+        elif where == 'ollama':
+            status.setText(f'Using Ollama’s copy · {size}')
+        elif where == 'external':
+            status.setText('Using the copy in ALFRED_LLAMA_DIR' if key == models.ENGINE else f'Using the copy in ALFRED_MODELS_DIR · {size}')
+        elif where == 'included':
+            status.setText('Came with Alfred')
+        elif not state['downloadable']:
+            status.setText('Not downloaded · no download offered')
+        else:
+            part = f" · {state['part'] / 1e6:,.0f} MB so far" if state['part'] else ''
+            status.setText(f'Not downloaded · {size}{part}')
+            action.setText('Download…')
+        action.setVisible(where == 'alfred' or (where == 'missing' and state['downloadable']))
+
+    def file_action(self, key):
+        downloads = self.win.downloads
+        if downloads.running(key):
+            downloads.cancel(key)
+            return
+        state = self.file_states.get(key)
+        if state is None:
+            return
+        name = DOWNLOAD_ROWS[key][1]
+        home = self.win.settings.home
+        if state['where'] == 'alfred':
+            answer = ask_box(self, f'Remove {name}?', f"Delete Alfred’s copy of {state['label']} ({state['size'] / 1e6:,.0f} MB) from this PC? "
+                             'What needs it stops until you download it again.', QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if answer == QMessageBox.Yes:
+                remove = (lambda: models.remove_engine(home)) if key == models.ENGINE else (lambda: models.remove(key, home))
+                run_job(lambda s: remove(), lambda _: self.load_files(),
+                        lambda error: (self.load_files(), self.win.toast(str(error), 'red', seconds=8)))
+            return
+        if state['where'] != 'missing' or not state['downloadable']:
+            return
+        left = state['size'] - state['part']
+        so_far = f" ({state['part'] / 1e6:,.0f} MB already downloaded)" if state['part'] else ''
+        answer = ask_box(self, f'Download {name}?',
+                         f"Download {state['label']}: {state['size'] / 1e6:,.0f} MB{so_far}, {left / 1e6:,.0f} MB to go. "
+                         f"Free space on this drive: {models.free_space(home) / 1e9:,.1f} GB. It comes from github.com and is checked "
+                         'against its SHA-256 before Alfred uses it.', QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+        if answer == QMessageBox.Ok:
+            downloads.start(key)
+
+    def file_finished(self, key, error):
+        self.load_files()
 
     def show_index_info(self):
         st = self.win.status
@@ -3339,6 +3488,9 @@ class AlfredWindow(QWidget):
         self.engine_signals = Signals()  # the runtime reports from worker threads ("Preparing the graphics card (once)…")
         self.engine_signals.progress.connect(self.engine_status)
         ai.runtime.status_hook = self.engine_signals.progress.emit
+        self.downloads = ModelDownloads(self)  # model files and the engine (Settings rows, the first-run question)
+        self.downloads.changed.connect(lambda _: self.engine_status(self.downloads.status_text()))
+        self.downloads.finished.connect(self.download_finished)
         self.watcher = FolderWatcher(parent=self)
         self.watcher.changed.connect(self.auto_index)
         self.backdrop, self.grab_origin = None, QPoint()
@@ -3821,6 +3973,48 @@ class AlfredWindow(QWidget):
             if not self.toasting:
                 self.status_label.setText(self.status_text())
 
+    def download_finished(self, key, error):
+        """A model file or the engine arrived (or did not). When search by meaning can run now, it turns on without a
+        restart: the search model wakes, and an indexing run embeds what is missing."""
+        name = DOWNLOAD_ROWS[key][1]
+        if error is not None:
+            cancelled = isinstance(error, models.DownloadCancelled)
+            self.toast(f'Download of {name} stopped; it continues next time' if cancelled else str(error),
+                       'orange' if cancelled else 'red', seconds=8)
+            return
+        if key in models.FIRST_RUN and self.downloads.running(models.ENGINE if key != models.ENGINE else 'embed-text'):
+            return  # the other half of search by meaning is still coming
+        if key in models.FIRST_RUN and not ai.runtime.missing(self.settings):
+            self.toast('Search by meaning is on · adding it to your files', 'green', seconds=6)
+            self.warm_up()
+            self.start_index(quiet=True, background=True)
+        else:
+            self.toast(f'{name[0].upper()}{name[1:]} is downloaded', 'green', seconds=4)
+
+    def offer_model_download(self):
+        """First run (the engine or the search model missing): ask once whether to download them. Keyword and name
+        search work meanwhile; No is remembered, and Settings still offers each file. Nothing is asked when both are
+        here, or after the question was answered once."""
+        if self.settings.get('model_download_asked'):
+            return
+        home = self.settings.home
+
+        def ask(needs):
+            if not needs or self.settings.get('model_download_asked'):
+                return
+            total = sum(models.size_of(key) for key in needs)
+            what = 'the search model and engine' if len(needs) == 2 else DOWNLOAD_ROWS[needs[0]][1]
+            answer = ask_box(self, 'Search by meaning', f'Download {what} ({total / 1e6:,.0f} MB)? Keyword and name search work '
+                             'already; this adds search by meaning. You can also download them later in Settings.',
+                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            self.settings['model_download_asked'] = True
+            self.settings.save()
+            if answer == QMessageBox.Yes:
+                for key in needs:
+                    self.downloads.start(key)
+        run_job(lambda s: models.first_run_needs(home), ask,
+                lambda error: logging.getLogger('alfred').warning('First-run check: %s', error))
+
     def rebind_hotkey(self, text):
         """Switch the global shortcut live; GlobalHotkey restores the old one if the new one is taken."""
         if self.hotkey is None:
@@ -4224,6 +4418,7 @@ def run():
     else:
         window.show_panel()
         QTimer.singleShot(700, lambda: window.start_index(quiet=True, background=True))
+        QTimer.singleShot(1500, window.offer_model_download)  # first run without the search model or engine: ask once
     if window.active_hotkey:
         tray.showMessage('Alfred is ready' if at_sign_in else 'Alfred is running',
                          f'Press {window.active_hotkey} anywhere to open Alfred. Esc hides it.', app_icon(), 4000)
