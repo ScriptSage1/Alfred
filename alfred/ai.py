@@ -1,20 +1,20 @@
-"""Local models through Ollama: EmbeddingGemma 2 embeddings for semantic search,
-plus starting Ollama and reporting which device it runs on.
+"""Local models: EmbeddingGemma 2 embeddings for semantic search through the llama.cpp servers Alfred owns
+(alfred.runtime), plus the Ollama helpers the answer side still uses (phase B removes them) and diagnostics.
 
 Chat providers (Ollama, Claude, ChatGPT, APIs) live in alfred.providers.
 """
-import http.client
 import json
+import math
 import os
 import shutil
 import subprocess
-import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import runtime
 from .console import hidden
 
 OLLAMA_DEFAULT = 'http://127.0.0.1:11434'
@@ -41,33 +41,6 @@ def _json(url, payload=None, timeout=30):
         raise ProviderError(f'HTTP {error.code}: {detail}') from None
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
         raise ProviderError(f'Cannot reach {urlparse(url).netloc}: {getattr(error, "reason", error)}') from None
-
-
-_KEPT = threading.local()  # {(host, port): HTTPConnection} per thread, for local Ollama only
-
-
-def _json_kept(url, payload, timeout=30):
-    """POST JSON to a local server over a kept-open connection (no new socket or proxy lookup per call).
-    Raises on anything unexpected; the caller falls back to _json, which reports errors properly."""
-    parts = urlparse(url)
-    key = (parts.hostname, parts.port or 80)
-    pool = getattr(_KEPT, 'pool', None)
-    if pool is None:
-        pool = _KEPT.pool = {}
-    con = pool.get(key)
-    if con is None:
-        con = pool[key] = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
-    try:
-        con.request('POST', parts.path or '/', json.dumps(payload).encode(), {'Content-Type': 'application/json'})
-        response = con.getresponse()
-        body = response.read()
-        if response.status != 200:
-            raise ProviderError(f'HTTP {response.status}')
-        return json.loads(body)
-    except Exception:
-        con.close()
-        pool.pop(key, None)
-        raise
 
 
 def is_local_url(url):
@@ -108,7 +81,6 @@ def _threads(settings):
 
 PICTURE_SIDE = 512  # pictures are embedded at this size: larger costs the same and finds nothing more
 PICTURE_BATCH = 8
-_picture_support = {}  # (base, model) -> bool, probed once per process
 
 
 def picture_jpeg(image, side=PICTURE_SIDE):
@@ -125,143 +97,164 @@ def picture_jpeg(image, side=PICTURE_SIDE):
 
 # -------------------------------------------------------------- embeddings
 class Embedder:
-    """EmbeddingGemma (or another Ollama embedding model) with its prompt format."""
+    """EmbeddingGemma 2 with its prompt format, on the llama.cpp servers of alfred.runtime: queries and small indexing
+    jobs on the search server, larger jobs and every picture on the index server."""
+    MODEL = 'embeddinggemma-2'
 
     def __init__(self, settings):
-        self.kind = 'ollama'
-        self.model = (settings.get('embed_model') or 'embeddinggemma-2').strip()
-        self.base = _ollama_base(settings.get('embed_base_url'))
-        self.device = settings.get('embed_device', 'auto')
+        self.kind = 'llama'
+        self.model = self.MODEL  # the only embedding model: a settings file naming another one gets this one
+        self.settings = settings
+        self.device = settings.get('embed_device', 'auto')  # the indexing device; search follows search_on_gpu
         self.batch = max(1, min(int(settings.get('embed_batch') or 16), 128))
         self.keep_alive = keep_alive(settings)
-        name = self.model.lower()
-        self.family = 'gemma' if 'embeddinggemma' in name else 'nomic' if 'nomic' in name else 'plain'
+        self.family = 'gemma'
         # Cosine similarity below which a meaning-only match is noise (measured on EmbeddingGemma 2:
         # related passages score about 0.70+, unrelated ones 0.58–0.65).
-        self.min_similarity = 0.66 if self.family == 'gemma' else 0.5
+        self.min_similarity = 0.66
         # Similarity at which a meaning match alone is confident enough to show (index.is_confident). Calibrated
         # for EmbeddingGemma 2 on the benchmark's synthetic corpus: the best passage for unrelated queries scored
-        # 0.60-0.65, the relevant passage for paraphrase/meaning queries 0.69+. Other models are not calibrated
-        # and use their noise floor.
-        self.confident_similarity = 0.67 if self.family == 'gemma' else None
-        # The same for a picture vector (a text query against a picture). Measured on the benchmark's medium corpus:
-        # the right picture for a query about what it shows scored 0.715-0.858, the best picture for queries with no
-        # picture answer at most 0.709. Uncalibrated models: picture matches are never confident.
-        self.confident_picture_similarity = 0.712 if self.family == 'gemma' else None
+        # 0.60-0.65, the relevant passage for paraphrase/meaning queries 0.69+.
+        self.confident_similarity = 0.67
+        # The same for a picture vector (a text query against a picture). Measured on the benchmark's medium corpus
+        # with Ollama: the right picture for a query about what it shows scored 0.715-0.858, the best picture for
+        # queries with no picture answer at most 0.709. M13 design, section 9: while Ollama-made picture vectors remain,
+        # the floor is the higher of this and the floor measured on llama.cpp vectors (not measured yet).
+        self.confident_picture_similarity = 0.712
         self.threads = _threads(settings)
+        self.role = None  # set by plan() for an indexing job; None: chosen per request by its size
 
     @classmethod
     def from_settings(cls, settings):
-        return cls(settings) if settings.get('embed_enabled') and settings.get('embed_model') else None
+        return cls(settings) if settings.get('embed_enabled') else None
 
     @property
     def local(self):
-        return is_local_url(self.base)
+        return True
+
+    def available(self):
+        """Whether the engine and the search model are on this PC (no server is started)."""
+        return runtime.missing(self.settings) is None
 
     def signature(self):
-        """Changes whenever stored vectors would no longer be comparable (model or prompt format)."""
+        """Changes whenever stored vectors would no longer be comparable. It names the vector space, not the engine:
+        llama.cpp's vectors match Ollama's (0.9999), so the string stays and nothing is re-embedded."""
         return f'ollama:{self.model}:prompt-v1'
 
     def document_prompt(self, title, text):
-        if self.family == 'gemma':
-            return f'title: {title or "none"} | text: {text}'
-        if self.family == 'nomic':
-            return f'search_document: {title}: {text}'
-        return f'{title}: {text}' if title else text
+        return f'title: {title or "none"} | text: {text}'
 
     def query_prompt(self, text):
-        if self.family == 'gemma':
-            return f'task: search result | query: {text}'
-        if self.family == 'nomic':
-            return f'search_query: {text}'
-        return text
+        return f'task: search result | query: {text}'
 
-    def _embed(self, texts):
-        payload = {'model': self.model, 'input': texts, 'truncate': True, 'keep_alive': self.keep_alive, 'options': _options(self.device, self.threads)}
+    # ------------------------------------------------------------ indexing jobs
+    def plan(self, passages):
+        """An indexing run is about to embed ``passages`` passages: a small job goes through the search server in small
+        batches, a larger one to the index server. Returns the batch size to send."""
+        self.role = runtime.role_for_job(passages, settings=self.settings)
+        return runtime.small_job(self.settings)[1] if self.role == 'search' else self.batch
+
+    def finish(self):
+        """The run's embedding work is done: the index server exits after a 60 s linger unless a new run starts."""
+        self.role = None
+        runtime.release('index', self.settings)
+
+    # ------------------------------------------------------------------- text
+    def _post_texts(self, role, prompts, timeout):
         try:
-            result = _json(self.base + '/api/embed', payload, timeout=180)
-        except ProviderError as error:
-            if 'HTTP 404' in str(error):
-                raise ProviderError(f'The embedding model “{self.model}” is not installed. Run: ollama pull {self.model}') from None
+            result = runtime.call(role, '/v1/embeddings', {'input': prompts}, self.settings, timeout=timeout)
+            data = sorted(result['data'], key=lambda d: d['index'])
+            vectors = [_unit(d['embedding'][-runtime.EMBED_DIM:]) for d in data]
+        except runtime.HttpError:
             raise
-        vectors = result.get('embeddings')
-        if not vectors or len(vectors) != len(texts):
-            raise ProviderError('Ollama returned an unexpected embedding response')
+        except runtime.ServerError as error:
+            raise ProviderError(str(error)) from None
+        except (KeyError, TypeError, ValueError):
+            raise ProviderError('The search engine returned an unexpected embedding response') from None
+        if len(vectors) != len(prompts):
+            raise ProviderError('The search engine returned an unexpected embedding response')
         return vectors
+
+    def _texts(self, role, items, timeout):
+        """Vectors for [(make_prompt, text)]. llama-server refuses an input longer than it reads (Ollama cut it
+        silently): a batch that fails is sent one by one, and an input that is too long is cut to the first half of
+        its characters until it is accepted."""
+        try:
+            return self._post_texts(role, [make(text) for make, text in items], timeout)
+        except runtime.HttpError as error:
+            if len(items) > 1:
+                return [vector for item in items for vector in self._texts(role, [item], timeout)]
+            make, text = items[0]
+            if _too_long(error) and len(text) > 1:
+                return self._texts(role, [(make, text[:len(text) // 2])], timeout)
+            raise ProviderError(str(error)) from None
 
     def embed_documents(self, texts, titles=None):
         titles = titles or [''] * len(texts)
-        try:
-            return self._embed([self.document_prompt(title, text[:6000]) for title, text in zip(titles, texts)])
-        except ProviderError as error:
-            if 'memory' in str(error).lower() and len(texts) > 1:  # out of (V)RAM: smaller batches
-                half = len(texts) // 2
-                return self.embed_documents(texts[:half], titles[:half]) + self.embed_documents(texts[half:], titles[half:])
-            raise
+        role = self.role or runtime.role_for_job(len(texts), settings=self.settings)
+        items = [((lambda body, title=title: self.document_prompt(title, body)), text[:6000]) for title, text in zip(titles, texts)]
+        return self._texts(role, items, runtime.BATCH_TIMEOUT)
 
     def embed_query(self, text):
-        prompt = self.query_prompt(text[:2000])
-        if self.local:  # one query per keystroke pause: reuse the connection to Ollama
-            payload = {'model': self.model, 'input': [prompt], 'truncate': True, 'keep_alive': self.keep_alive,
-                       'options': _options(self.device, self.threads)}
-            try:
-                vectors = _json_kept(self.base + '/api/embed', payload, timeout=180).get('embeddings')
-                if vectors and len(vectors) == 1:
-                    return vectors[0]
-            except TimeoutError:
-                raise ProviderError(f'Cannot reach {urlparse(self.base).netloc}: timed out') from None
-            except Exception:
-                pass  # the regular request below reports what went wrong
-        return self._embed([prompt])[0]
+        return self._texts('search', [(self.query_prompt, text[:2000])], runtime.QUERY_TIMEOUT)[0]
 
-    # Pictures: the same model embeds a picture into the space of its text vectors (EmbeddingGemma 2 is
-    # multimodal), so a text query finds a picture by what it shows. Pictures are sent as `input: [{"image": b64}]`;
-    # Ollama silently ignores the `images` field of /api/embed, so it is never used.
+    # --------------------------------------------------------------- pictures
+    # The same model embeds a picture into the space of its text vectors (EmbeddingGemma 2 is multimodal), so a text
+    # query finds a picture by what it shows. Only the index server loads the picture projector.
     def embed_pictures(self, images):
         """Vectors for PIL images (or base64 JPEG strings), in batches of PICTURE_BATCH; raises ProviderError."""
         payloads = [image if isinstance(image, str) else picture_jpeg(image) for image in images]
         vectors = []
         for start in range(0, len(payloads), PICTURE_BATCH):
             batch = payloads[start:start + PICTURE_BATCH]
-            payload = {'model': self.model, 'input': [{'image': data} for data in batch], 'truncate': True,
-                       'keep_alive': self.keep_alive, 'options': _options(self.device, self.threads)}
             try:
-                result = _json(self.base + '/api/embed', payload, timeout=300)
-            except ProviderError as error:
-                if 'HTTP 404' in str(error):
-                    raise ProviderError(f'The embedding model “{self.model}” is not installed. Run: ollama pull {self.model}') from None
-                raise
-            found = result.get('embeddings')
-            if not found or len(found) != len(batch):
-                raise ProviderError('Ollama returned an unexpected picture embedding response')
+                result = self._post_pictures(batch)
+                data = sorted(result, key=lambda d: d['index'])
+                found = [_unit(_flatten(d['embedding'])[-runtime.EMBED_DIM:]) for d in data]
+            except runtime.ServerError as error:
+                raise ProviderError(str(error)) from None
+            except (KeyError, TypeError, ValueError):
+                raise ProviderError('The search engine returned an unexpected picture embedding response') from None
+            if len(found) != len(batch):
+                raise ProviderError('The search engine returned an unexpected picture embedding response')
             vectors += found
         return vectors
 
+    def _post_pictures(self, batch):
+        """POST /embeddings with the server's media marker; on HTTP 400 read the marker again and retry once (it is
+        random per server start)."""
+        for attempt in (0, 1):
+            server = runtime.client('index', self.settings, pictures=True)
+            if attempt:
+                server.refresh_marker()
+            payload = {'content': [{'prompt_string': server.marker, 'multimodal_data': [data]} for data in batch]}
+            try:
+                return runtime.call('index', '/embeddings', payload, self.settings, pictures=True, timeout=runtime.BATCH_TIMEOUT)
+            except runtime.HttpError as error:
+                if error.status != 400 or attempt:
+                    raise
+
     def supports_pictures(self):
-        """Whether this model embeds pictures: probed once per process and model by embedding two small, different
-        generated pictures (a model that reads only text returns an error, or the same vector for both)."""
-        key = (self.base, self.model)
-        if key in _picture_support:
-            return _picture_support[key]
-        from PIL import Image, ImageDraw
-        first = Image.new('RGB', (96, 96), 'white')
-        ImageDraw.Draw(first).ellipse((16, 16, 80, 80), fill=(200, 30, 30))
-        second = Image.new('RGB', (96, 96), (20, 60, 160))
-        draw = ImageDraw.Draw(second)
-        for x in range(0, 96, 16):
-            draw.rectangle((x, 0, x + 7, 95), fill=(240, 220, 40))
-        try:
-            a, b = self.embed_pictures([first, second])
-        except ProviderError as error:
-            if 'Cannot reach' in str(error):
-                return False  # Ollama is down: not an answer about the model, ask again next time
-            _picture_support[key] = False
-            return False
-        import math
-        dot = sum(x * y for x, y in zip(a, b))
-        norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)) or 1e-12
-        _picture_support[key] = bool(len(a) == len(b) and dot / norm < 0.98)
-        return _picture_support[key]
+        """Whether pictures can be embedded: the picture projector is on this PC (no server is started)."""
+        return runtime.missing(self.settings, pictures=True) is None
+
+
+def _too_long(error):
+    detail = (error.detail or '').lower()
+    return error.status in (400, 413, 500) and ('too large' in detail or 'context' in detail or 'exceed' in detail or 'too long' in detail)
+
+
+def _flatten(embedding):
+    """/embeddings gives one row per token for a picture; the picture's vector is the last 768 numbers."""
+    if embedding and isinstance(embedding[0], list):
+        return [x for row in embedding for x in row]
+    return embedding
+
+
+def _unit(vector):
+    """The vector scaled to unit length (vectors are stored and compared at unit length)."""
+    norm = math.sqrt(sum(x * x for x in vector)) or 1e-12
+    return [x / norm for x in vector]
 
 
 class Contextualizer:
@@ -275,7 +268,7 @@ class Contextualizer:
 
     def __init__(self, settings):
         self.model = (settings.get('context_model') or DEFAULT_CONTEXT_MODEL).strip()
-        self.base = _ollama_base(settings.get('embed_base_url'))  # the Ollama indexing already uses for embeddings
+        self.base = _ollama_base(settings.get('base_url'))  # the local Ollama of the answer side
         self.device = settings.get('device', 'auto')  # Settings → Ollama → Device, as for local chat models
         self.keep_alive = keep_alive(settings)
         self.threads = _threads(settings)
@@ -347,17 +340,16 @@ def ensure_ollama(base=OLLAMA_DEFAULT, wait=25.0):
 
 
 def warm_up(settings, progress=lambda text: None):
-    """Make sure Ollama runs and the embedding model is loaded (restarts its keep-alive timer)."""
+    """Wake the search server (start it if needed): the 1.3-1.6 s wake overlaps with typing. Raises ProviderError."""
     embedder = Embedder.from_settings(settings)
     report = {'started': False, 'loaded': [], 'keep_alive': keep_alive(settings)}
-    if embedder is None or not embedder.local:
+    if embedder is None:
         return report
-    if not ollama_running(embedder.base):
-        progress('Starting Ollama…')
-        report['started'] = ensure_ollama(embedder.base)['started']
-    progress('Loading the search model…')
-    _json(embedder.base + '/api/embed', {'model': embedder.model, 'input': 'warm up', 'keep_alive': embedder.keep_alive,
-                                         'options': _options(embedder.device, embedder.threads)}, timeout=180)
+    progress('Waking the search model…')
+    try:
+        report['started'] = runtime.wake('search', settings)
+    except runtime.ServerError as error:
+        raise ProviderError(str(error)) from None
     report['loaded'].append(embedder.model)
     return report
 
@@ -412,29 +404,38 @@ def diagnostics(settings, probe=False):
     embedder = Embedder.from_settings(settings)
     report = {'checked_at': time.strftime('%H:%M:%S'), 'gpu': detect_gpus(), 'chat': ChatProvider(settings).describe(),
               'embeddings': {'enabled': embedder is not None}, 'errors': []}
-    models = [('embeddings', embedder)] if embedder is not None else []
-    if not models:
+    if (settings.get('provider') or 'ollama') == 'ollama':  # the answer side (phase B replaces this)
+        report['ollama'] = ollama_runtime(settings.get('base_url'))
+    if embedder is None:
         return report
-    for key, model in models:
-        report[key].update(provider='ollama', model=model.model, location='local' if model.local else 'remote')
-    if probe and embedder is not None:
+    report['embeddings'].update(provider='llama.cpp', model=embedder.model, location='local')
+    reason = runtime.missing(settings)
+    if reason:
+        report['errors'].append(reason)
+    if probe and not reason:
         try:
             embedder.embed_query('diagnostic probe')
         except ProviderError as error:
             report['errors'].append(f'Embedding test failed: {error}')
-    runtime = ollama_runtime(models[0][1].base)
-    report['ollama'] = runtime
-    if not runtime['running']:
-        report['errors'].append(runtime['error'])
-    for key, model in models:
-        match = next((m for m in runtime['loaded'] if m['model'].split(':')[0] == model.model.split(':')[0]), None)
-        if match:
-            report[key]['execution'] = f"{match['device']} — {match['vram_mib']} MiB of {match['size_mib']} MiB in VRAM (reported by Ollama)"
-            report[key]['gpu_active'] = match['gpu_share_percent'] > 0
-        else:
-            report[key]['execution'] = 'Not loaded right now (Ollama loads it when needed).'
-            report[key]['gpu_active'] = None
+    servers = runtime.status(settings)
+    if servers:
+        report['embeddings']['execution'] = '; '.join(_describe_server(s) for s in servers)
+        report['embeddings']['gpu_active'] = any(s['device'] != 'cpu' for s in servers)
+    else:
+        report['embeddings']['execution'] = 'Not running right now (started when needed).'
+        report['embeddings']['gpu_active'] = None
+    report['embeddings']['servers'] = servers
     return report
+
+
+def _describe_server(server):
+    where = 'the CPU' if server['device'] == 'cpu' else server['device']
+    text = f"{server['role']} server on {where}"
+    if server['mmproj']:
+        text += ' with the picture projector'
+    if server['memory_mib'] is not None:
+        text += f" ({server['memory_mib']} MB in use)"
+    return text
 
 
 # ------------------------------------------------------------------- chat

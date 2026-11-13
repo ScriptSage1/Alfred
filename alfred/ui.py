@@ -4025,14 +4025,9 @@ class AlfredWindow(QWidget):
 
         def work(signals):
             embedder = ai.Embedder.from_settings(settings)
-            if embedder is not None and embedder.local and settings.get('ollama_autostart', True):
-                try:
-                    ai.ensure_ollama(embedder.base)
-                except ai.ProviderError as error:
-                    logging.getLogger('alfred').warning('Indexing without search by meaning: %s', error)
-                    embedder = None  # keyword search still works; meaning catches up on the next run
-            if embedder is not None and not ai.ollama_running(embedder.base, 1.5):
-                embedder = None
+            if embedder is not None and not embedder.available():  # the llama.cpp engine or the search model is missing
+                logging.getLogger('alfred').warning('Indexing without search by meaning: %s', ai.runtime.missing(settings))
+                embedder = None  # keyword search still works; meaning catches up on the next run
             return index.update(signals.progress.emit, embedder, force=force, roots=roots, background=background)
         run_job(work, done, failed, progress=progress)
 

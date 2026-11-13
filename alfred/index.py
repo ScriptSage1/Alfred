@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS media_cache(hash TEXT, layer TEXT, signature TEXT, pa
 # pages of a PDF that need OCR / a picture vector). media_cache: OCR passages and picture vectors by content hash.
 SCHEMA_VERSION = '3'  # 2: OCR and picture layers; 3: AI picture descriptions removed
 OCR_VERSION = 'rapidocr-v1'
-PICTURE_VERSION = 'picture-v1:512'
+PICTURE_VERSION = 'picture-v2:512'  # v2: llama.cpp picture vectors (M13); v1 pictures are re-embedded in the background
 CACHE_DAYS = 180
 MEDIA = IMAGE_SUFFIXES | VIDEO_SUFFIXES
 MEDIA_SQL = '(' + ' OR '.join(f"lower(f.path) LIKE '%{suffix}'" for suffix in sorted(MEDIA)) + ')'
@@ -781,6 +781,9 @@ class Index:
         finally:
             if ocr_runner is not None:
                 ocr_runner.close()
+            finish = getattr(embedder, 'finish', None)
+            if finish is not None:
+                finish()  # the run's embedding work is done: the index server exits after its linger
         with con:
             con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('last_indexed', time.strftime('%Y-%m-%d %H:%M')))
             if not self.cancel.is_set():
@@ -1238,10 +1241,12 @@ class Index:
         rows = list(con.execute('SELECT s.id, s.path, f.text FROM segments s JOIN fts f ON f.rowid = s.id '
                                 'LEFT JOIN vectors v ON v.segment_id=s.id WHERE v.segment_id IS NULL'))
         done = 0
-        for start in range(0, len(rows), embedder.batch):
+        plan = getattr(embedder, 'plan', None)  # a small job goes through the search server, a larger one to the index server
+        size = plan(len(rows)) if plan is not None and rows else embedder.batch
+        for start in range(0, len(rows), size):
             if self._stopping():
                 break
-            batch = rows[start:start + embedder.batch]
+            batch = rows[start:start + size]
             progress({'phase': 'embedding', 'done': done, 'total': len(rows), 'current': batch[0][1]})
             try:
                 vectors = embedder.embed_documents([text for _, _, text in batch], [Path(p).stem for _, p, _ in batch])

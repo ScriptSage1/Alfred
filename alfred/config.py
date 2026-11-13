@@ -1,7 +1,7 @@
 """Single source of truth for Alfred settings.
 
 Settings live in %LOCALAPPDATA%\\Alfred\\settings.json (override with
-ALFRED_HOME), outside the repository. Every model runs locally through Ollama.
+ALFRED_HOME), outside the repository. Search models run locally on llama.cpp (alfred.runtime).
 """
 import json
 import logging
@@ -37,12 +37,11 @@ DEFAULTS = {
     # Chat history: one JSON file per chat. Empty folder = %LOCALAPPDATA%\Alfred\Chats.
     'save_chat_history': True,
     'chats_folder': '',
-    # Semantic search: EmbeddingGemma 2 through a local Ollama. Keyword search always works.
+    # Semantic search: EmbeddingGemma 2 on llama.cpp servers Alfred starts and owns (alfred.runtime). Keyword search
+    # always works. (embed_provider, embed_base_url and embed_model are gone: an older settings file still loads.)
     'embed_enabled': True,
-    'embed_provider': 'ollama',
-    'embed_base_url': 'http://127.0.0.1:11434',
-    'embed_model': 'embeddinggemma-2',
-    'embed_device': 'auto',
+    'embed_device': 'auto',      # the indexing device: 'auto' (the GPU once its check passed) | 'cpu'
+    'search_on_gpu': False,      # search runs on the CPU (--device none -ngl 0 -t 4) unless this is on
     'embed_batch': 16,
     # Text in images, scanned PDF pages and video frames, read by a local OCR model.
     'ocr_enabled': True,

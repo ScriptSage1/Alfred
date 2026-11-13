@@ -177,44 +177,23 @@ class SearchTests(McpBase):
         self.assertTrue(self.server.handle(request('tools/call', {'name': 'search_files', 'arguments': [1]}))['result']['isError'])
 
 
-class OllamaCheckTests(McpBase):
-    """Ollama is probed once and the answer is remembered; it is started at most once while it stays down."""
+class EngineCheckTests(McpBase):
+    """Search by meaning runs on Alfred's llama.cpp runtime now: Ollama is neither probed nor started (M13 phase A;
+    phase B replaces the rest of the MCP server's Ollama code)."""
 
-    def setUp(self):
-        super().setUp()
-        self.settings.update(embed_enabled=True, embed_model='embeddinggemma-2', ollama_autostart=True)
-        self.probes, self.starts, self.up = [], [], False
-        self.kept = (mcp_server.ai.ollama_running, mcp_server.ai.ensure_ollama)
-        mcp_server.ai.ollama_running = lambda base, timeout=0.8: self.probes.append(base) or self.up
-
-        def start(base, wait=25.0):
-            self.starts.append(wait)
-            raise mcp_server.ai.ProviderError('Ollama is not installed')
-        mcp_server.ai.ensure_ollama = start
-
-    def tearDown(self):
-        mcp_server.ai.ollama_running, mcp_server.ai.ensure_ollama = self.kept
-        super().tearDown()
-
-    def test_down_is_remembered_and_search_falls_back_to_keywords(self):
-        for _ in range(3):
+    def test_ollama_is_not_probed_or_started_and_search_still_answers(self):
+        self.settings.update(embed_enabled=True, ollama_autostart=True)
+        kept = (mcp_server.ai.ollama_running, mcp_server.ai.ensure_ollama)
+        touched = []
+        mcp_server.ai.ollama_running = lambda *args, **kwargs: touched.append('probe') or False
+        mcp_server.ai.ensure_ollama = lambda *args, **kwargs: touched.append('start')
+        try:
             data = self.payload(self.tool('search_files', {'query': 'harbour'}))
-            self.assertTrue(data['results'])
-            self.assertIn('keyword matches', data['notes'][0])
-        self.assertEqual((len(self.probes), len(self.starts)), (1, 1))
-        self.assertLessEqual(self.starts[0], 10)
-
-    def test_checked_again_after_the_wait(self):
-        self.tool('search_files', {'query': 'harbour'})
-        base, running, checked = self.server._ollama
-        self.server._ollama = (base, running, checked - mcp_server.OLLAMA_DOWN_SECONDS - 1)
-        self.tool('search_files', {'query': 'harbour'})
-        self.assertEqual(len(self.probes), 2)
-
-    def test_not_started_when_the_user_turned_autostart_off(self):
-        self.settings['ollama_autostart'] = False
-        self.tool('search_files', {'query': 'harbour'})
-        self.assertEqual(self.starts, [])
+        finally:
+            mcp_server.ai.ollama_running, mcp_server.ai.ensure_ollama = kept
+        self.assertTrue(data['results'])
+        self.assertEqual(touched, [])
+        self.assertFalse((self.home / 'run' / 'search.json').exists())  # the index has no vectors: no server was needed
 
 
 class ReadTests(McpBase):
