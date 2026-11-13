@@ -27,16 +27,22 @@ class ModelFile:
     size: int
     sha256: str      # also the name of Ollama's blob (sha256-<hash>)
     licence: str
-    urls: tuple = ()  # download addresses: chosen by the user (M13 design, section 11 item 2); filled in by task 6
+    urls: tuple = ()  # download addresses; empty: Alfred has none for this file yet
+
+
+# The two EmbeddingGemma 2 files are assets of a release on Alfred's GitHub repository (the user's decision, 2026-11-13).
+# Apache 2.0 according to Google's model card; use must follow the Gemma Prohibited Use Policy.
+RELEASE = 'https://github.com/ScriptSage1/Alfred/releases/download/models-embeddinggemma-2/'
+EMBED_LICENCE = 'Apache-2.0 (Google DeepMind); Gemma Prohibited Use Policy applies'
 
 
 FILES = {f.key: f for f in (
     ModelFile('embed-text', 'embed', 'EmbeddingGemma 2, text, 8-bit', 'embeddinggemma-2', 'embeddinggemma-2-text-q8_0.gguf',
               303_957_280, '111e84992a0406bacb70d11dddd8874001c783cc56b82c462ec82a2f5b8d08b1',
-              'Apache-2.0 (to be confirmed on the model card before publishing)'),
+              EMBED_LICENCE, (RELEASE + 'embeddinggemma-2-text-q8_0.gguf',)),
     ModelFile('embed-pictures', 'pictures', 'EmbeddingGemma 2, picture projector', 'embeddinggemma-2', 'embeddinggemma-2-mmproj.gguf',
               980_895_232, '74bf65c860d292a1eebafd7ca85b44532a2528f03017f9204fe1695916d2c66f',
-              'Apache-2.0 (to be confirmed on the model card before publishing)'),
+              EMBED_LICENCE, (RELEASE + 'embeddinggemma-2-mmproj.gguf',)),
     ModelFile('answer', 'answer', 'gemma3:4b', 'gemma3-4b', 'gemma3-4b-q4_k_m.gguf',
               2_499_012_288, 'f06e91e18fc74295d0c781bf91622508c75655e2c18ed869d52447ffe1e667e1', 'Gemma Terms of Use'),
 )}
