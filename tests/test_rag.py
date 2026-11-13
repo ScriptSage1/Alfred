@@ -1,7 +1,7 @@
 """Chat-with-documents tests: chunk headers, retrieval, reranking, context building, the prompt and
 its injection filter, streaming citation clean-up, and the rendered answer.
 
-No Ollama or reranker download is needed: a fake embedder, a fake reranker and a scripted chat
+No model server or reranker download is needed: a fake embedder, a fake reranker and a scripted chat
 provider stand in for the models.
 """
 import sys
@@ -21,7 +21,7 @@ COLORS = {'accent': '#0a84ff', 'chip': 'rgba(10,132,255,0.16)', 'fill': '#333', 
 
 class Scripted(Provider):
     """A chat provider that streams a fixed reply in small pieces and records what it was sent."""
-    kind = 'ollama'
+    kind = 'local'
     cloud = False
 
     def __init__(self, reply, pieces=3):

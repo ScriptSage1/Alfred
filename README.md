@@ -8,14 +8,17 @@ text inside images and videos — by keyword and by meaning. Everything runs on 
 ## Install (from a clone)
 
 1. Install Python 3.11 or newer.
-2. For search by meaning and a local chat model, install [Ollama](https://ollama.com) and run
-   `ollama pull embeddinggemma-2` and `ollama pull gemma3:4b`.
-   Without it, keyword search still works.
+2. Search by meaning and the answer model on this PC run on [llama.cpp](https://github.com/ggml-org/llama.cpp)
+   (`llama-server.exe`), which Alfred starts and stops itself; nothing else needs to be installed or kept running.
+   Alfred looks for the engine in `ALFRED_LLAMA_DIR`, then in the install folder's `runtime\llama\`, then in
+   `%LOCALAPPDATA%\Alfred\runtime\llama-b12318\`, and for the model files in `%LOCALAPPDATA%\Alfred\models\`
+   (a copy already on this PC from an earlier Ollama install is used where it is). Downloading them from Alfred
+   comes in a later version. Without them, keyword search still works.
 3. Double-click `Setup-Alfred.cmd`. It creates `.venv`, installs the requirements, adds Alfred to the Start menu
    and starts it.
 
 Setup (or Alfred's first launch) also adds Alfred to your Windows Startup folder, so from then on it starts
-hidden in the tray when you sign in (and starts Ollama in the background). No administrator rights
+hidden in the tray when you sign in (no model is loaded until it is needed). No administrator rights
 are needed. Turn this off or back on under **Settings → Start Alfred when you sign in**; once you
 turn it off, Alfred leaves it off.
 
@@ -68,7 +71,7 @@ or under **Settings → AI model**:
 
 | Provider | How it connects | Set up |
 |---|---|---|
-| On this PC (Ollama) | local models, e.g. `gemma3:4b`, `llama3.2` | `ollama pull <model>` |
+| On this PC | gemma3:4b on llama.cpp, started on the first question and stopped after **Keep models loaded** | the model file (see Install) |
 | Claude · your Pro/Max plan | the Claude Code CLI (bundled with the Claude desktop app, or `npm i -g @anthropic-ai/claude-code`) | Settings → Accounts → Sign in |
 | ChatGPT · your Plus/Pro plan | the Codex CLI (bundled with the Codex app, or `npm i -g @openai/codex`) | Settings → Accounts → Sign in |
 | Claude API / OpenAI API | the providers' APIs | Settings → Accounts → Add key |
@@ -130,4 +133,6 @@ Nothing is indexed, changed or opened by the server. Text from your files is han
 
 `alfred/rag.py` answers questions from your documents: it retrieves and reranks passages, then asks the model to cite them (the top of that file describes each step). More components to start at sign-in go in `TASKS` in `alfred/startup.py`.
 
-Settings, the index and logs live in `%LOCALAPPDATA%\Alfred` (override with `ALFRED_HOME`).
+Settings, the index and logs live in `%LOCALAPPDATA%\Alfred` (override with `ALFRED_HOME`). The llama.cpp servers
+write their logs to `logs\llama-<role>.log` there. Tests use a small fake `llama-server` (`tests/fake_llama.py`); set
+`ALFRED_LLAMA_DIR` to a llama.cpp build to also run the opt-in test against the real server.

@@ -4,7 +4,8 @@ One ``llama-server.exe`` per role, each holding one model:
   search  the text model, 1 slot; on the CPU unless Settings → search_on_gpu. Queries and small indexing jobs.
   index   the text model (plus the picture projector when pictures are waiting); on the GPU when the graphics check
           passed, else the CPU. Larger indexing jobs and every picture. Exits 60 s after the run's embedding work ends.
-  (answer comes in phase B: gemma3:4b for Ask Alfred. ROLES, _args and NEED_MIB are where it joins.)
+  answer  gemma3:4b for Ask Alfred (text only, no projector): started on the first question, stopped keep_alive_minutes
+          after the last answer. Device from Settings → device; no vector check, but a failed GPU verdict is respected.
 
 Sharing: the starter writes ALFRED_HOME\\run\\<role>.json (process, port, key, device…) once /health answers. Another
 process (the MCP server, a second window) reads it, checks the process and /health, and uses that server. A lock file
@@ -37,7 +38,7 @@ from .console import hidden
 log = logging.getLogger('alfred')
 
 BUILD = models.BUILD['build']
-ROLES = ('search', 'index')        # 'answer' joins in phase B
+ROLES = ('search', 'index', 'answer')
 EMBED_DIM = 768
 SMALL_JOB_CPU = (16, 4)            # a small indexing job: at most this many passages, sent in batches of this size,
 SMALL_JOB_GPU = (64, 16)           # through the search server (on the CPU / on the GPU); task 5 tunes these
@@ -45,17 +46,21 @@ LINGER_SECONDS = 60                # the index server waits this long for a new 
 START_WAIT = 90                    # seconds a start may take (model load; Vulkan's slow first use)
 FIRST_TIMEOUT = 60                 # the first request after a start
 QUERY_TIMEOUT = 30                 # a query after that
-BATCH_TIMEOUT = 180                # a batch of passages or pictures (the design names no limit; Ollama's code used 180-300 s)
+BATCH_TIMEOUT = 180                # a batch of passages or pictures (the design names no limit)
 FAILURE_WINDOW = 600               # a second failure on the GPU within this many seconds moves the role to the CPU
 SEARCH_CPU_THREADS = 4
 GPU_MARGIN_MIB = 512
 MIN_GPU_MIB = 1024                 # a device with less memory in total is not used
-NEED_MIB = {'search': 512, 'index': 512, 'index+pictures': 1640}  # measured: 0.5 GB text, 1.6 GB with the projector
+NEED_MIB = {'search': 512, 'index': 512, 'index+pictures': 1640,  # measured: 0.5 GB text, 1.6 GB with the projector
+            'answer': 3900}                                     # gemma3:4b: at most 3.8 GB measured (with its projector)
+ANSWER_CONTEXT = 10240             # tokens the answer model reads at once (passages + chat so far + answer)
 GPU_CHECK_COSINE = 0.995
 REFERENCE = Path(__file__).with_name('data') / 'gpu_reference.json'
 
 # Tests: a command (list) that stands in for llama-server.exe, e.g. [sys.executable, 'tests/fake_llama.py'].
 PROGRAM_OVERRIDE = None
+# The app's status line: called (from any thread) with a short text while something slow runs, then with None.
+status_hook = None
 
 
 class ServerError(RuntimeError):
@@ -109,11 +114,14 @@ def command(home=None):
     return [str(found / 'llama-server.exe')]
 
 
-def missing(settings=None, pictures=False):
-    """Why search by meaning (or, with ``pictures``, by what pictures show) cannot run now, or None."""
+def missing(settings=None, pictures=False, answer=False):
+    """Why search by meaning (or, with ``pictures``, by what pictures show; with ``answer``, answers on this PC) cannot
+    run now, or None."""
     home = home_of(settings)
     if not PROGRAM_OVERRIDE and program_dir(home) is None:
         return 'The search engine (llama.cpp) is not installed'
+    if answer:
+        return None if models.find('answer', home) is not None else 'The answer model (gemma3:4b) is not downloaded'
     if models.find('embed-text', home) is None:
         return 'The search model (EmbeddingGemma 2) is not downloaded'
     if pictures and models.find('embed-pictures', home) is None:
@@ -572,13 +580,27 @@ def index_threads(settings):
     return threads if threads > 0 else max(1, (os.cpu_count() or 4) - 2)
 
 
+def answer_context(settings):
+    try:
+        tokens = int((settings or {}).get('answer_context') or ANSWER_CONTEXT)
+    except (TypeError, ValueError):
+        tokens = ANSWER_CONTEXT
+    return max(2048, min(tokens, 131072))
+
+
 def _args(role, home, settings, device, mmproj):
     """Command-line arguments for a role (no host, port or key: Server adds those)."""
+    gpu = ['--device', device, '-ngl', 'all'] if device != 'cpu' else ['--device', 'none', '-ngl', '0']
+    common = ['--no-webui', '--offline', '-b', '2048', '-ub', '2048', '--sleep-idle-seconds', str(keep_alive_seconds(settings))]
+    if role == 'answer':
+        model = models.find('answer', home)
+        if model is None:
+            raise ServerError('The answer model (gemma3:4b) is not downloaded')
+        return ['-m', str(model), '--no-mmproj'] + common + ['-c', str(answer_context(settings)), '-np', '1'] + gpu
     text = models.find('embed-text', home)
     if text is None:
         raise ServerError('The search model (EmbeddingGemma 2) is not downloaded')
-    args = ['-m', str(text), '--embedding', '--no-webui', '--offline', '-b', '2048', '-ub', '2048',
-            '--sleep-idle-seconds', str(keep_alive_seconds(settings))]
+    args = ['-m', str(text), '--embedding'] + common
     if mmproj:
         projector = models.find('embed-pictures', home)
         if projector is None:
@@ -586,7 +608,6 @@ def _args(role, home, settings, device, mmproj):
         args += ['--mmproj', str(projector)] + (['--no-mmproj-offload'] if device == 'cpu' else [])
     else:
         args.append('--no-mmproj')
-    gpu = ['--device', device, '-ngl', 'all'] if device != 'cpu' else ['--device', 'none', '-ngl', '0']
     if role == 'search':
         args += ['-c', '2048', '-np', '1'] + gpu + (['-t', str(SEARCH_CPU_THREADS)] if device == 'cpu' else [])
     elif role == 'index':
@@ -684,35 +705,86 @@ def _wants_gpu(role, settings, home):
         return False
     if role == 'search':
         return bool((settings or {}).get('search_on_gpu'))
+    if role == 'answer':
+        return (settings or {}).get('device', 'auto') != 'cpu'
     return (settings or {}).get('embed_device', 'auto') != 'cpu'
+
+
+def _status(text):
+    if status_hook is not None:
+        try:
+            status_hook(text)
+        except Exception:
+            pass
 
 
 def _start(role, home, settings, pictures):
     """Start a server for ``role`` (the caller holds the role's lock). On the GPU only after the graphics check passed:
-    the index role runs the check itself the first time; search never waits for it and uses the CPU until then."""
-    model_hash = models.FILES['embed-text'].sha256
+    the index role runs the check itself the first time; search never waits for it and uses the CPU until then; the
+    answer role has no check of its own but stays off a card whose check failed."""
+    model_hash = models.FILES['answer' if role == 'answer' else 'embed-text'].sha256
+
+    def server(device):
+        return Server(role, home, _args(role, home, settings, device, pictures), device, pictures, model_hash)
+
     if _wants_gpu(role, settings, home):
         device, reason = _best_gpu(home, NEED_MIB['index+pictures' if pictures else role])
         if device is not None:
             verdict = gpu_verdict(home, device)
             if verdict is None and role == 'index':
-                log.info('Preparing the graphics card (once)…')
-                server = Server(role, home, _args(role, home, settings, device['id'], pictures), device['id'], pictures, model_hash)
+                return _check_and_start(home, device, server) or server('cpu').start()
+            if (verdict is None and role == 'answer') or (verdict and verdict.get('passed')):
                 try:
-                    server.start()
-                    verdict = run_gpu_check(Client(role, home, server.record, server))
-                except ServerError as error:
-                    verdict = {'passed': False, 'reason': f'the server failed: {error}', 'checked_at': time.strftime('%Y-%m-%d %H:%M')}
-                _store_verdict(home, _gpu_key(home, device), verdict)
-                log.info('Graphics card check: %s', verdict)
-                if verdict['passed']:
-                    return server
-                server.stop()
-            elif verdict and verdict.get('passed'):
-                return Server(role, home, _args(role, home, settings, device['id'], pictures), device['id'], pictures, model_hash).start()
+                    return server(device['id']).start()
+                except ServerError as error:  # not stored: a start failure says nothing about the card's results
+                    log.warning('%s server could not start on the graphics card (%s); using the CPU', role, error)
+            elif verdict:
+                log.info('%s server on the CPU: the graphics card check failed (%s)', role, verdict.get('reason'))
         else:
             log.info('%s server on the CPU: %s', role, reason)
-    return Server(role, home, _args(role, home, settings, 'cpu', pictures), 'cpu', pictures, model_hash).start()
+    return server('cpu').start()
+
+
+def _check_and_start(home, device, server):
+    """The graphics card check (once per build, device, driver and model) on a GPU index server, which is kept when the
+    check passes. A verdict is stored only when vectors were compared or the server crashed during the check; a server
+    that could not start at all falls back to the CPU for this run and the card is checked again next time."""
+    _status('Preparing the graphics card (once)…')
+    try:
+        checked = server(device['id'])
+        try:
+            checked.start()
+        except ServerError as error:
+            log.warning('Graphics card check skipped: the server did not start on it (%s); indexing on the CPU', error)
+            return None
+        verdict = run_gpu_check(Client('index', home, checked.record, checked))
+        _store_verdict(home, _gpu_key(home, device), verdict)
+        log.info('Graphics card check: %s', verdict)
+        if verdict['passed']:
+            return checked
+        checked.stop()
+        return None
+    finally:
+        _status(None)
+
+
+def gpu_summary(settings=None):
+    """One line for Settings: the graphics card check's verdict or why it does not apply."""
+    home = home_of(settings)
+    if missing(settings):
+        return 'Not available: ' + missing(settings)
+    found = devices(home)
+    if not found:
+        return 'No usable graphics card: everything runs on the CPU'
+    best = max(found, key=lambda d: d['total_mib'])
+    if best['total_mib'] < MIN_GPU_MIB:
+        return f"{best['name']} has less than 1 GB of memory: everything runs on the CPU"
+    verdict = gpu_verdict(home, best)
+    if verdict is None:
+        return f"{best['name']}: not checked yet (runs at the next indexing on the graphics card)"
+    if verdict.get('passed'):
+        return f"{best['name']}: passed ({verdict.get('checked_at', '')}); indexing uses the graphics card"
+    return f"{best['name']}: failed — {verdict.get('reason') or 'unknown reason'}; indexing and answers use the CPU"
 
 
 def client(role, settings=None, pictures=False, fresh=False):
@@ -751,9 +823,42 @@ def call(role, path, payload, settings=None, pictures=False, timeout=QUERY_TIMEO
         return current.post(path, payload, timeout)
     except Gone as error:
         log.warning('llama.cpp %s server failed (%s); starting it again', role, error)
-        _drop(current.port)
-        _failed(role, settings, current)
-        return client(role, settings, pictures, fresh=True).post(path, payload, timeout)
+        return restart(role, settings, current, pictures).post(path, payload, timeout)
+
+
+def restart(role, settings, current, pictures=False):
+    """``current`` failed (not reachable): count the failure and find or start another server."""
+    _drop(current.port)
+    _failed(role, settings, current)
+    return client(role, settings, pictures, fresh=True)
+
+
+_starters = {}  # (home, role) -> [thread, error]
+
+
+def ready(role, settings=None, wait=8.0):
+    """Whether the role's server is up within ``wait`` seconds. The start runs on its own thread and carries on after
+    the wait, so a later call finds the server ready (the MCP server answers with keyword matches meanwhile)."""
+    key = (str(home_of(settings)), role)
+    current = _clients.get(key)
+    if current is not None and current.usable():
+        return True
+    with _locks_lock:
+        starter = _starters.get(key)
+        if starter is None or not starter[0].is_alive():
+            starter = [None, None]
+
+            def start():
+                try:
+                    client(role, settings)
+                except Exception as error:  # reported by the next call
+                    starter[1] = error
+            starter[0] = threading.Thread(target=start, name=f'llama-{role}-start', daemon=True)
+            _starters[key] = starter
+            starter[0].start()
+    starter[0].join(wait)
+    current = _clients.get(key)
+    return not starter[0].is_alive() and current is not None and current.usable()
 
 
 def _failed(role, settings, current):

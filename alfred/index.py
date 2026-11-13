@@ -6,7 +6,7 @@
 * Semantic search: EmbeddingGemma 2 vectors (normalised float32), compared with a
   dot product; vectors are cached per passage and rebuilt when the model changes.
 * Hybrid: reciprocal-rank fusion of both lists. Keyword search keeps working
-  when Ollama is unavailable.
+  when the search model is unavailable.
 * Enriched passages: both searches see each passage with a short header in front
   (file, folder, slide title / sheet columns / section heading, place), and,
   when turned on, a sentence or two of AI-written context situating it in its

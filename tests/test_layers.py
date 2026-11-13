@@ -2,7 +2,7 @@
 background mode, the content cache and the upgrade of an older index.
 
 Run from the repository folder:  .venv\\Scripts\\python -m unittest discover -s tests -v
-No Ollama, GPU or real OCR: OCR and the embedder are fakes.
+No model server, GPU or real OCR: OCR and the embedder are fakes.
 """
 import json
 import math
@@ -293,9 +293,8 @@ class BackgroundTests(Base):
         self.assertEqual(ocr.thread_plan(18), (4, 4))
         self.assertEqual(ocr.thread_plan(4), (1, 4))
         self.assertEqual(ocr.thread_plan(2), (1, 2))
-        from alfred import ai
-        self.assertEqual(ai._options('cpu', 4), {'num_gpu': 0, 'num_thread': 4})
-        self.assertEqual(ai._options('auto', 4), {})
+        from alfred import runtime
+        self.assertEqual(runtime.index_threads({'index_threads': 4}), 4)
 
 
 class UpgradeTests(Base):

@@ -27,8 +27,23 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## llama.cpp
+
+Alfred runs search by meaning and the answer model on this PC with `llama-server.exe` from
+[llama.cpp](https://github.com/ggml-org/llama.cpp) (build b12318), which is published under the MIT License. The engine
+is not part of this repository. When it is shipped with Alfred, its own `LICENSE` file (and the `LICENSE-LLVM-OpenMP`
+file that comes with the Windows build, for `libomp.dll`) must be shipped with it and its copyright line copied here
+from that file.
+
+## Models
+
+The model files are not part of this repository. EmbeddingGemma 2 (search) and gemma3:4b (answers on this PC) are
+published by Google; their terms (the Gemma Terms of Use, or Apache-2.0 if the model card says so) must be checked on
+each model card before the files are offered for download.
+
 ## Provider logos
 
-`alfred/assets/logos/` holds the Claude, Anthropic, OpenAI and Ollama marks as SVGs from
+`alfred/assets/logos/` holds the Claude, Anthropic and OpenAI marks as SVGs from
 [Simple Icons](https://simpleicons.org) (simple-icons 13.21.0, CC0 1.0). The logos are trademarks of their
 respective owners and are used only to identify which provider answers in Alfred; no endorsement is implied.
+`pc.svg` (the "On this PC" mark) was drawn for Alfred.

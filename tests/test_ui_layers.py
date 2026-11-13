@@ -1,5 +1,5 @@
 """Layered-indexing UI: progress text, the partial-index notice, background runs and battery resume.
-Pure helpers are tested directly; window methods run against fakes or a headless window (no network, no Ollama)."""
+Pure helpers are tested directly; window methods run against fakes or a headless window (no network, no model server)."""
 import os
 import sys
 import tempfile

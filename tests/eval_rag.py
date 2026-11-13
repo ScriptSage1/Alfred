@@ -1,6 +1,6 @@
 """Evaluate Ask Alfred on a folder of sample files (by default C:\\Users\\<you>\\AlfredSamples).
 
-    .venv\\Scripts\\python tests\\eval_rag.py --home <scratch folder> [--answers ollama:gemma3:4b,claude_code:sonnet]
+    .venv\\Scripts\\python tests\\eval_rag.py --home <scratch folder> [--answers local:gemma3:4b,claude_code:sonnet]
                                             [--rerankers none,bge-reranker-v2-m3] [--models <folder with reranker models>]
 
 1. Retrieval: for each question, does the expected file (and the passage with the expected fact)

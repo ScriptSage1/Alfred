@@ -1,7 +1,7 @@
 """MCP server tests: protocol, the two tools, consent per client, the call log, and what the module may touch.
 
 Run from the repository folder:  .venv\\Scripts\\python -m unittest discover -s tests -v
-Keyword mode or a fake embedder only: no Ollama, and every ALFRED_HOME is a temporary folder.
+Keyword mode, a fake embedder or the fake llama-server only, and every ALFRED_HOME is a temporary folder.
 """
 import io
 import json
@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -178,22 +179,49 @@ class SearchTests(McpBase):
 
 
 class EngineCheckTests(McpBase):
-    """Search by meaning runs on Alfred's llama.cpp runtime now: Ollama is neither probed nor started (M13 phase A;
-    phase B replaces the rest of the MCP server's Ollama code)."""
+    """Search by meaning runs on Alfred's llama.cpp runtime: the app's search server, or this process's own. A missing
+    model, or a server not ready within SEARCH_START_WAIT, gives keyword matches with a note; the start goes on."""
 
-    def test_ollama_is_not_probed_or_started_and_search_still_answers(self):
-        self.settings.update(embed_enabled=True, ollama_autostart=True)
-        kept = (mcp_server.ai.ollama_running, mcp_server.ai.ensure_ollama)
-        touched = []
-        mcp_server.ai.ollama_running = lambda *args, **kwargs: touched.append('probe') or False
-        mcp_server.ai.ensure_ollama = lambda *args, **kwargs: touched.append('start')
-        try:
+    def setUp(self):
+        super().setUp()
+        from unittest import mock
+        from alfred import models, runtime
+        self.runtime = runtime
+        self.settings.update(embed_enabled=True)
+        fake = [sys.executable, str(Path(__file__).resolve().parent / 'fake_llama.py')]
+        for patch in (mock.patch.dict(os.environ, {'ALFRED_HOME': str(self.home), 'FAKE_LLAMA_LOAD_SECONDS': '3'}),
+                      mock.patch.object(runtime, 'PROGRAM_OVERRIDE', fake),
+                      mock.patch.object(models, 'find', lambda key, home=None: self.home / f'{key}.gguf'),
+                      mock.patch.object(mcp_server, 'SEARCH_START_WAIT', 1.0)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def tearDown(self):  # before the temporary folder goes: the server's log is open
+        self.runtime.stop_all()
+        self.runtime._clients.clear()
+        self.runtime._starters.clear()
+        super().tearDown()
+
+    def test_a_missing_model_gives_keyword_matches_at_once(self):
+        from unittest import mock
+        with mock.patch.object(self.runtime, 'missing', lambda settings=None, **kw: 'The search model (EmbeddingGemma 2) is not downloaded'):
             data = self.payload(self.tool('search_files', {'query': 'harbour'}))
-        finally:
-            mcp_server.ai.ollama_running, mcp_server.ai.ensure_ollama = kept
         self.assertTrue(data['results'])
-        self.assertEqual(touched, [])
-        self.assertFalse((self.home / 'run' / 'search.json').exists())  # the index has no vectors: no server was needed
+        self.assertIn('not downloaded', data['notes'][0])
+        self.assertIn('keyword matches', data['notes'][0])
+        self.assertFalse((self.home / 'run' / 'search.json').exists())
+
+    def test_a_slow_start_gives_keyword_matches_within_the_wait_and_carries_on(self):
+        started = time.monotonic()
+        data = self.payload(self.tool('search_files', {'query': 'harbour'}))
+        self.assertLess(time.monotonic() - started, 2.5)  # SEARCH_START_WAIT (1 s here) plus the search itself
+        self.assertTrue(data['results'])
+        self.assertIn('still starting', data['notes'][0])
+        starter = self.runtime._starters[(str(self.home), 'search')][0]
+        starter.join(30)  # the start went on in the background
+        data = self.payload(self.tool('search_files', {'query': 'harbour'}))
+        self.assertFalse(any('still starting' in note for note in data.get('notes') or []))
+        self.assertTrue((self.home / 'run' / 'search.json').exists())
 
 
 class ReadTests(McpBase):
@@ -388,7 +416,7 @@ class StdioTests(unittest.TestCase):
             (folder / 'quay.txt').write_text('harbour pilot schedule für the quay', encoding='utf-8')
             settings = config.load(home)
             settings['tracked_folders'] = [str(folder)]
-            settings['embed_enabled'] = False  # keyword only: no Ollama is started or asked
+            settings['embed_enabled'] = False  # keyword only: no model server is started or asked
             settings.save()
             from alfred.index import Index
             index = Index(settings)

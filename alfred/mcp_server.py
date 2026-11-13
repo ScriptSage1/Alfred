@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import ai, config, extract, paths
+from . import ai, config, extract, paths, runtime
 from .index import SCHEMA_VERSION, Index
 
 PROTOCOLS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
@@ -26,7 +26,7 @@ CLIENTS_FILE, CALLS_FILE, OLD_CALLS_FILE = 'mcp_clients.json', 'mcp_calls.jsonl'
 MAX_LOG_BYTES = 5 * 1024 ** 2
 UNKNOWN_CLIENT = 'unknown client'
 MAX_QUERY, MAX_LIMIT, DEFAULT_LIMIT, MAX_PATH = 500, 20, 10, 2048
-OLLAMA_UP_SECONDS, OLLAMA_DOWN_SECONDS, OLLAMA_START_WAIT = 30, 60, 8.0  # how long a check of Ollama is trusted
+SEARCH_START_WAIT = 8.0  # seconds a search waits for the search model to start; then keyword matches (the start goes on)
 # Sent to the client when it connects: how to use the two tools and how to answer from them.
 INSTRUCTIONS = (
     "Alfred searches the user's own files on this PC (documents, PDFs, slides, spreadsheets, notes, and the text in pictures "
@@ -270,7 +270,6 @@ class Server:
         self.embedder = embedder
         self.index = None
         self.client = {'name': UNKNOWN_CLIENT, 'version': ''}
-        self._ollama = (None, None, 0.0)  # (base URL, running?, when checked)
 
     # ---- protocol
     def handle(self, message):
@@ -383,31 +382,20 @@ class Server:
         self.settings.update({k: v for k, v in stored.items() if k in config.DEFAULTS})
 
     def _embedder(self):
-        """(embedder or None, note): meaning search is the default; keyword only when Ollama is not available."""
+        """(embedder or None, note): meaning search is the default; keyword only when the search model is missing or does
+        not start within SEARCH_START_WAIT (it keeps starting in the background, so the next search has it). The search
+        server is the app's when the app runs, else this process's own (alfred.runtime)."""
         if self.embedder is not None:
             return self.embedder, None
         embedder = ai.Embedder.from_settings(self.settings)
         if embedder is None:
             return None, 'Search by meaning is turned off in Alfred; these are keyword matches.'
-        if embedder.kind == 'ollama' and not self._ollama_up(embedder):
-            return None, 'Ollama is not running, so search by meaning was unavailable; these are keyword matches.'
+        reason = runtime.missing(self.settings)
+        if reason:
+            return None, f'{reason}, so search by meaning was unavailable; these are keyword matches.'
+        if not runtime.ready('search', self.settings, wait=SEARCH_START_WAIT):
+            return None, 'The search model is still starting, so search by meaning was unavailable; these are keyword matches.'
         return embedder, None
-
-    def _ollama_up(self, embedder):
-        """Is Ollama answering? The last check is trusted for a while (30 s when up, 60 s when down), so a search does
-        not pay for a probe every time, and Ollama is started at most once a minute (only when the app would)."""
-        base, running, checked = self._ollama
-        now = time.monotonic()
-        if base == embedder.base and now - checked < (OLLAMA_UP_SECONDS if running else OLLAMA_DOWN_SECONDS):
-            return running
-        running = ai.ollama_running(embedder.base)
-        if not running and embedder.local and self.settings.get('ollama_autostart', True):
-            try:
-                running = bool(ai.ensure_ollama(embedder.base, wait=OLLAMA_START_WAIT)) and ai.ollama_running(embedder.base)
-            except Exception as error:
-                print(f'alfred mcp: could not start Ollama: {error}', file=sys.stderr)
-        self._ollama = (embedder.base, running, time.monotonic())
-        return running
 
     def _search(self, arguments):
         _check_keys(arguments, ('query', 'limit', 'kinds', 'modified_after', 'modified_before', 'path'))

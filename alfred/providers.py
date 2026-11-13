@@ -4,7 +4,7 @@ Every provider has the same shape — ``describe()``, ``status()``, ``models()``
 and ``stream(messages, on_token, cancel, on_status)`` — so the rest of Alfred never cares which
 one is in use:
 
-* ``ollama``      a model running in Ollama on this PC (the default; nothing leaves the PC)
+* ``local``       gemma3:4b on this PC, on a llama.cpp server Alfred owns (the default; nothing leaves the PC)
 * ``claude_code`` Claude through your Claude Pro/Max plan, via the Claude Code CLI
 * ``codex``       ChatGPT models through your ChatGPT Plus/Pro plan, via the Codex CLI
 * ``anthropic``   the Claude API with your API key
@@ -28,15 +28,15 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from . import ai, keys
+from . import ai, keys, runtime
 from .console import hidden
 from .ai import NotConfigured, ProviderError
 
 CLI_TIMEOUT = 300
-ORDER = ['ollama', 'claude_code', 'codex', 'anthropic', 'openai', 'compatible']
-VIA = {'ollama': 'on this PC', 'claude_code': 'through your Claude plan', 'codex': 'through your ChatGPT plan',
+ORDER = ['local', 'claude_code', 'codex', 'anthropic', 'openai', 'compatible']
+VIA = {'local': 'on this PC', 'claude_code': 'through your Claude plan', 'codex': 'through your ChatGPT plan',
        'anthropic': 'through the Claude API', 'openai': 'through the OpenAI API', 'compatible': 'through your custom server'}
-GROUPS = {'ollama': 'On this PC', 'claude_code': 'Claude · your plan', 'codex': 'ChatGPT · your plan', 'anthropic': 'Claude API',
+GROUPS = {'local': 'On this PC', 'claude_code': 'Claude · your plan', 'codex': 'ChatGPT · your plan', 'anthropic': 'Claude API',
           'openai': 'OpenAI API', 'compatible': 'Custom server'}
 ANTHROPIC_URL = 'https://api.anthropic.com'
 OPENAI_URL = 'https://api.openai.com/v1'
@@ -128,7 +128,7 @@ class Provider:
     @property
     def via(self):
         """'through your Claude plan', 'on this PC', ..."""
-        return VIA[self.kind] if self.cloud or self.kind == 'ollama' else 'on this PC'
+        return VIA[self.kind] if self.cloud or self.kind == 'local' else 'on this PC'
 
     @property
     def configured(self):
@@ -158,67 +158,6 @@ class Provider:
 
     def stream(self, messages, on_token=lambda t: None, cancel=None, on_status=lambda text: None):
         raise NotImplementedError
-
-
-# ------------------------------------------------------------------ ollama
-class Ollama(Provider):
-    kind = 'ollama'
-
-    def __init__(self, settings, model=None):
-        super().__init__(settings, model)
-        self.model = self.model.removesuffix(':latest')
-        self.base = ai._ollama_base(settings.get('base_url'))
-
-    @property
-    def cloud(self):
-        return not ai.is_local_url(self.base)
-
-    def status(self):
-        if ai.ollama_running(self.base, 1.0):
-            return {'state': 'ready', 'detail': 'Running'}
-        if ai.is_local_url(self.base) and ai.find_ollama():
-            return {'state': 'ready', 'detail': 'Starts when needed'}
-        return {'state': 'missing', 'detail': 'Ollama is not installed (ollama.com)'}
-
-    def models(self):
-        return [(m['model'], m['model']) for m in ai.available_models(self.settings)]
-
-    def effort_options(self):
-        if not self.configured:
-            return [], 'Choose a chat model first.'
-        if 'thinking' not in ai.model_capabilities(self.base, self.model):
-            return [], f'{self.model} answers directly (it has no thinking mode).'
-        if 'gpt-oss' in self.model:
-            return [('low', 'Low'), ('medium', 'Medium'), ('high', 'High')], 'How long the model thinks before answering.'
-        return [('off', 'Off'), ('on', 'On')], 'Thinking first gives better answers to hard questions, but takes longer.'
-
-    def stream(self, messages, on_token=lambda t: None, cancel=None, on_status=lambda text: None):
-        self.require()
-        effort = (self.settings.get('effort') or 'off').lower()
-        # Room for the passages Ask Alfred sends (about 6k tokens), the chat so far and the answer; Ollama's default is 4k.
-        context = max(2048, min(int(self.settings.get('ollama_context') or 10240), 131072))
-        payload = {'model': self.model, 'messages': messages, 'stream': True, 'keep_alive': ai.keep_alive(self.settings),
-                   'options': dict(ai._options(self.settings.get('device', 'auto')), temperature=self.settings.get('temperature', 0.2),
-                                   num_ctx=context)}
-        if 'thinking' in ai.model_capabilities(self.base, self.model):
-            payload['think'] = effort if 'gpt-oss' in self.model else effort != 'off'
-        parts = []
-        with _post_stream(self.base + '/api/chat', payload, {}) as response:
-            for raw in response:
-                if cancel is not None and cancel.is_set():
-                    break
-                event = json.loads(raw.decode('utf-8', 'replace') or '{}')
-                if event.get('error'):
-                    raise ProviderError(event['error'])
-                message = event.get('message') or {}
-                if message.get('thinking') and not parts:
-                    on_status('Thinking…')
-                if message.get('content'):
-                    parts.append(message['content'])
-                    on_token(message['content'])
-                if event.get('done'):
-                    break
-        return ''.join(parts)
 
 
 # --------------------------------------------------------- openai-style API
@@ -253,11 +192,15 @@ class OpenAICompatible(Provider):
             return []
         return sorted((m['id'], m['id']) for m in data if m.get('id'))
 
+    def options(self):
+        """Extra request fields (sampling settings)."""
+        return {}
+
     def stream(self, messages, on_token=lambda t: None, cancel=None, on_status=lambda text: None):
         self.require()
         if self.status()['state'] != 'ready':
             raise NotConfigured(f'{self.label} isn’t set up — add it in Settings → AI model.')
-        payload = {'model': self.model, 'messages': messages, 'stream': True}
+        payload = dict(self.options(), model=self.model, messages=messages, stream=True)
         parts = []
         with _post_stream(self.base + '/chat/completions', payload, self.headers()) as response:
             for event in _sse(response, cancel):
@@ -269,6 +212,80 @@ class OpenAICompatible(Provider):
                         parts.append(text)
                         on_token(text)
         return ''.join(parts)
+
+
+class Local(OpenAICompatible):
+    """gemma3:4b on this PC: OpenAICompatible pointed at the ``answer`` server of alfred.runtime, with its key. The server
+    starts on the first question and stops keep_alive_minutes after the last answer."""
+    kind = 'local'
+    cloud = False
+    MODEL = 'gemma3:4b'
+
+    def __init__(self, settings, model=None):
+        super().__init__(settings, model)
+        self.server = None
+
+    @property
+    def base(self):
+        return f'{self.server.base}/v1' if self.server is not None else ''
+
+    def headers(self):
+        return {'Authorization': f'Bearer {self.server.key}'} if self.server is not None else {}
+
+    def options(self):
+        return {'temperature': self.settings.get('temperature', 0.2)}
+
+    def status(self):
+        reason = runtime.missing(self.settings, answer=True)
+        if reason:
+            return {'state': 'missing', 'detail': reason}
+        return {'state': 'ready', 'detail': 'Starts when needed'}
+
+    def models(self):
+        return [(self.MODEL, 'Gemma 3 4B')] if self.status()['state'] == 'ready' else []
+
+    def effort_options(self):
+        return [], f'{self.model or self.MODEL} answers directly.'
+
+    def _connect(self, failed=None):
+        try:
+            self.server = runtime.client('answer', self.settings) if failed is None else runtime.restart('answer', self.settings, failed)
+        except runtime.ServerError as error:
+            raise ProviderError(str(error)) from None
+
+    def _done(self):
+        runtime.release('answer', self.settings, after=runtime.keep_alive_seconds(self.settings))
+
+    def stream(self, messages, on_token=lambda t: None, cancel=None, on_status=lambda text: None):
+        self.require()
+        if self.status()['state'] != 'ready':
+            raise NotConfigured(self.status()['detail'])
+        self._connect()
+        try:
+            try:
+                return super().stream(messages, on_token, cancel, on_status)
+            except ProviderError as error:
+                if not str(error).startswith('Cannot reach'):
+                    raise
+                self._connect(failed=self.server)  # the server went away: start it again once
+                return super().stream(messages, on_token, cancel, on_status)
+        finally:
+            self._done()
+
+    def complete(self, messages, max_tokens=None, temperature=None):
+        """One short answer without streaming (passage contexts, query rewrites)."""
+        payload = dict(self.options(), model=self.model or self.MODEL, messages=messages, stream=False)
+        if max_tokens:
+            payload['max_tokens'] = max_tokens
+        if temperature is not None:
+            payload['temperature'] = temperature
+        try:
+            result = runtime.call('answer', '/v1/chat/completions', payload, self.settings, timeout=runtime.BATCH_TIMEOUT)
+            return ((result.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        except runtime.ServerError as error:
+            raise ProviderError(str(error)) from None
+        finally:
+            self._done()
 
 
 class OpenAI(OpenAICompatible):
@@ -623,14 +640,14 @@ class Codex(CLIProvider):
         return ''.join(parts)
 
 
-KINDS = {'ollama': Ollama, 'claude_code': ClaudeCode, 'codex': Codex, 'anthropic': Anthropic, 'openai': OpenAI,
+KINDS = {'local': Local, 'claude_code': ClaudeCode, 'codex': Codex, 'anthropic': Anthropic, 'openai': OpenAI,
          'compatible': OpenAICompatible}
 
 
 def for_settings(settings, kind=None, model=None):
     """The provider (and model) Ask Alfred should use."""
-    kind = kind or settings.get('provider') or 'ollama'
-    return KINDS.get(kind, Ollama)(settings, model)
+    kind = kind or settings.get('provider') or 'local'
+    return KINDS.get(kind, Local)(settings, model)
 
 
 def catalog(settings):

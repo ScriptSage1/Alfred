@@ -3,12 +3,13 @@
     python fake_llama.py <llama-server arguments>
 
 Speaks what Alfred uses: GET /health, GET /props, POST /v1/embeddings, POST /embeddings (pictures, with the media
-marker), and a POST /v1/chat/completions stub (phase B). Like the real server it wants the key from LLAMA_API_KEY,
+marker), and POST /v1/chat/completions ("A fake answer.", streamed in three pieces when asked). Like the real server it wants the key from LLAMA_API_KEY,
 refuses an input longer than a slot reads with HTTP 500 "input (N tokens) is too large to process" (one character
 counts as one token here), and answers a picture request with a wrong marker with HTTP 400.
 
 Test hooks: --list-devices prints FAKE_LLAMA_DEVICES (lines separated by ';'); every start is appended, with its
-arguments, to ALFRED_HOME\\fake_starts.jsonl; POST /_test/marker gives the server a new marker.
+arguments, to ALFRED_HOME\\fake_starts.jsonl; POST /_test/marker gives the server a new marker; a server started with
+--device FAKE_LLAMA_FAIL_DEVICE exits at once.
 """
 import hashlib
 import json
@@ -35,6 +36,9 @@ if '--version' in ARGS:
     print('version: 0.0.0-fake (build 4242, commit fake)')
     sys.exit(0)
 
+if os.environ.get('FAKE_LLAMA_FAIL_DEVICE') and value('--device') == os.environ['FAKE_LLAMA_FAIL_DEVICE']:
+    print('ggml_vulkan: device lost (fake)', flush=True)
+    sys.exit(1)  # this device cannot even start a server
 KEY = os.environ.get('LLAMA_API_KEY')
 CONTEXT, SLOTS = int(value('-c', 4096)), int(value('-np', 1))
 SLOT = CONTEXT // SLOTS
@@ -120,8 +124,21 @@ class Handler(BaseHTTPRequestHandler):
             print(f'pictures {len(results)}', flush=True)
             return self.send(200, results)
         if self.path == '/v1/chat/completions':
-            return self.send(200, {'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': 'stop',
-                                                                              'message': {'role': 'assistant', 'content': 'A fake answer.'}}]})
+            answer = 'A fake answer.'
+            if not payload.get('stream'):
+                return self.send(200, {'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': 'stop',
+                                                                                  'message': {'role': 'assistant', 'content': answer}}]})
+            self.send_response(200)  # server-sent events, then the connection closes
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            for piece in ('A ', 'fake ', 'answer.'):
+                chunk = {'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': piece}}]}
+                self.wfile.write(f'data: {json.dumps(chunk)}\n\n'.encode())
+                self.wfile.flush()
+            self.wfile.write(b'data: [DONE]\n\n')
+            self.close_connection = True
+            return
         self.send(404, {'error': {'code': 404, 'message': 'File Not Found'}})
 
 

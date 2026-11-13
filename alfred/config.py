@@ -1,7 +1,7 @@
 """Single source of truth for Alfred settings.
 
 Settings live in %LOCALAPPDATA%\\Alfred\\settings.json (override with
-ALFRED_HOME), outside the repository. Search models run locally on llama.cpp (alfred.runtime).
+ALFRED_HOME), outside the repository. Local models run on llama.cpp servers Alfred owns (alfred.runtime).
 """
 import json
 import logging
@@ -16,24 +16,21 @@ DEFAULTS = {
     'tracked_folders': [],
     'auto_index': True,          # watch tracked folders and index new/changed files automatically
     # Chat (Ask Alfred): which provider writes answers (see alfred.providers) and its model. Empty until you choose.
-    'provider': 'ollama',        # ollama | claude_code | codex | anthropic | openai | compatible
+    'provider': 'local',         # local | claude_code | codex | anthropic | openai | compatible
     'model': '',
     'compatible_base_url': '',   # an OpenAI-compatible server, e.g. https://openrouter.ai/api/v1
     'cloud_ok': [],              # cloud providers whose privacy notice you've accepted
-    'base_url': 'http://127.0.0.1:11434',  # Ollama
-    'device': 'auto',            # 'auto' (GPU when available) | 'cpu'
+    'device': 'auto',            # the answer model's device: 'auto' (GPU when available) | 'cpu'
     'effort': 'off',             # thinking, for models that support it: off | on (gpt-oss: low | medium | high)
     'temperature': 0.2,
     'top_k': 6,
-    'ollama_autostart': True,    # start Ollama (headless) and warm the search model when Alfred starts
-    'keep_alive_minutes': 5,
-    'ollama_context': 10240,     # tokens a local chat model reads at once (passages + chat so far + answer)
+    'keep_alive_minutes': 5,     # a local model stays loaded this long after its last use
+    'answer_context': 10240,     # tokens the answer model on this PC reads at once (passages + chat so far + answer)
     # Answers from your files (alfred.rag).
     'answer_beyond_files': True, # the model may add general knowledge, clearly labelled, after what your files say
     'rerank_enabled': True,      # reorder candidate passages with the local reranker once it's downloaded
     'rerank_model': 'bge-reranker-v2-m3',
-    'contextual_chunks': False,  # a local model writes a line of context for every passage while indexing (slow, better recall)
-    'context_model': '',         # empty = gemma3:4b (alfred.ai.DEFAULT_CONTEXT_MODEL)
+    'contextual_chunks': False,  # the answer model on this PC writes a line of context for every passage while indexing (slow, better recall)
     # Chat history: one JSON file per chat. Empty folder = %LOCALAPPDATA%\Alfred\Chats.
     'save_chat_history': True,
     'chats_folder': '',
@@ -90,6 +87,18 @@ def retire_legacy(home):
     logging.getLogger('alfred').info('Moved an earlier Alfred’s settings and index to %s', backup)
 
 
+def migrate(settings, loaded):
+    """Settings files written before Alfred ran its own models (M13). Each old key is read once: save() keeps only the
+    keys in DEFAULTS, so it is gone after the next save.
+      ollama_context  -> answer_context
+      provider ollama -> no model chosen (provider local, model empty): never silently switched to the model on this PC
+      ollama_autostart, base_url, context_model, embed_provider, embed_base_url, embed_model: dropped"""
+    if 'answer_context' not in loaded and isinstance(loaded.get('ollama_context'), int):
+        settings['answer_context'] = loaded['ollama_context']
+    if loaded.get('provider') == 'ollama':
+        settings['provider'], settings['model'] = 'local', ''
+
+
 class Settings(dict):
     """Dict of settings; ``save()`` persists atomically."""
 
@@ -105,7 +114,8 @@ class Settings(dict):
             try:
                 loaded = json.loads(self.path.read_text(encoding='utf-8-sig'))
                 self.update({k: v for k, v in loaded.items() if k in DEFAULTS})
-            except (OSError, ValueError):
+                migrate(self, loaded)
+            except (OSError, ValueError, AttributeError):
                 pass
 
     def save(self):

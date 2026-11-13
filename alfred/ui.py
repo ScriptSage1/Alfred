@@ -167,7 +167,7 @@ class NumberBox(QSpinBox):
         QTimer.singleShot(0, self.selectAll)  # after the click has placed the cursor
 
 
-# How long Ollama may keep a model loaded after its last use (minutes; ai.keep_alive caps it at a day).
+# How long a local model stays loaded after its last use (minutes; ai.keep_alive_minutes caps it at a day).
 KEEP_LOADED = (5, 10, 15, 30, 60, 120, 240, 480, 1440)
 
 
@@ -881,7 +881,6 @@ class SearchView(QWidget):
         options = self.filter_options()
         def work(signals):
             embedder = ai.Embedder.from_settings(settings)
-            down = bool(embedder and embedder.kind == 'ollama' and embedder.local and not ai.ollama_running(embedder.base, 0.6))
             results = index.search(query, limit=24, mode='hybrid', embedder=embedder, include_weak=True, **options)
             pending = None
             if not any(not r.get('weak') for r in results) and not options['kinds'] and not options['modified_after']:
@@ -889,8 +888,8 @@ class SearchView(QWidget):
                 if time.monotonic() - when > PENDING_REUSE_SECONDS:  # a disk walk: not once per keystroke
                     pending = index.pending_changes()
                     self.pending_seen = (time.monotonic(), pending)
-            return results, pending, down
-        run_job(work, lambda value: (self.show(value[0], generation, query, value[1]), value[2] and self.heal(generation)),
+            return results, pending
+        run_job(work, lambda value: self.show(value[0], generation, query, value[1]),
                 lambda error: generation == self.generation and self.show_error(error))
 
     def show_error(self, error):
@@ -898,15 +897,6 @@ class SearchView(QWidget):
         self.empty.show_state('Search unavailable', str(error), [('Rescan', self.win.start_index)], 'warning')
         self.stack.setCurrentIndex(0)
         self.win.update_height()
-
-    def heal(self, generation):
-        """Ollama isn't running, so this search was keyword-only: start it and search again once it's ready."""
-        if not self.win.settings.get('ollama_autostart', True):
-            self.win.toast('Ollama isn’t running — searching by keyword only (Settings → Start Ollama automatically)', 'orange', seconds=8)
-            return
-        if not self.win.warming:  # one notice, even if several searches notice at once
-            self.win.toast('Ollama wasn’t running — starting it; this search will refresh with matches by meaning', 'orange', seconds=8)
-        self.win.warm_up(on_ready=lambda: generation == self.generation and self.query and self.run())
 
     def show(self, results, generation, query, pending=None):
         if generation != self.generation:
@@ -1895,12 +1885,12 @@ class AskView(QWidget):
         where = 'runs on this PC' if not provider.cloud else f'answers {provider.via}'
         folders = self.win.settings.folders
         if not chosen:
-            local = next((e for e in self.models if e['kind'] == 'ollama'), None)
+            local = next((e for e in self.models if e['kind'] == 'local'), None)
             self.intro_title.setText('Choose a model to chat with your files')
-            lead = ('Use a model on this PC through Ollama, or Claude or ChatGPT with your subscription or an API key. '
+            lead = ('Use a model on this PC, or Claude or ChatGPT with your subscription or an API key. '
                     'Alfred answers from the folders you track.')
             missing = self.models_known and local is not None and not local['models']
-            self.intro_text.setText(f'{lead} (No local chat models yet — e.g. ollama pull gemma3:4b)' if missing else lead)
+            self.intro_text.setText(f'{lead} (The model for this PC, gemma3:4b, is not downloaded yet.)' if missing else lead)
             self.intro_button.setText('Choose a model')
             self.intro_button.show()
             self.suggestions.hide()
@@ -1940,7 +1930,7 @@ class AskView(QWidget):
         def opened(value):
             entries, (efforts, _) = value
             self.models, self.models_known = entries, True
-            current = (settings.get('provider') or 'ollama', settings.get('model') or '')
+            current = (settings.get('provider') or 'local', settings.get('model') or '')
             items = picker.model_items(entries, current, efforts, settings.get('effort'))
             self.popover = popover = picker.Popover(self.win, items)
             popover.chosen.connect(self.picked)
@@ -2134,11 +2124,6 @@ class AskView(QWidget):
         history, settings, index = list(self.history), self.win.settings, self.win.index
 
         def work(signals):
-            if settings.get('ollama_autostart', True):
-                try:
-                    ai.ensure_ollama(settings.get('base_url'))
-                except ai.ProviderError as error:
-                    logging.getLogger('alfred').warning('Ollama unavailable before Ask: %s', error)
             return rag.ask(index, settings, question, history, on_token=signals.token.emit, cancel=cancel,
                            on_evidence=signals.progress.emit, only_path=scope,
                            on_status=lambda text: signals.progress.emit(('status', text)))
@@ -2617,7 +2602,7 @@ class SettingsView(QWidget):
         g.outer.addWidget(self.rerank_status)
         self.contextual = Toggle(pal)
         g.row('Add AI context to passages', self.contextual,
-              'While indexing, a local model in Ollama writes a line saying where each passage sits in its document. Finds more; indexing is slower.')
+              'While indexing, the answer model on this PC writes a line saying where each passage sits in its document. Finds more; indexing is slower.')
         self.rerank_job = None
         body.addWidget(g)
 
@@ -2639,20 +2624,22 @@ class SettingsView(QWidget):
         g.rows.addWidget(holder)
         body.addWidget(g)
 
-        g = Group(win, 'OLLAMA', 'Runs local models: chat models you pick, plus the search model (which also reads pictures).')
+        g = Group(win, 'ON THIS PC', 'Alfred runs its local models itself (llama.cpp): the answer model when you choose it, plus the '
+                                     'search model (which also reads pictures). Nothing runs until it is needed.')
         self.device = QComboBox()
         self.device.addItems(['Auto (GPU when available)', 'CPU only'])
         self.device.setMinimumWidth(260)
-        g.row('Device', self.device)
-        self.base_url = QLineEdit()
-        self.base_url.setMinimumWidth(260)
-        g.row('Ollama server', self.base_url)
-        self.autostart = Toggle(pal)
-        g.row('Start Ollama automatically', self.autostart, 'When Alfred starts, start Ollama in the background if it isn’t running')
+        g.row('Answer model device', self.device)
         self.keep_minutes = QComboBox()
         for minutes in KEEP_LOADED:
             self.keep_minutes.addItem(duration_text(minutes), minutes)
-        g.row('Keep models loaded', self.keep_minutes, 'After the last use; then Ollama unloads them and frees GPU memory')
+        g.row('Keep models loaded', self.keep_minutes, 'After the last use; then the model is unloaded and its memory is freed')
+        self.gpu_check = label('Not checked yet.', 'caption', wrap=True)
+        gpu_row = QHBoxLayout()
+        gpu_row.addWidget(self.gpu_check, 1)
+        gpu_row.addWidget(button('Check again', self.check_gpu_again, None,
+                                 'Forget the last result; the next indexing run on the graphics card checks it again'))
+        g.row('Graphics card check', gpu_row, 'Once per driver: the graphics card must compute the same vectors as the CPU')
         body.addWidget(g)
 
         g = Group(win, 'CHATS', 'Chats are saved as files on this PC, so you can reopen them from the history panel (Ctrl+H) in Ask Alfred. '
@@ -2669,20 +2656,19 @@ class SettingsView(QWidget):
         g.row('Saved chats', self.delete_chats)
         body.addWidget(g)
 
-        g = Group(win, 'SEARCH BY MEANING', 'EmbeddingGemma 2 runs in Ollama on this PC and finds passages by meaning, not just matching words. '
-                                         'Keyword search always works, even when Ollama is off.')
+        g = Group(win, 'SEARCH BY MEANING', 'EmbeddingGemma 2 runs on this PC and finds passages by meaning, not just matching words. '
+                                         'Keyword search always works, even while the search model is not running.')
         self.embed_enabled = Toggle(pal)
-        self.embed_model, self.embed_url = QLineEdit(), QLineEdit()
         self.embed_device = QComboBox()
         self.embed_device.addItems(['Auto (GPU when available)', 'CPU only'])
+        self.embed_device.setMinimumWidth(300)
         self.embed_batch = NumberBox()
         self.embed_batch.setRange(1, 128)
-        for widget in (self.embed_model, self.embed_url, self.embed_device):
-            widget.setMinimumWidth(300)
+        self.search_on_gpu = Toggle(pal)
         g.row('Use embeddings', self.embed_enabled)
-        g.row('Model', self.embed_model)
-        g.row('Ollama server', self.embed_url)
-        g.row('Device', self.embed_device)
+        g.row('Indexing device', self.embed_device)
+        g.row('Search on the graphics card', self.search_on_gpu,
+              'Off: searches run on the CPU (about 20 ms each), so search needs no graphics memory')
         g.row('Batch size', self.embed_batch, 'Lower it if the GPU runs out of memory')
         body.addWidget(g)
 
@@ -2712,7 +2698,7 @@ class SettingsView(QWidget):
         g.add(self.mcp_calls)
         body.addWidget(g)
 
-        g = Group(win, 'DIAGNOSTICS', 'A detected GPU is not the same as an accelerated model. Device facts come from nvidia-smi and from Ollama’s own report — nothing is inferred.')
+        g = Group(win, 'DIAGNOSTICS', 'A detected GPU is not the same as an accelerated model. Device facts come from nvidia-smi and from the servers Alfred started — nothing is inferred.')
         row = QHBoxLayout()
         row.addWidget(button('Check status', lambda: self.diagnose(False)))
         row.addWidget(button('Run test inference', lambda: self.diagnose(True), 'primary'))
@@ -2731,7 +2717,7 @@ class SettingsView(QWidget):
         self.start_login = Toggle(pal)
         self.start_login.toggled.connect(self.change_start_login)
         g.row('Start Alfred when you sign in', self.start_login,
-              'Starts hidden in the tray, so the shortcut works right away; it also starts Ollama for search by meaning')
+              'Starts hidden in the tray, so the shortcut works right away; models load only when first needed')
         self.hotkey_edit = QKeySequenceEdit()
         self.hotkey_edit.setMaximumSequenceLength(1)
         self.hotkey_edit.setFixedWidth(170)
@@ -2747,14 +2733,13 @@ class SettingsView(QWidget):
         body.addStretch()
 
         self.save_timer = QTimer(self, singleShot=True, timeout=self.save)
-        for widget in (self.base_url, self.embed_model, self.embed_url, self.compatible_url):
-            widget.textEdited.connect(lambda _: self.save_timer.start(600))
+        self.compatible_url.textEdited.connect(lambda _: self.save_timer.start(600))
         for widget in (self.device, self.embed_device, self.theme, self.effort):
             widget.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
         self.embed_batch.valueChanged.connect(lambda _: self.save_timer.start(600))
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
         self.keep_minutes.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
-        for toggle in (self.embed_enabled, self.ocr_enabled, self.reduce_motion, self.auto_index, self.autostart, self.save_chats,
+        for toggle in (self.embed_enabled, self.ocr_enabled, self.reduce_motion, self.auto_index, self.search_on_gpu, self.save_chats,
                        self.beyond, self.rerank_enabled, self.contextual):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
         self.rerank_model.currentIndexChanged.connect(lambda _: (self.save_timer.start(250), self.show_rerank()))
@@ -2766,13 +2751,11 @@ class SettingsView(QWidget):
         s = self.win.settings
         for widget in self.findChildren(QWidget):
             widget.blockSignals(True)
-        self.base_url.setText(s.get('base_url') or ai.OLLAMA_DEFAULT)
         self.compatible_url.setText(s.get('compatible_base_url') or '')
         self.device.setCurrentIndex(1 if s.get('device') == 'cpu' else 0)
         self.embed_enabled.setChecked(bool(s.get('embed_enabled')))
-        self.embed_model.setText(s.get('embed_model') or '')
-        self.embed_url.setText(s.get('embed_base_url') or '')
         self.embed_device.setCurrentIndex(1 if s.get('embed_device') == 'cpu' else 0)
+        self.search_on_gpu.setChecked(bool(s.get('search_on_gpu')))
         self.embed_batch.setValue(int(s.get('embed_batch') or 16))
         self.ocr_enabled.setChecked(bool(s.get('ocr_enabled', True)))
         self.video_interval.setValue(int(s.get('video_interval') or 10))
@@ -2780,8 +2763,7 @@ class SettingsView(QWidget):
         self.theme.setCurrentIndex({'system': 0, 'dark': 1, 'light': 2}.get(s.get('theme'), 0))
         self.reduce_motion.setChecked(bool(s.get('reduce_motion')))
         self.auto_index.setChecked(bool(s.get('auto_index', True)))
-        self.autostart.setChecked(bool(s.get('ollama_autostart', True)))
-        self.show_keep_loaded(int(ai.keep_alive(s)[:-1]))
+        self.show_keep_loaded(ai.keep_alive_minutes(s))
         self.beyond.setChecked(bool(s.get('answer_beyond_files', True)))
         self.rerank_enabled.setChecked(bool(s.get('rerank_enabled', True)))
         self.rerank_model.setCurrentIndex(max(0, self.rerank_model.findData(s.get('rerank_model') or rerank.DEFAULT)))
@@ -2797,7 +2779,19 @@ class SettingsView(QWidget):
         run_job(lambda s: startup.enabled(), self.show_start_login)
         self.tracked.load()
         self.show_index_info()
+        self.show_gpu_check()
         self.loading = False
+
+    def show_gpu_check(self):
+        """The graphics card check's verdict or reason (asking llama-server for devices takes a moment: in the background)."""
+        settings = self.win.settings
+        run_job(lambda s: ai.runtime.gpu_summary(settings), lambda text: self.gpu_check.setText(text),
+                lambda error: self.gpu_check.setText(f'Unknown ({error})'))
+
+    def check_gpu_again(self):
+        ai.runtime.clear_gpu_verdict(self.win.settings.home)
+        self.win.toast('The graphics card is checked again at the next indexing run', 'green', seconds=4)
+        self.show_gpu_check()
 
     def mcp_command_line(self):
         exe = sys.executable
@@ -3007,7 +3001,7 @@ class SettingsView(QWidget):
             art.setPixmap(brand_pixmap(picker.LOGOS[art.kind], 24, self.win.pal['text']))
         for entry in entries:
             kind, state = entry['kind'], entry['status']['state']
-            if kind == 'ollama':
+            if kind == 'local':
                 continue
             color = {'ready': 'green', 'signed_out': 'orange', 'unreachable': 'red'}.get(state)
             dot = self.account_dot[kind]
@@ -3182,18 +3176,19 @@ class SettingsView(QWidget):
         if self.loading:
             return
         s = self.win.settings
-        before = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('contextual_chunks'))
+        before = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('video_interval'), s.get('contextual_chunks'))
         before_model = (s.get('provider'), s.get('model'))
-        s.update(base_url=self.base_url.text().strip() or ai.OLLAMA_DEFAULT, compatible_base_url=self.compatible_url.text().strip())
+        before_search = s.get('search_on_gpu')
+        s.update(compatible_base_url=self.compatible_url.text().strip())
         if self.effort.isEnabled() and self.effort.currentData() is not None:
             s['effort'] = self.effort.currentData()
         s.update({'device': 'cpu' if self.device.currentIndex() else 'auto',
-                  'embed_enabled': self.embed_enabled.isChecked(), 'embed_model': self.embed_model.text().strip(),
-                  'embed_base_url': self.embed_url.text().strip(), 'embed_device': 'cpu' if self.embed_device.currentIndex() else 'auto',
+                  'embed_enabled': self.embed_enabled.isChecked(), 'search_on_gpu': self.search_on_gpu.isChecked(),
+                  'embed_device': 'cpu' if self.embed_device.currentIndex() else 'auto',
                   'embed_batch': self.embed_batch.value(), 'ocr_enabled': self.ocr_enabled.isChecked(),
                   'video_interval': self.video_interval.value(), 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
                   'reduce_motion': self.reduce_motion.isChecked(), 'auto_index': self.auto_index.isChecked(),
-                  'ollama_autostart': self.autostart.isChecked(), 'keep_alive_minutes': self.keep_minutes.currentData(),
+                  'keep_alive_minutes': self.keep_minutes.currentData(),
                   'save_chat_history': self.save_chats.isChecked(), 'answer_beyond_files': self.beyond.isChecked(),
                   'rerank_enabled': self.rerank_enabled.isChecked(), 'rerank_model': self.rerank_model.currentData() or rerank.DEFAULT,
                   'contextual_chunks': self.contextual.isChecked()})
@@ -3206,7 +3201,9 @@ class SettingsView(QWidget):
         if (s.get('provider'), s.get('model')) != before_model:
             self.load_effort()
             self.show_location()
-        after = (s.get('embed_enabled'), s.get('embed_model'), s.get('ocr_enabled'), s.get('video_interval'), s.get('contextual_chunks'))
+        if s.get('search_on_gpu') != before_search:
+            ai.runtime.stop('search', s)  # this process's search server restarts on its new device at the next search
+        after = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('video_interval'), s.get('contextual_chunks'))
         if after != before:
             self.win.toast('Saved · updating your index', 'green', seconds=4)
             self.win.start_index(quiet=True)
@@ -3229,10 +3226,6 @@ class SettingsView(QWidget):
                 lines.append(f"**GPU detected:** {g['name']} · {g['vram_used_mib']:,} / {g['vram_total_mib']:,} MiB in use · driver {g['driver']}")
             if not r['gpu']['available']:
                 lines.append(f"**GPU detected:** none — {r['gpu'].get('note', '')}")
-            if r.get('ollama'):
-                o = r['ollama']
-                lines.append(f"**Ollama:** {'v' + str(o.get('version')) if o.get('running') else 'not running'}" +
-                             (' · ' + ', '.join(f"{m['model']} → {m['device']}" for m in o['loaded']) if o.get('loaded') else ' · nothing loaded'))
             for key, name in (('chat', 'Chat'), ('embeddings', 'Search by meaning')):
                 info = r.get(key, {})
                 if (key == 'chat' and not info.get('configured')) or (key != 'chat' and not info.get('enabled')):
@@ -3343,6 +3336,9 @@ class AlfredWindow(QWidget):
         self.battery_timer = QTimer(self, interval=60000, timeout=self.battery_tick)
         self.hotkey, self.open_action = None, None
         self.warming = False
+        self.engine_signals = Signals()  # the runtime reports from worker threads ("Preparing the graphics card (once)…")
+        self.engine_signals.progress.connect(self.engine_status)
+        ai.runtime.status_hook = self.engine_signals.progress.emit
         self.watcher = FolderWatcher(parent=self)
         self.watcher.changed.connect(self.auto_index)
         self.backdrop, self.grab_origin = None, QPoint()
@@ -3788,50 +3784,42 @@ class AlfredWindow(QWidget):
             return ('Your folders haven’t been indexed yet', 'Index them now to start searching.', [('Index now', self.start_index)], 'refresh')
         return None
 
-    def warm_up(self, on_ready=None, retry=True):
-        """Start Ollama if needed and pre-load the models; each open restarts their keep-alive timer."""
+    def warm_up(self, on_ready=None):
+        """Wake the search server (starting it if needed) when the panel opens, so its 1.3-1.6 s wake overlaps with
+        typing. Keyword results never wait for it."""
         if on_ready is not None:
             self.ready_callbacks = getattr(self, 'ready_callbacks', []) + [on_ready]
-        if self.warming or not self.settings.get('ollama_autostart', True):
+        if self.warming or not self.settings.get('embed_enabled'):
             return
-        uses_ollama = bool(self.settings.get('model')) or bool(self.settings.get('embed_enabled'))
-        if not uses_ollama:
+        settings = self.settings
+        if ai.runtime.missing(settings):  # the engine or the search model is not on this PC: keyword search only
             return
         self.warming = True
-        settings = dict(self.settings)
-        minutes = ai.keep_alive(settings)[:-1]
-
-        def progress(text):
-            if not self.toasting:
-                self.status_label.setText(f"<span style='color:{self.pal['accent'].name()}'>●</span>&nbsp; {html.escape(text)}")
-            self.shimmer.start()
 
         def done(report):
             self.warming = False
-            logging.getLogger('alfred').info('Ollama ready (started=%s, loaded=%s)', report['started'], report['loaded'])
+            logging.getLogger('alfred').info('Search model awake (started=%s)', report['started'])
             callbacks, self.ready_callbacks = getattr(self, 'ready_callbacks', []), []
             for callback in callbacks:
                 callback()
-            if not self.indexing:
-                self.shimmer.stop()
-            if report['started']:
-                self.toast(f"Ollama started · models ready and kept loaded {minutes} min after last use", 'green', seconds=5)
-            elif not self.toasting:
-                self.status_label.setText(self.status_text())
-            self.update()
 
         def failed(error):
             self.warming = False
+            self.ready_callbacks = []
+            logging.getLogger('alfred').warning('The search model did not start: %s', error)
+        run_job(lambda s: ai.warm_up(settings), done, failed)
+
+    def engine_status(self, text):
+        """runtime's status line (for example "Preparing the graphics card (once)…"); None when it is over."""
+        if text:
+            if not self.toasting:
+                self.status_label.setText(f"<span style='color:{self.pal['accent'].name()}'>●</span>&nbsp; {html.escape(text)}")
+            self.shimmer.start()
+        else:
             if not self.indexing:
                 self.shimmer.stop()
-            logging.getLogger('alfred').warning('Ollama start failed: %s', error)
-            if retry:  # e.g. right after boot the GPU driver may not be ready yet: try once more shortly
-                self.toast(f'Ollama didn’t start ({error}) — retrying in 30 s; searching by keyword meanwhile', 'orange', seconds=8)
-                QTimer.singleShot(30000, lambda: self.warm_up(retry=False))
-            else:
-                self.ready_callbacks = []
-                self.toast(f'Ollama unavailable: {error} — searching by keyword only', 'orange', seconds=10)
-        run_job(lambda s: ai.warm_up(settings, s.progress.emit), done, failed, progress=progress)
+            if not self.toasting:
+                self.status_label.setText(self.status_text())
 
     def rebind_hotkey(self, text):
         """Switch the global shortcut live; GlobalHotkey restores the old one if the new one is taken."""
@@ -4230,7 +4218,7 @@ def run():
     at_sign_in = '--startup' in sys.argv
     if at_sign_in:
         # Started with Windows: stay hidden in the tray. Give Windows and the GPU driver a moment,
-        # then run the sign-in tasks (start Ollama, catch up the index).
+        # then run the sign-in tasks (catch up the index; no model starts until it is needed).
         logging.getLogger('alfred').info('Started at sign-in (hidden in the tray)')
         QTimer.singleShot(startup.TASK_DELAY_MS, lambda: startup.run_tasks(window))
     else:

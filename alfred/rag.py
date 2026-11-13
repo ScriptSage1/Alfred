@@ -41,7 +41,7 @@ MAX_SEARCHES = 3
 MMR_LAMBDA = 0.75
 BEYOND = 'Beyond your files'
 CHARS_PER_TOKEN = 3.6
-BUDGETS = {'ollama': 6000, 'compatible': 8000, 'claude_code': 24000, 'anthropic': 24000, 'codex': 24000, 'openai': 24000}
+BUDGETS = {'local': 6000, 'compatible': 8000, 'claude_code': 24000, 'anthropic': 24000, 'codex': 24000, 'openai': 24000}
 HISTORY_CHARS = 4000
 NOT_FOUND = 'I couldn’t find anything about this in your files.'
 
@@ -95,23 +95,12 @@ def rewrite_query(question, history, complete, cancel=None):
 
 
 def completer(settings, provider):
-    """A quick, non-streaming completion for rewriting queries: a local Ollama model when one is
-    available (fast and private), otherwise the chat provider itself."""
-    base = ai._ollama_base(settings.get('base_url') or settings.get('embed_base_url'))
-    model = provider.model if provider.kind == 'ollama' else None
-    if model is None and ai.is_local_url(base) and ai.ollama_running(base, 0.5):
-        installed = {m['model'] for m in ai.available_models(settings)}
-        model = next((m for m in (ai.DEFAULT_CONTEXT_MODEL, settings.get('context_model')) if m and m.removesuffix(':latest') in installed),
-                     None) or next(iter(sorted(installed)), None)
-    if model:
+    """A quick completion for rewriting queries: the answer model on this PC answers it without streaming (short and
+    deterministic); any other provider answers through its own stream."""
+    short = getattr(provider, 'complete', None) if provider.kind == 'local' else None
+    if short is not None:
         def complete(messages, cancel=None):
-            # The same context size as answers use, so Ollama doesn't reload the model between the two.
-            context = max(2048, min(int(settings.get('ollama_context') or 10240), 131072))
-            payload = {'model': model, 'messages': messages, 'stream': False, 'keep_alive': ai.keep_alive(settings),
-                       'options': dict(ai._options(settings.get('device', 'auto')), temperature=0.0, num_predict=80, num_ctx=context)}
-            if 'thinking' in ai.model_capabilities(base, model):
-                payload['think'] = False if 'gpt-oss' not in model else 'low'
-            return (ai._json(base + '/api/chat', payload, timeout=60).get('message') or {}).get('content', '')
+            return short(messages, max_tokens=80, temperature=0.0)
         return complete
 
     def complete(messages, cancel=None):

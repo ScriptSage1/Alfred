@@ -3,6 +3,7 @@
 Run:  .venv\\Scripts\\python -m unittest discover -s tests -v
 """
 import json
+import os
 import sys
 import tempfile
 import textwrap
@@ -10,6 +11,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 import keyring
 from keyring.backend import KeyringBackend
@@ -239,7 +241,9 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(text, 'Blue')
 
     def test_catalog_lists_every_provider_in_order(self):
-        entries = providers.catalog({'provider': 'ollama', 'base_url': 'http://127.0.0.1:9'})
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {'ALFRED_HOME': home}), \
+                mock.patch.object(providers.runtime.models, 'find', lambda key, home=None: None):
+            entries = providers.catalog({'provider': 'local'})
         self.assertEqual([e['kind'] for e in entries], providers.ORDER)
         self.assertTrue(all(e['models'] == [] or e['status']['state'] == 'ready' for e in entries))
         self.assertTrue(next(e for e in entries if e['kind'] == 'anthropic')['cloud'])

@@ -36,6 +36,7 @@ def reset_runtime():
     runtime._failures.clear()
     runtime._forced_cpu.clear()
     runtime._build_cache.clear()
+    runtime._starters.clear()
 
 
 class FakeBase(unittest.TestCase):
@@ -101,14 +102,14 @@ class TextTests(FakeBase):
         self.assertEqual(vectors[1], self.embedder.embed_documents(['harbour pilot schedule'], ['short'])[0])
         self.assertEqual(len(self.embedder.embed_query('中文' * 3000)), 768)
 
-    def test_search_only_never_starts_a_server_with_the_picture_projector(self):
+    def test_search_only_never_starts_a_server_with_the_picture_projector_or_the_answer_model(self):
         from PIL import Image
         folder = self.dir / 'Tracked'
         folder.mkdir()
         (folder / 'boat.txt').write_text('Kayak hull repair: sand, patch and seal the leaking seam.', encoding='utf-8')
         (folder / 'garden.txt').write_text('Garden plan: repair the fence before spring planting.', encoding='utf-8')
         Image.new('RGB', (64, 64), 'red').save(folder / 'red.png')
-        self.settings.update(tracked_folders=[str(folder)], picture_search=False)
+        self.settings.update(tracked_folders=[str(folder)], picture_search=False, provider='local', model='')  # answers off
         index = Index(self.settings)
         self.addCleanup(index.close)
         summary = index.update(embedder=self.embedder)
@@ -119,6 +120,10 @@ class TextTests(FakeBase):
         self.assertFalse(any('--mmproj' in args for args in starts), starts)
         self.assertTrue(all('--no-mmproj' in args for args in starts))
         self.assertEqual(len(starts), 1)  # a small job goes through the search server: no index server
+        self.assertFalse(any(str(self.home / 'answer.gguf') in args for args in starts))
+        ai.warm_up(self.settings)  # opening the panel wakes search only
+        self.assertEqual(len(self.starts()), 1)
+        self.assertIsNone(runtime.read_record(self.home, 'answer'))
 
     def test_a_larger_job_uses_the_index_server_which_exits_after_its_linger(self):
         self.assertEqual(self.embedder.plan(4), 4)
@@ -265,6 +270,17 @@ class GpuTests(FakeBase):
         self.assertEqual(len(self.starts()), 2)  # the checked server is kept and used
         self.assertEqual(runtime._clients[(str(self.home), 'index')].device, 'Vulkan0')
 
+    def test_a_server_that_cannot_start_on_the_card_stores_no_verdict(self):
+        self.devices(GPU)
+        statuses = []
+        with mock.patch.dict(os.environ, {'FAKE_LLAMA_FAIL_DEVICE': 'Vulkan0'}), mock.patch.object(runtime, 'status_hook', statuses.append):
+            self.embedder.plan(40)
+            self.embedder.embed_documents(['one'])
+        self.assertEqual([args[args.index('--device') + 1] for args in self.starts()], ['none'])  # the failed start is not logged
+        self.assertFalse((self.home / 'run' / 'gpu_check.json').exists())
+        self.assertEqual(statuses, ['Preparing the graphics card (once)…', None])
+        self.assertIn('not checked yet', runtime.gpu_summary(self.settings))
+
     def test_too_little_free_graphics_memory_runs_on_the_cpu_without_a_check(self):
         self.devices('Vulkan0: Fake GPU (8192 MiB, 700 MiB free)')
         self.embedder.plan(40)
@@ -292,6 +308,82 @@ class GpuTests(FakeBase):
         self.assertIn(key, runtime._forced_cpu)
 
 
+class AnswerTests(FakeBase):
+    def setUp(self):
+        super().setUp()
+        from alfred import providers
+        self.settings.update(provider='local', model='gemma3:4b')
+        self.local = providers.for_settings(self.settings)
+
+    def test_answers_stream_through_the_local_provider(self):
+        self.assertEqual((self.local.kind, self.local.label, self.local.cloud), ('local', 'On this PC', False))
+        self.assertEqual(self.local.status()['state'], 'ready')
+        self.assertEqual(self.local.models(), [('gemma3:4b', 'Gemma 3 4B')])
+        pieces = []
+        text = self.local.stream([{'role': 'user', 'content': 'hi'}], on_token=pieces.append)
+        self.assertEqual((text, pieces), ('A fake answer.', ['A ', 'fake ', 'answer.']))
+        [args] = self.starts()
+        self.assertIn(str(self.home / 'answer.gguf'), args)
+        self.assertIn('--no-mmproj', args)
+        self.assertNotIn('--embedding', args)
+        self.assertEqual((args[args.index('-c') + 1], args[args.index('-np') + 1], args[args.index('--device') + 1]), ('10240', '1', 'none'))
+        record = runtime.read_record(self.home, 'answer')
+        self.assertNotIn(record['key'], ' '.join(args))
+
+    def test_the_answer_server_stops_after_its_keep_alive(self):
+        with mock.patch.object(runtime, 'keep_alive_seconds', lambda settings: 0.3):
+            self.local.stream([{'role': 'user', 'content': 'hi'}])
+            server = runtime._clients[(str(self.home), 'answer')].server
+            self.assertTrue(server.alive())
+            deadline = time.monotonic() + 10
+            while server.alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+        self.assertFalse(server.alive())
+        self.assertIsNone(runtime.read_record(self.home, 'answer'))
+
+    def test_a_killed_answer_server_is_started_again(self):
+        self.local.stream([{'role': 'user', 'content': 'hi'}])
+        runtime._clients[(str(self.home), 'answer')].server.process.kill()
+        self.assertEqual(self.local.stream([{'role': 'user', 'content': 'again'}]), 'A fake answer.')
+        self.assertEqual(len(self.starts()), 2)
+
+    def test_passage_contexts_and_query_rewrites_use_the_answer_server(self):
+        from alfred import rag
+        self.settings['contextual_chunks'] = True
+        writer = ai.Contextualizer.from_settings(self.settings)
+        self.assertEqual(writer.situate('report.txt', 'A long document.', 'A passage.'), 'A fake answer.')
+        complete = rag.completer(self.settings, self.local)
+        self.assertEqual(complete([{'role': 'user', 'content': 'rewrite'}]), 'A fake answer.')
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_answer_context_and_device(self):
+        self.settings.update(answer_context=4096)
+        self.devices(GPU)
+        self.local.stream([{'role': 'user', 'content': 'hi'}])
+        args = self.starts()[-1]
+        self.assertEqual((args[args.index('-c') + 1], args[args.index('--device') + 1], args[args.index('-ngl') + 1]), ('4096', 'Vulkan0', 'all'))
+
+    def test_the_answer_model_stays_off_a_card_that_failed_or_is_full(self):
+        self.devices(GPU)
+        with mock.patch.object(runtime, 'gpu_verdict', lambda home, device: {'passed': False, 'reason': 'vectors differ'}):
+            self.local.stream([{'role': 'user', 'content': 'hi'}])
+        runtime.stop('answer', self.settings)
+        self.devices('Vulkan0: Fake GPU (8192 MiB, 3000 MiB free)')  # less than 3,900 MiB + the margin
+        self.local.stream([{'role': 'user', 'content': 'hi'}])
+        runtime.stop('answer', self.settings)
+        self.settings['device'] = 'cpu'
+        self.devices(GPU)
+        self.local.stream([{'role': 'user', 'content': 'hi'}])
+        self.assertEqual([args[args.index('--device') + 1] for args in self.starts()], ['none', 'none', 'none'])
+
+    def test_a_missing_answer_model_says_so(self):
+        with mock.patch.object(models, 'find', lambda key, home=None: None if key == 'answer' else self.home / f'{key}.gguf'):
+            self.assertEqual(self.local.status()['state'], 'missing')
+            self.assertIn('gemma3:4b', runtime.missing(self.settings, answer=True))
+            self.assertIsNone(runtime.missing(self.settings))
+            self.assertEqual(self.local.models(), [])
+
+
 class DeviceTests(unittest.TestCase):
     def test_list_devices_is_parsed(self):
         text = 'Available devices:\n  Vulkan0: NVIDIA GeForce RTX 5070 Ti Laptop GPU (11944 MiB, 11176 MiB free)\n'
@@ -316,6 +408,39 @@ class SettingsTests(unittest.TestCase):
             self.assertIsNotNone(ai.Embedder.from_settings(settings))
             settings.save()
             self.assertNotIn('embed_model', json.loads((home / 'settings.json').read_text(encoding='utf-8')))
+
+
+class MigrationTests(unittest.TestCase):
+    def load(self, stored):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        home = Path(folder.name)
+        if stored is not None:
+            (home / 'settings.json').write_text(json.dumps(dict(stored, start_with_windows_configured=True)), encoding='utf-8')
+        return config.load(home)
+
+    def test_a_new_install_defaults_to_the_model_on_this_pc_with_nothing_chosen(self):
+        settings = self.load(None)
+        self.assertEqual((settings['provider'], settings['model'], settings['answer_context']), ('local', '', 10240))
+        for gone in ('ollama_autostart', 'ollama_context', 'base_url', 'context_model'):
+            self.assertNotIn(gone, settings)
+
+    def test_an_ollama_user_gets_no_model_chosen(self):
+        settings = self.load({'provider': 'ollama', 'model': 'qwen3:8b', 'ollama_context': 16384, 'ollama_autostart': False,
+                              'base_url': 'http://127.0.0.1:11434', 'context_model': 'gemma3:4b', 'keep_alive_minutes': 30})
+        self.assertEqual((settings['provider'], settings['model'], settings['answer_context']), ('local', '', 16384))
+        self.assertFalse(__import__('alfred.providers', fromlist=['x']).for_settings(settings).configured)
+        self.assertEqual(settings['keep_alive_minutes'], 30)
+        settings.save()
+        stored = json.loads((settings.home / 'settings.json').read_text(encoding='utf-8'))
+        self.assertEqual(stored['answer_context'], 16384)
+        for gone in ('ollama_autostart', 'ollama_context', 'base_url', 'context_model'):
+            self.assertNotIn(gone, stored)
+        self.assertEqual(config.load(settings.home)['answer_context'], 16384)  # read once; the new key wins from now on
+
+    def test_other_providers_and_a_new_answer_context_are_kept(self):
+        settings = self.load({'provider': 'claude_code', 'model': 'sonnet', 'ollama_context': 4096, 'answer_context': 8192})
+        self.assertEqual((settings['provider'], settings['model'], settings['answer_context']), ('claude_code', 'sonnet', 8192))
 
 
 class ModelTests(unittest.TestCase):
@@ -371,6 +496,27 @@ class RealServerTests(unittest.TestCase):
                     self.assertEqual(len(vector), 768)
                     self.assertAlmostEqual(unit_length(vector), 1.0, places=5)
                     self.assertEqual(runtime._clients[(str(Path(folder)), 'search')].device, 'cpu')
+                finally:
+                    reset_runtime()
+
+
+@unittest.skipUnless(os.environ.get('ALFRED_LLAMA_DIR') and os.environ.get('ALFRED_REAL_ANSWER'),
+                     'set ALFRED_LLAMA_DIR and ALFRED_REAL_ANSWER=1 to start the real answer model (2.5 GB, on the GPU)')
+class RealAnswerTests(unittest.TestCase):
+    """Opt-in: the real answer server with gemma3:4b (Ollama's copy) answers one short question, then stops."""
+
+    def test_real_answer(self):
+        from alfred import providers
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            with mock.patch.dict(os.environ, {'ALFRED_HOME': folder}):
+                settings = config.load(folder)
+                settings.update(provider='local', model='gemma3:4b')
+                local = providers.for_settings(settings)
+                if local.status()['state'] != 'ready':
+                    self.skipTest(local.status()['detail'])
+                try:
+                    text = local.stream([{'role': 'user', 'content': 'Reply with one word: the colour of a clear daytime sky.'}])
+                    self.assertTrue(text.strip())
                 finally:
                     reset_runtime()
 

@@ -1,7 +1,7 @@
 """Search pipeline tests: extraction, OCR, incremental indexing, hybrid ranking, path safety.
 
 Run from the repository folder:  .venv\\Scripts\\python -m unittest discover -s tests -v
-No Ollama is needed: semantic search uses a small deterministic fake embedder.
+No model server is needed: semantic search uses a small deterministic fake embedder.
 """
 import os
 import sys
@@ -300,8 +300,8 @@ class RemovedSettingsTests(unittest.TestCase):
             stored = json.loads((home / 'settings.json').read_text(encoding='utf-8'))
             self.assertFalse(any(key.startswith('vision_') for key in stored))
             self.assertTrue(stored['contextual_chunks'])
-            writer = ai.Contextualizer.from_settings(settings)  # passage contexts: gemma3:4b on the embeddings' Ollama
-            self.assertEqual((writer.model, writer.base, writer.device), ('gemma3:4b', 'http://127.0.0.1:11434', 'auto'))
+            writer = ai.Contextualizer.from_settings(settings)  # passage contexts: gemma3:4b on this PC's answer server
+            self.assertEqual((writer.model, writer.writer.kind, writer.signature()), ('gemma3:4b', 'local', 'local:gemma3:4b:context-v1'))
 
 
 class PathSafetyTests(unittest.TestCase):

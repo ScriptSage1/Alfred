@@ -5,7 +5,7 @@ needs no administrator rights. For a clone it launches the repo's .venv pythonw
 (no console window) with ``-m alfred --startup``; for a frozen build it launches
 Alfred.exe ``--startup``. Either way Alfred starts hidden in the tray.
 
-``TASKS`` lists the components started at sign-in (Ollama, the index catch-up; later scripts).
+``TASKS`` lists the components started at sign-in (the index catch-up; later scripts).
 """
 import logging
 import os
@@ -24,11 +24,6 @@ FROZEN = getattr(sys, 'frozen', False)
 TASK_DELAY_MS = 15000  # give Windows and drivers a moment after sign-in before starting extra components
 
 
-def start_ollama(window):
-    """Start Ollama hidden if it isn't running and load the search model (runs in the background)."""
-    window.warm_up()
-
-
 def catch_up_index(window):
     """Index what changed in the tracked folders while Alfred wasn't running."""
     window.start_index(quiet=True, auto=True)
@@ -36,8 +31,9 @@ def catch_up_index(window):
 
 # Callables run once, in order, after TASK_DELAY_MS when Alfred starts at sign-in. Each gets the
 # AlfredWindow and must return quickly (start background work, don't block); a task that raises
-# is logged and skipped. Add more components here.
-TASKS = [start_ollama, catch_up_index]
+# is logged and skipped. Add more components here. No model starts at sign-in: the search server starts at the first
+# search or indexing run (alfred.runtime).
+TASKS = [catch_up_index]
 
 
 def run_tasks(window):

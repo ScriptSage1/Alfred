@@ -9,9 +9,9 @@ from PySide6.QtWidgets import QWidget
 from . import providers
 from .ui_kit import Motion, Spring, brand_pixmap, icon_pixmap, paint_shadow
 
-LOGOS = {'ollama': 'ollama', 'claude_code': 'claude', 'anthropic': 'anthropic', 'codex': 'openai', 'openai': 'openai', 'compatible': 'server'}
+LOGOS = {'local': 'pc', 'claude_code': 'claude', 'anthropic': 'anthropic', 'codex': 'openai', 'openai': 'openai', 'compatible': 'server'}
 EXPERIMENTAL = {'claude_code', 'codex'}  # subscription routes through CLIs
-SUBTITLES = {'claude_code': 'Your Claude plan', 'codex': 'Your ChatGPT plan', 'anthropic': 'Claude API', 'openai': 'OpenAI API',
+SUBTITLES = {'local': '2.5 GB · runs on this PC', 'claude_code': 'Your Claude plan', 'codex': 'Your ChatGPT plan', 'anthropic': 'Claude API', 'openai': 'OpenAI API',
              'compatible': 'Custom server'}
 NOTES = {'missing': 'Not installed', 'signed_out': 'Sign in under Settings → Accounts', 'no_key': 'Add a key under Settings → Accounts',
          'unreachable': 'Unavailable right now'}
@@ -26,16 +26,14 @@ def model_items(entries, current, efforts=(), effort=None):
         kind, state = entry['kind'], entry['status']['state']
         if state != 'ready' or not entry['models']:
             note = NOTES.get(state, 'No models found') if state != 'ready' else (
-                'No chat models yet — ollama pull gemma3:4b' if kind == 'ollama' else 'No models found')
+                'No models found')
             if kind == 'compatible' and state == 'no_key':
                 note = 'Add its address under Settings → Accounts'
             unavailable.append({'type': 'note', 'kind': kind, 'title': entry['group'], 'subtitle': note})
             continue
         items.append({'type': 'header', 'title': entry['group'], 'cloud': entry['cloud']})
-        sizes = {m['model']: m for m in entry.get('details', [])}
         for model, label in entry['models']:
-            detail = sizes.get(model)
-            subtitle = (f"{detail['size_gb']} GB" + (' · reads images' if detail.get('vision') else '')) if detail else SUBTITLES.get(kind, '')
+            subtitle = SUBTITLES.get(kind, '')
             items.append({'type': 'row', 'kind': kind, 'model': model, 'title': label, 'subtitle': subtitle, 'cloud': entry['cloud'],
                           'badge': 'Experimental' if kind in EXPERIMENTAL else '', 'selected': (kind, model) == current})
     if unavailable:
@@ -50,14 +48,8 @@ def model_items(entries, current, efforts=(), effort=None):
 
 
 def catalog_with_details(settings):
-    """providers.catalog plus Ollama's size / vision details for the subtitles."""
-    from . import ai
-    entries = providers.catalog(settings)
-    local = {m['model']: m for m in ai.available_models(settings)}
-    for entry in entries:
-        if entry['kind'] == 'ollama':
-            entry['details'] = [local[m] for m, _ in entry['models'] if m in local]
-    return entries
+    """providers.catalog, for the picker."""
+    return providers.catalog(settings)
 
 
 def place(right, bottom, top, width, height, bounds=None, gap=6):

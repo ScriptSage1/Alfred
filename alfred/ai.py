@@ -1,24 +1,16 @@
-"""Local models: EmbeddingGemma 2 embeddings for semantic search through the llama.cpp servers Alfred owns
-(alfred.runtime), plus the Ollama helpers the answer side still uses (phase B removes them) and diagnostics.
+"""Local models: EmbeddingGemma 2 embeddings for semantic search and the passage contexts, on the llama.cpp servers
+Alfred owns (alfred.runtime), plus diagnostics.
 
-Chat providers (Ollama, Claude, ChatGPT, APIs) live in alfred.providers.
+Chat providers (on this PC, Claude, ChatGPT, APIs) live in alfred.providers.
 """
-import json
 import math
-import os
 import shutil
 import subprocess
 import time
-import urllib.error
-import urllib.request
-from pathlib import Path
 from urllib.parse import urlparse
 
 from . import runtime
 from .console import hidden
-
-OLLAMA_DEFAULT = 'http://127.0.0.1:11434'
-DEFAULT_CONTEXT_MODEL = 'gemma3:4b'  # writes passage contexts (and rewrites queries) when no other local model is chosen
 
 
 class ProviderError(RuntimeError):
@@ -29,47 +21,14 @@ class NotConfigured(ProviderError):
     pass
 
 
-# ------------------------------------------------------------------- http
-def _json(url, payload=None, timeout=30):
-    data = json.dumps(payload).encode() if payload is not None else None
-    request = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode('utf-8', 'replace')[:300]
-        raise ProviderError(f'HTTP {error.code}: {detail}') from None
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
-        raise ProviderError(f'Cannot reach {urlparse(url).netloc}: {getattr(error, "reason", error)}') from None
-
-
 def is_local_url(url):
     host = (urlparse(url if '//' in (url or '') else f'http://{url}').hostname or '').lower()
     return host in ('127.0.0.1', 'localhost', '::1')
 
 
-def _ollama_base(url):
-    return (url or OLLAMA_DEFAULT).rstrip('/').removesuffix('/api')
-
-
-def keep_alive(settings):
-    """How long Ollama keeps a model loaded after its last use (never under 5 minutes)."""
-    try:
-        minutes = int(settings.get('keep_alive_minutes', 5))
-    except (TypeError, ValueError):
-        minutes = 5
-    return f'{max(5, min(minutes, 24 * 60))}m'
-
-
-def _options(device, threads=0):
-    """Ollama request options: a model asked to run on the CPU gets no GPU layers and, when the indexing thread
-    budget is set (setting index_threads), that many threads."""
-    if device != 'cpu':
-        return {}
-    options = {'num_gpu': 0}
-    if threads and int(threads) > 0:
-        options['num_thread'] = int(threads)
-    return options
+def keep_alive_minutes(settings):
+    """How long a local model stays loaded after its last use, in minutes (5 minutes to a day)."""
+    return runtime.keep_alive_seconds(settings) // 60
 
 
 def _threads(settings):
@@ -107,7 +66,7 @@ class Embedder:
         self.settings = settings
         self.device = settings.get('embed_device', 'auto')  # the indexing device; search follows search_on_gpu
         self.batch = max(1, min(int(settings.get('embed_batch') or 16), 128))
-        self.keep_alive = keep_alive(settings)
+        self.keep_alive = keep_alive_minutes(settings)
         self.family = 'gemma'
         # Cosine similarity below which a meaning-only match is noise (measured on EmbeddingGemma 2:
         # related passages score about 0.70+, unrelated ones 0.58–0.65).
@@ -176,8 +135,8 @@ class Embedder:
         return vectors
 
     def _texts(self, role, items, timeout):
-        """Vectors for [(make_prompt, text)]. llama-server refuses an input longer than it reads (Ollama cut it
-        silently): a batch that fails is sent one by one, and an input that is too long is cut to the first half of
+        """Vectors for [(make_prompt, text)]. llama-server refuses an input longer than it reads (it does not cut
+        it silently): a batch that fails is sent one by one, and an input that is too long is cut to the first half of
         its characters until it is accepted."""
         try:
             return self._post_texts(role, [make(text) for make, text in items], timeout)
@@ -258,91 +217,36 @@ def _unit(vector):
 
 
 class Contextualizer:
-    """Optional "contextual retrieval": a local Ollama model (setting context_model; DEFAULT_CONTEXT_MODEL when empty)
-    writes one or two sentences situating a passage within its document, so a passage like
-    "Revenue grew 3%" is found as "ACME's Q2 2026 report: revenue grew 3%". Off unless turned on."""
+    """Optional "contextual retrieval": the answer model on this PC (gemma3:4b, through providers.Local) writes one or
+    two sentences situating a passage within its document, so a passage like "Revenue grew 3%" is found as "ACME's Q2
+    2026 report: revenue grew 3%". Off unless turned on."""
     PROMPT = ('<document title="{title}">\n{document}\n</document>\n\nHere is a passage from this document:\n<passage>\n{passage}\n</passage>\n\n'
               'Write one or two short sentences that situate this passage within the document (what the document is, and which '
               'part, topic, person, date or project the passage is about), to improve search retrieval of the passage. '
               'Answer with only those sentences.')
 
     def __init__(self, settings):
-        self.model = (settings.get('context_model') or DEFAULT_CONTEXT_MODEL).strip()
-        self.base = _ollama_base(settings.get('base_url'))  # the local Ollama of the answer side
-        self.device = settings.get('device', 'auto')  # Settings → Ollama → Device, as for local chat models
-        self.keep_alive = keep_alive(settings)
-        self.threads = _threads(settings)
+        from .providers import Local
+        self.writer = Local(settings, Local.MODEL)
+        self.model = Local.MODEL
 
     @classmethod
     def from_settings(cls, settings):
         return cls(settings) if settings.get('contextual_chunks') else None
 
     def signature(self):
-        return f'ollama:{self.model}:context-v1'
+        return f'local:{self.model}:context-v1'
 
     def situate(self, title, document, passage):
-        payload = {'model': self.model, 'prompt': self.PROMPT.format(title=title, document=document[:12000], passage=passage[:3000]),
-                   'stream': False, 'keep_alive': self.keep_alive, 'options': dict(_options(self.device, self.threads), temperature=0.0, num_predict=90)}
-        try:
-            result = _json(self.base + '/api/generate', payload, timeout=180)
-        except ProviderError as error:
-            if 'HTTP 404' in str(error):
-                raise ProviderError(f'The model “{self.model}” is not installed. Run: ollama pull {self.model}') from None
-            raise
-        return ' '.join((result.get('response') or '').split())[:400]
-
-
-# ------------------------------------------------------------------ ollama
-def find_ollama():
-    found = shutil.which('ollama')
-    if found:
-        return found
-    for candidate in (Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Ollama' / 'ollama.exe',
-                      Path(os.environ.get('ProgramFiles', '')) / 'Ollama' / 'ollama.exe'):
-        if candidate.is_file():
-            return str(candidate)
-    return None
-
-
-def ollama_running(base=OLLAMA_DEFAULT, timeout=0.8):
-    try:
-        with urllib.request.urlopen(_ollama_base(base) + '/api/version', timeout=timeout) as response:
-            return bool(json.load(response).get('version'))
-    except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError, OSError):
-        return False
-
-
-def ensure_ollama(base=OLLAMA_DEFAULT, wait=25.0):
-    """Start ``ollama serve`` hidden in the background if it isn't running (local URLs only).
-    Returns {'started': bool, 'seconds': float}; raises ProviderError when it can't."""
-    base = _ollama_base(base)
-    if not is_local_url(base) or ollama_running(base):
-        return {'started': False, 'seconds': 0.0}
-    exe = find_ollama()
-    if not exe:
-        raise ProviderError('Ollama is not installed (https://ollama.com) — searching by keyword only.')
-    # In its own process group, so it keeps running after Alfred closes. It gets a console without a window rather than
-    # no console at all (DETACHED_PROCESS): the model runners Ollama starts for each model share that hidden console,
-    # where without one every runner opened a console window of its own.
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
-    env = dict(os.environ, OLLAMA_HOST=urlparse(base).netloc or '127.0.0.1:11434')
-    started = time.time()
-    try:
-        subprocess.Popen([exe, 'serve'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         close_fds=True, env=env, **hidden(flags))
-    except OSError as error:
-        raise ProviderError(f'Could not start Ollama: {error}') from None
-    while time.time() - started < wait:
-        if ollama_running(base, timeout=0.5):
-            return {'started': True, 'seconds': round(time.time() - started, 1)}
-        time.sleep(0.25)
-    raise ProviderError(f'Ollama did not start within {int(wait)} s')
+        prompt = self.PROMPT.format(title=title, document=document[:12000], passage=passage[:3000])
+        text = self.writer.complete([{'role': 'user', 'content': prompt}], max_tokens=90, temperature=0.0)
+        return ' '.join(text.split())[:400]
 
 
 def warm_up(settings, progress=lambda text: None):
     """Wake the search server (start it if needed): the 1.3-1.6 s wake overlaps with typing. Raises ProviderError."""
     embedder = Embedder.from_settings(settings)
-    report = {'started': False, 'loaded': [], 'keep_alive': keep_alive(settings)}
+    report = {'started': False, 'loaded': [], 'keep_alive': keep_alive_minutes(settings)}
     if embedder is None:
         return report
     progress('Waking the search model…')
@@ -352,22 +256,6 @@ def warm_up(settings, progress=lambda text: None):
         raise ProviderError(str(error)) from None
     report['loaded'].append(embedder.model)
     return report
-
-
-def ollama_runtime(base=OLLAMA_DEFAULT):
-    """Version and the models Ollama has loaded, with how much of each sits in VRAM."""
-    base = _ollama_base(base)
-    try:
-        version = _json(base + '/api/version', timeout=2).get('version')
-        loaded = []
-        for model in _json(base + '/api/ps', timeout=3).get('models', []):
-            size, vram = model.get('size') or 0, model.get('size_vram') or 0
-            share = round(100 * vram / size) if size else 0
-            loaded.append({'model': model.get('name', ''), 'size_mib': size // 2 ** 20, 'vram_mib': vram // 2 ** 20, 'gpu_share_percent': share,
-                           'device': 'GPU' if share >= 99 else f'{share}% GPU / {100 - share}% CPU' if share else 'CPU'})
-        return {'running': True, 'version': version, 'loaded': loaded}
-    except ProviderError as error:
-        return {'running': False, 'error': f'Ollama is not running ({error})', 'loaded': []}
 
 
 def detect_gpus():
@@ -404,8 +292,6 @@ def diagnostics(settings, probe=False):
     embedder = Embedder.from_settings(settings)
     report = {'checked_at': time.strftime('%H:%M:%S'), 'gpu': detect_gpus(), 'chat': ChatProvider(settings).describe(),
               'embeddings': {'enabled': embedder is not None}, 'errors': []}
-    if (settings.get('provider') or 'ollama') == 'ollama':  # the answer side (phase B replaces this)
-        report['ollama'] = ollama_runtime(settings.get('base_url'))
     if embedder is None:
         return report
     report['embeddings'].update(provider='llama.cpp', model=embedder.model, location='local')
@@ -439,38 +325,6 @@ def _describe_server(server):
 
 
 # ------------------------------------------------------------------- chat
-_capabilities = {}
-
-
-def model_capabilities(base, model):
-    """Ollama's capability list for a model ('completion', 'vision', 'thinking', 'embedding', ...), cached."""
-    key = (_ollama_base(base), model)
-    if key not in _capabilities:
-        try:
-            _capabilities[key] = set(_json(key[0] + '/api/show', {'model': model}, timeout=5).get('capabilities') or [])
-        except ProviderError:
-            return set()
-    return _capabilities[key]
-
-
-def available_models(settings):
-    """Installed Ollama models that can chat: [{'model', 'label', 'vision', 'thinking', 'size_gb'}]."""
-    base = _ollama_base(settings.get('base_url'))
-    try:
-        tags = _json(base + '/api/tags', timeout=3).get('models', [])
-    except ProviderError:
-        return []
-    models = []
-    for item in tags:
-        name = item['name'].removesuffix(':latest')
-        caps = model_capabilities(base, item['name'])
-        if 'embed' in name.lower() or (caps and 'completion' not in caps):
-            continue  # embedding models can't answer questions
-        models.append({'provider': 'ollama', 'model': name, 'vision': 'vision' in caps, 'thinking': 'thinking' in caps,
-                       'size_gb': round((item.get('size') or 0) / 1e9, 1), 'label': name})
-    return sorted(models, key=lambda m: m['model'])
-
-
 def ChatProvider(settings):
     """The chat provider chosen in settings (see alfred.providers)."""
     from .providers import for_settings
