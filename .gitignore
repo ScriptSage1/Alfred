@@ -11,3 +11,6 @@ dist/
 # OS clutter
 Thumbs.db
 .DS_Store
+
+# The llama.cpp engine for a run from this folder (copied in, not part of the repository)
+/runtime/
