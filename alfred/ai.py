@@ -76,10 +76,11 @@ class Embedder:
         # 0.60-0.65, the relevant passage for paraphrase/meaning queries 0.69+.
         self.confident_similarity = 0.67
         # The same for a picture vector (a text query against a picture). Measured on the benchmark's medium corpus
-        # with Ollama: the right picture for a query about what it shows scored 0.715-0.858, the best picture for
-        # queries with no picture answer at most 0.709. M13 design, section 9: while Ollama-made picture vectors remain,
-        # the floor is the higher of this and the floor measured on llama.cpp vectors (not measured yet).
-        self.confident_picture_similarity = 0.712
+        # with llama.cpp vectors (77 pictures, 102 queries): the right picture for a query about what it shows scored
+        # 0.708-0.858; the best picture for a query with no picture answer 0.704, apart from one on-topic chart at
+        # 0.709, which this floor lets through; unrelated queries reach at most 0.643. The margin is thin and comes
+        # from one corpus. (With Ollama's vectors the floor was 0.712; pictures embedded then are re-embedded.)
+        self.confident_picture_similarity = 0.7075
         self.threads = _threads(settings)
         self.role = None  # set by plan() for an indexing job; None: chosen per request by its size
 
