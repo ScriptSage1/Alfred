@@ -14,7 +14,7 @@ Start it
    engine and model (about 340 MB together); Alfred offers to download them - that is your choice.
 
 Good to know
-- Alfred adds itself to start when you sign in (hidden in the tray). Switch that off in
+- Alfred starts when you sign in (hidden in the tray) unless you switch that off in the last setup step, or later in
   Settings -> "Start Alfred when you sign in".
 - Your settings and the index live in %LOCALAPPDATA%\Alfred (paste that into the Explorer address bar).
   Alfred never changes the files it searches.

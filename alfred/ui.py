@@ -252,8 +252,25 @@ def _above_panel(dialog):
     """Dialogs must sit above Alfred's always-on-top panel, or they open behind it and can't be clicked."""
     dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
     dialog.setWindowModality(Qt.ApplicationModal)
-    QTimer.singleShot(0, lambda: (dialog.raise_(), dialog.activateWindow()))
+    QTimer.singleShot(0, lambda: _lift(dialog))
+    QTimer.singleShot(200, lambda: _lift(dialog))
     return dialog
+
+
+def _lift(dialog):
+    """Raise a shown dialog above the panel. Qt's stay-on-top flag does not reach Windows for these dialogs (measured:
+    not topmost, not owned by the panel, below it), so the window is made topmost through Windows itself."""
+    try:
+        if not dialog.isVisible():
+            return
+        dialog.raise_()
+        dialog.activateWindow()
+        if os.name == 'nt':
+            import ctypes
+            # HWND_TOPMOST; SWP_NOSIZE | SWP_NOMOVE
+            ctypes.windll.user32.SetWindowPos(ctypes.c_void_p(int(dialog.winId())), ctypes.c_void_p(-1), 0, 0, 0, 0, 0x1 | 0x2)
+    except RuntimeError:  # the dialog was closed and deleted meanwhile
+        pass
 
 
 def ask_box(parent, title, text, buttons, default):
