@@ -25,9 +25,22 @@ Tell us what you tried, what you expected and what happened, and attach the log 
   %LOCALAPPDATA%\Alfred\assistant.log
 (The log lists file names Alfred indexed or failed to read; look through it before you send it if that matters to you.)
 
+Using Alfred from Claude Code and other AI tools (optional)
+Alfred can let an AI tool on this PC search your tracked folders and read the matching text, so you can ask it
+about your own files. It works with tools that support MCP servers (Claude Code, Codex, Claude Desktop and others).
+1. In Alfred, open Settings -> AI tools. It shows one command with a Copy button, like
+     claude mcp add alfred -- "C:\path\to\Alfred\Alfred.exe" --mcp
+2. Paste it into a terminal and run it (that line is for Claude Code). For another tool, add an MCP server in its
+   settings with the program  C:\path\to\Alfred\Alfred.exe  and the argument  --mcp
+3. The first time a tool asks, Windows shows "... wants to search your files through Alfred. Allow?" - nothing is
+   shared until you click Yes. Settings -> AI tools lists the tools you allowed and what each one asked for.
+The tool only gets the passages it asks for; Alfred itself sends nothing anywhere. To disconnect a tool, remove it in
+Settings -> AI tools, or run:  claude mcp remove alfred
+
 Removing Alfred
-1. Settings -> switch off "Start Alfred when you sign in", then quit Alfred from its tray icon (right-click -> Quit Alfred).
-2. Delete the Alfred folder you unzipped.
-3. To remove your settings, index and downloaded models too, delete %LOCALAPPDATA%\Alfred.
-4. If you skipped step 1, also delete Alfred.lnk from
-   %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
+Double-click Uninstall-Alfred.cmd in this folder. It stops Alfred, removes its start-at-sign-in and Start menu
+shortcuts, and then asks, one at a time, whether to also delete your settings, index and downloaded models
+(%LOCALAPPDATA%\Alfred), the API keys saved in Windows Credential Manager, and this folder.
+The files and folders you searched with Alfred are never touched.
+By hand instead: quit Alfred from its tray icon (right-click -> Quit Alfred), delete this folder, delete
+%LOCALAPPDATA%\Alfred, and delete Alfred.lnk from %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup

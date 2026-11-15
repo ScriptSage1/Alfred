@@ -16,6 +16,7 @@ if not exist "%PY%" (
 
 "%PY%" -m PyInstaller --noconfirm --clean --log-level WARN --distpath "%OUT%\dist" --workpath "%OUT%\build" "%REPO%\packaging\alfred.spec" || exit /b 1
 copy /y "%REPO%\packaging\README-testers.txt" "%OUT%\dist\Alfred\README-testers.txt" >nul || exit /b 1
+copy /y "%REPO%\packaging\Uninstall-Alfred.cmd" "%OUT%\dist\Alfred\Uninstall-Alfred.cmd" >nul || exit /b 1
 
 set "VERSION="
 for /f "tokens=2 delims='" %%V in ('findstr /b /c:"__version__" "%REPO%\alfred\__init__.py"') do set "VERSION=%%V"
