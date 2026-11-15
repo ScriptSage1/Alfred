@@ -7,26 +7,31 @@ from io import BytesIO
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QByteArray, QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QFont, QGuiApplication, QIcon, QImage, QLinearGradient, QPainter, QPainterPath,
-                           QPen, QPixmap, QTransform)
+                           QPen, QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QAbstractButton
 
 # --------------------------------------------------------------------- theme
-# Apple's system colours (macOS label/separator/systemBlue values) for Spotlight's look.
+# Apple's system colours (macOS label/separator/systemBlue values) for Spotlight's look. ``body`` is the glass body's
+# tint colour (the plain material is this colour, opaque); ``tint`` and ``rim_top`` serve the style sheet and the popover.
+# Secondary text at alpha 215 keeps 5:1 over the live glass; light fills are black (white fills vanish on light glass).
 PALETTES = {
-    'dark': dict(tint=QColor(32, 32, 35, 178), tint_bottom=QColor(24, 24, 27, 196), text=QColor(255, 255, 255, 235),
-                 secondary=QColor(235, 235, 245, 150), tertiary=QColor(235, 235, 245, 77), separator=QColor(255, 255, 255, 26),
-                 hover=QColor(255, 255, 255, 16), fill=QColor(255, 255, 255, 18), fill_strong=QColor(255, 255, 255, 34),
-                 accent=QColor(10, 132, 255), accent_text=QColor(255, 255, 255), rim_top=QColor(255, 255, 255, 64),
-                 rim_bottom=QColor(255, 255, 255, 14), sheen=QColor(255, 255, 255, 22), shadow=QColor(0, 0, 0, 120),
+    'dark': dict(tint=QColor(32, 32, 35, 178), body=QColor(30, 30, 34), text=QColor(255, 255, 255, 235),
+                 secondary=QColor(235, 235, 245, 215), tertiary=QColor(235, 235, 245, 77), separator=QColor(255, 255, 255, 26),
+                 hover=QColor(255, 255, 255, 16), fill=QColor(255, 255, 255, 26), fill_strong=QColor(255, 255, 255, 48),
+                 outline=QColor(255, 255, 255, 46), accent=QColor(10, 132, 255), accent_text=QColor(255, 255, 255),
+                 rim_top=QColor(255, 255, 255, 64), shadow=QColor(0, 0, 0, 120),
                  green=QColor(48, 209, 88), orange=QColor(255, 159, 10), red=QColor(255, 69, 58), name='dark'),
-    'light': dict(tint=QColor(246, 246, 248, 190), tint_bottom=QColor(238, 238, 242, 205), text=QColor(0, 0, 0, 222),
-                  secondary=QColor(60, 60, 67, 155), tertiary=QColor(60, 60, 67, 77), separator=QColor(0, 0, 0, 24),
-                  hover=QColor(0, 0, 0, 10), fill=QColor(0, 0, 0, 12), fill_strong=QColor(0, 0, 0, 22),
-                  accent=QColor(0, 122, 255), accent_text=QColor(255, 255, 255), rim_top=QColor(255, 255, 255, 200),
-                  rim_bottom=QColor(0, 0, 0, 20), sheen=QColor(255, 255, 255, 90), shadow=QColor(0, 0, 0, 70),
+    'light': dict(tint=QColor(246, 246, 248, 190), body=QColor(246, 246, 248), text=QColor(0, 0, 0, 222),
+                  secondary=QColor(60, 60, 67, 215), tertiary=QColor(60, 60, 67, 77), separator=QColor(0, 0, 0, 24),
+                  hover=QColor(0, 0, 0, 10), fill=QColor(0, 0, 0, 22), fill_strong=QColor(0, 0, 0, 42),
+                  outline=QColor(0, 0, 0, 45), accent=QColor(0, 122, 255), accent_text=QColor(255, 255, 255),
+                  rim_top=QColor(255, 255, 255, 200), shadow=QColor(0, 0, 0, 70),
                   green=QColor(52, 199, 89), orange=QColor(255, 149, 0), red=QColor(255, 59, 48), name='light'),
 }
+# The glass panel's bevel rim: alpha of the hairline everywhere (base), at its top-left and bottom-right peaks, the peaks'
+# angular width (degrees), the hairline's pen, the dark inner line, and the highlight inside the top-left.
+RIM = dict(base=0.07, tl=0.95, br=0.45, width=38, pen=1.25, dark_line=0.24, highlight=0.10)
 GLOW = [QColor('#2E9BFF'), QColor('#8E5CFF'), QColor('#FF4FA3'), QColor('#FF8A3D'), QColor('#FFD23F'), QColor('#2E9BFF')]
 
 
@@ -622,90 +627,62 @@ def app_icon():
 
 
 # --------------------------------------------------------------------- glass
-def blurred_backdrop(pixmap, strength=10):
-    """Frosted-glass backdrop: downscale, gaussian blur, boost saturation (vibrancy).
-
-    Runs before the panel's first frame, so it stays cheap (~20 ms rather than ~200): the heavy blurs work on 1/8 and 1/2
-    size images and the result goes straight back to Qt (no PNG round trip). It looks the same as blurring at full size."""
-    from PIL import Image, ImageEnhance, ImageFilter
-    if pixmap is None or pixmap.isNull():
-        return None
-    image = pixmap.toImage()
-    w, h = image.width(), image.height()
-    small = image.scaled(max(1, w // 8), max(1, h // 8), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-    small = small.convertToFormat(QImage.Format_RGB888)
-    pil = Image.frombuffer('RGB', (small.width(), small.height()), bytes(small.constBits()), 'raw', 'RGB', small.bytesPerLine(), 1)
-    pil = ImageEnhance.Color(pil.filter(ImageFilter.GaussianBlur(strength / 2.5))).enhance(1.7)
-    half = pil.resize((max(1, w // 2), max(1, h // 2)), Image.BICUBIC).filter(ImageFilter.GaussianBlur(strength / 2))
-    data = half.tobytes()
-    large = QImage(data, half.width, half.height, half.width * 3, QImage.Format_RGB888)
-    result = QPixmap.fromImage(large.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
-    result.setDevicePixelRatio(pixmap.devicePixelRatio())
-    return result
-
-
-def fallback_backdrop(size, dark=True):
-    """Soft wallpaper-like gradient when the screen cannot be captured."""
-    pixmap = QPixmap(size)
-    painter = QPainter(pixmap)
-    gradient = QLinearGradient(0, 0, size.width(), size.height())
-    if dark:
-        gradient.setColorAt(0, QColor('#1d2a4a'))
-        gradient.setColorAt(0.5, QColor('#2a1f45'))
-        gradient.setColorAt(1, QColor('#0f2f3a'))
-    else:
-        gradient.setColorAt(0, QColor('#cfe3ff'))
-        gradient.setColorAt(0.5, QColor('#e9dcff'))
-        gradient.setColorAt(1, QColor('#d7f3ee'))
-    painter.fillRect(pixmap.rect(), gradient)
-    painter.end()
-    return pixmap
-
-
-SHADOW_DROP = 10  # the shadow sits this much lower than the panel
+SHADOW_DROP = 10  # the popover's shadow sits this much lower than it
 SHADOW_SPREAD = 26  # and reaches this far beyond it
+# The glass panel's shadow: softer and further out, at half the palette's strength, and cut out under the panel, whose
+# body is see-through (the shadow must not darken what shows through it).
+PANEL_SHADOW = dict(spread=34, drop=12, strength=0.5, exponent=2.4, step=1, cut=True)
 _shadow_cache = {}
 
 
-def _draw_shadow(p, rect, radius, color, spread):
+def _draw_shadow(p, rect, radius, color, spread, drop=SHADOW_DROP, strength=1.0, exponent=2, step=2):
     p.save()
     p.setPen(Qt.NoPen)
-    for i in range(spread, 0, -2):
+    for i in range(spread, 0, -step):
         c = QColor(color)
-        c.setAlphaF(color.alphaF() * (1 - i / spread) ** 2 * 0.16)
+        c.setAlphaF(min(1.0, color.alphaF() * strength * (1 - i / spread) ** exponent * 0.16))
         p.setBrush(c)
-        p.drawRoundedRect(rect.adjusted(-i, -i + SHADOW_DROP, i, i + SHADOW_DROP), radius + i, radius + i)
+        p.drawRoundedRect(rect.adjusted(-i, -i + drop, i, i + drop), radius + i, radius + i)
     p.restore()
 
 
-def _shadow_sprite(width, radius, color, spread, dpr):
+def _shadow_sprite(width, radius, color, spread, dpr, drop, strength, exponent, step, cut):
     """The shadow of a short panel, drawn once at device resolution. Its middle rows are identical, so any taller
-    panel's shadow is its top, a stretched middle band and its bottom: three blits instead of 13 large anti-aliased fills."""
-    key = (round(width, 2), radius, color.rgba(), spread, dpr)
+    panel's shadow is its top, a stretched middle band and its bottom: three blits instead of many large anti-aliased
+    fills. With ``cut`` the panel's own area is cleared (the middle rows stay identical)."""
+    key = (round(width, 2), radius, color.rgba(), spread, dpr, drop, strength, exponent, step, cut)
     if key not in _shadow_cache:
-        pad, height = spread + SHADOW_DROP + 2, 2 * radius + 8
+        pad, height = spread + drop + 2, 2 * radius + 8
         image = QImage(int(math.ceil((width + 2 * pad) * dpr)), int(math.ceil((height + 2 * pad) * dpr)), QImage.Format_ARGB32_Premultiplied)
         image.setDevicePixelRatio(dpr)
         image.fill(Qt.transparent)
         painter = QPainter(image)
         painter.setRenderHint(QPainter.Antialiasing)
-        _draw_shadow(painter, QRectF(pad, pad, width, height), radius, color, spread)
+        _draw_shadow(painter, QRectF(pad, pad, width, height), radius, color, spread, drop, strength, exponent, step)
+        if cut:
+            painter.setCompositionMode(QPainter.CompositionMode_DestinationOut)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0))
+            painter.drawRoundedRect(QRectF(pad, pad, width, height), radius, radius)
         painter.end()
         pixmap = QPixmap.fromImage(image)
-        top_cut = pad + radius + SHADOW_DROP + 2  # inside the band of identical rows
+        top_cut = pad + radius + drop + 2  # inside the band of identical rows
         band = pixmap.copy(0, int(round(top_cut * dpr)), pixmap.width(), int(round(2 * dpr)))
         band.setDevicePixelRatio(dpr)
         _shadow_cache[key] = (pixmap, band, pad, height, top_cut)
     return _shadow_cache[key]
 
 
-def paint_shadow(p, rect, radius, color, spread=SHADOW_SPREAD):
-    pixmap, band, pad, height, top_cut = _shadow_sprite(rect.width(), radius, color, spread, p.device().devicePixelRatioF())
+def paint_shadow(p, rect, radius, color, spread=SHADOW_SPREAD, drop=SHADOW_DROP, strength=1.0, exponent=2, step=2, cut=False):
+    """A soft drop shadow under the rounded rectangle ``rect``. The defaults are the popover's; the glass panel passes
+    PANEL_SHADOW."""
+    pixmap, band, pad, height, top_cut = _shadow_sprite(rect.width(), radius, color, spread, p.device().devicePixelRatioF(),
+                                                        drop, strength, exponent, step, cut)
     dpr = pixmap.devicePixelRatio()
     bottom_cut = top_cut + 2
     stretch = rect.height() - height  # extra height of this panel over the sprite's
     if stretch + bottom_cut - top_cut < 0:  # too short to slice (never for Alfred's panel)
-        _draw_shadow(p, rect, radius, color, spread)
+        _draw_shadow(p, rect, radius, color, spread, drop, strength, exponent, step)
         return
     full_w = pixmap.width() / dpr
     left, top = rect.left() - pad, rect.top() - pad
@@ -717,40 +694,62 @@ def paint_shadow(p, rect, radius, color, spread=SHADOW_SPREAD):
                  QRectF(0, bottom_cut * dpr, pixmap.width(), below * dpr))
 
 
-def paint_glass(p, rect, radius, palette, backdrop, backdrop_origin, span=None):
-    """``span``: the height the tint and rim gradients stretch over. A fixed span keeps every pixel above the bottom edge
-    the same while the panel grows or shrinks, so an animating panel only repaints its moving edge."""
-    span = span or rect.height()
-    # Fills of the rounded shape (the backdrop as a texture brush) instead of a clip path: an anti-aliased clip makes
-    # the raster engine build a mask on every frame.
+def paint_glass(p, rect, radius, palette, body=None, alpha=1.0, edge_layer=None, edge=1.0):
+    """The glass panel's material in ``rect``.
+
+    ``body``: the engine's opaque picture of the whole window (alfred.glass), painted through the rounded rectangle at
+    ``alpha`` (the live desktop shows through the rest); None paints the plain material, opaque in the palette's body
+    colour. Then the highlight inside the top-left, and the rim: ``edge_layer`` (the resting shape's bevel rim, a picture
+    of the whole device from (0, 0)) at opacity ``edge``, and a simple hairline at 1 - ``edge`` (while the height
+    animates). Everything here is anchored to the top-left, so pixels above a moving bottom edge never change."""
     path = QPainterPath()
     path.addRoundedRect(rect, radius, radius)
+    # Fills of the rounded shape (the picture as a texture brush) instead of a clip path: an anti-aliased clip makes
+    # the raster engine build a mask on every frame.
     p.save()
     p.setPen(Qt.NoPen)
-    if backdrop is not None:
-        brush = QBrush(backdrop)
-        brush.setTransform(QTransform.fromTranslate(backdrop_origin.x(), backdrop_origin.y()))
-        p.setBrush(brush)
-        p.drawPath(path)
-    tint = QLinearGradient(rect.topLeft(), QPointF(rect.left(), rect.top() + span))
-    tint.setColorAt(0, palette['tint'])
-    tint.setColorAt(1, palette['tint_bottom'])
-    p.setBrush(tint)
+    if body is None:
+        p.setBrush(palette['body'])
+    else:
+        p.setOpacity(alpha)
+        p.setBrush(QBrush(body))
     p.drawPath(path)
-    # Liquid-glass sheen: a soft specular band across the top.
-    sheen = QLinearGradient(rect.topLeft(), QPointF(rect.left(), rect.top() + min(90, rect.height())))
-    sheen.setColorAt(0, palette['sheen'])
-    sheen.setColorAt(1, QColor(255, 255, 255, 0))
-    p.setBrush(sheen)
+    p.setOpacity(1.0)
+    centre = QPointF(rect.left() + 70, rect.top() + 46)
+    glow = QRadialGradient(centre, 240)
+    glow.setColorAt(0, QColor(255, 255, 255, int(255 * RIM['highlight'])))
+    glow.setColorAt(1, QColor(255, 255, 255, 0))
+    p.setBrush(glow)
+    p.setClipRect(QRectF(rect.left(), rect.top(), 70 + 241, 46 + 241), Qt.IntersectClip)  # a plain rectangle clip: cheap
     p.drawPath(path)
     p.restore()
-    rim = QLinearGradient(rect.topLeft(), QPointF(rect.left(), rect.top() + span))
-    rim.setColorAt(0, palette['rim_top'])
-    rim.setColorAt(0.35, palette['rim_bottom'])
-    rim.setColorAt(1, palette['rim_bottom'])
-    p.setPen(QPen(QBrush(rim), 1.0))
-    p.setBrush(Qt.NoBrush)
-    p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+    if edge < 1.0:
+        p.save()
+        p.setOpacity(1.0 - edge)
+        k = 1.0 if palette['name'] == 'dark' else 0.8
+        line = QLinearGradient(rect.topLeft(), QPointF(rect.left() + 520, rect.top() + 520))
+        for at, a in ((0.0, RIM['base'] + RIM['tl'] * k), (0.18, RIM['base'] + RIM['tl'] * k * 0.35), (0.5, RIM['base']), (1.0, RIM['base'])):
+            line.setColorAt(at, QColor(255, 255, 255, int(255 * min(1.0, a))))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QBrush(line), RIM['pen']))
+        p.drawRoundedRect(rect.adjusted(0.6, 0.6, -0.6, -0.6), radius - 0.6, radius - 0.6)
+        if palette['name'] == 'light':
+            p.setPen(QPen(QColor(0, 0, 0, 40), 1.0))
+            p.drawRoundedRect(rect.adjusted(-0.5, -0.5, 0.5, 0.5), radius + 0.5, radius + 0.5)
+        p.restore()
+    if edge > 0.0 and edge_layer is not None:
+        p.save()
+        p.setOpacity(edge)
+        s = edge_layer.devicePixelRatio()
+        # Everything in the rim layer lies within a few pixels of the edge: draw only that ring, as four strips in whole
+        # device pixels that tile without overlapping (a 1:1 copy, never resampled, never drawn twice).
+        x0, y0 = math.floor((rect.left() - 3) * s), math.floor((rect.top() - 3) * s)
+        x1, y1 = math.ceil((rect.right() + 3) * s), math.ceil((rect.bottom() + 3) * s)
+        b = min(math.ceil(17 * s), (y1 - y0) // 2)
+        for x, y, w, h in ((x0, y0, x1 - x0, b), (x0, y1 - b, x1 - x0, b), (x0, y0 + b, b, y1 - y0 - 2 * b), (x1 - b, y0 + b, b, y1 - y0 - 2 * b)):
+            if w > 0 and h > 0:
+                p.drawImage(QRectF(x / s, y / s, w / s, h / s), edge_layer, QRectF(x, y, w, h))
+        p.restore()
 
 
 def paint_glow(p, rect, radius, phase, strength):
@@ -810,17 +809,21 @@ class Toggle(QAbstractButton):
 
 # -------------------------------------------------------------------- hotkey
 class HotkeyFilter(QAbstractNativeEventFilter):
-    """Delivers WM_HOTKEY from the GlobalHotkey registration to Qt."""
+    """Delivers WM_HOTKEY from the GlobalHotkey registration to Qt (``callback``, None without a hotkey), and a
+    wallpaper change (WM_SETTINGCHANGE with SPI_SETDESKWALLPAPER) to ``on_wallpaper``."""
 
-    def __init__(self, callback):
+    def __init__(self, callback, on_wallpaper=None):
         super().__init__()
         self.callback = callback
+        self.on_wallpaper = on_wallpaper
 
     def nativeEventFilter(self, event_type, message):
         if os.name == 'nt' and event_type == b'windows_generic_MSG':
             from ctypes import wintypes
             msg = wintypes.MSG.from_address(int(message))
-            if msg.message == 0x0312:  # WM_HOTKEY
+            if msg.message == 0x0312 and self.callback is not None:  # WM_HOTKEY
                 QTimer.singleShot(0, self.callback)
                 return True, 0
+            if msg.message == 0x001A and msg.wParam == 0x0014 and self.on_wallpaper is not None:
+                QTimer.singleShot(0, self.on_wallpaper)  # not consumed: every window may want it
         return False, 0

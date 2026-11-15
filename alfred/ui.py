@@ -27,15 +27,16 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconPr
                                QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
                                QSystemTrayIcon, QTextBrowser, QToolTip, QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, ai, chats, config, keys, mcp_server, models, opener, paths, picker, power, providers, rag, render, rerank, startup
+from . import APP_NAME, __version__, ai, chats, config, glass, keys, mcp_server, models, opener, paths, picker, power, providers, rag, render, rerank, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
 from .watcher import FolderWatcher
-from .ui_kit import (DRIVER, Loop, Motion, Spring, Toggle, app_icon, blurred_backdrop, brand_pixmap, dot_pixmap, fallback_backdrop, icon,
+from .ui_kit import (DRIVER, Loop, Motion, PALETTES, PANEL_SHADOW, Spring, Toggle, app_icon, brand_pixmap, dot_pixmap, icon,
                      icon_pixmap, logo_pixmap,
                      paint_glass, paint_glow, paint_shadow, palette_for, rgba, screen_dpr, snapped, sparkle_pixmap, stylesheet,
-                     HotkeyFilter, SHADOW_DROP, SHADOW_SPREAD, text_font, tune_text)
+                     system_dark, HotkeyFilter, text_font, tune_text)
 
 W, BAR, MAXH, M, R, FOOT = 780, 62, 600, 46, 26, 34
+EDGE_FADE = 0.12  # seconds: the resting shape's rim and lens band fade in after the height animation
 SEPARATOR_FADE = 60  # the line under the search bar fades in over the panel's first pixels of growth
 DEFAULT_HOTKEY, FALLBACK_HOTKEYS = 'Ctrl+Alt+L', ['Ctrl+Alt+L', 'Ctrl+Alt+K', 'Ctrl+Alt+A']
 SEARCH, ASK, SETTINGS = range(3)
@@ -2782,8 +2783,10 @@ class SettingsView(QWidget):
 
         g = Group(win, 'APPEARANCE')
         self.theme = QComboBox()
-        self.theme.addItems(['Match Windows', 'Dark', 'Light'])
-        g.row('Theme', self.theme)
+        self.theme.addItems(['Automatic', 'Dark', 'Light'])
+        g.row('Theme', self.theme, 'Automatic follows what is behind the panel (Windows’ setting when the panel is opaque)')
+        self.see_through = Toggle(pal)
+        g.row('See-through panel', self.see_through, 'Shows what is behind Alfred; off, the panel is opaque and uses no capture')
         self.reduce_motion = Toggle(pal)
         g.row('Reduce motion', self.reduce_motion, 'Also follows Windows “Animation effects”')
         self.start_login = Toggle(pal)
@@ -2812,7 +2815,7 @@ class SettingsView(QWidget):
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
         self.keep_minutes.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
         for toggle in (self.embed_enabled, self.ocr_enabled, self.reduce_motion, self.auto_index, self.search_on_gpu, self.save_chats,
-                       self.beyond, self.rerank_enabled, self.contextual):
+                       self.beyond, self.rerank_enabled, self.contextual, self.see_through):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
         self.rerank_model.currentIndexChanged.connect(lambda _: (self.save_timer.start(250), self.show_rerank()))
         self.loading = False
@@ -2834,6 +2837,7 @@ class SettingsView(QWidget):
         self.save_chats.setChecked(bool(s.get('save_chat_history', True)))
         self.theme.setCurrentIndex({'system': 0, 'dark': 1, 'light': 2}.get(s.get('theme'), 0))
         self.reduce_motion.setChecked(bool(s.get('reduce_motion')))
+        self.see_through.setChecked(bool(s.get('see_through', True)))
         self.auto_index.setChecked(bool(s.get('auto_index', True)))
         self.show_keep_loaded(ai.keep_alive_minutes(s))
         self.beyond.setChecked(bool(s.get('answer_beyond_files', True)))
@@ -3328,6 +3332,7 @@ class SettingsView(QWidget):
         before = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('video_interval'), s.get('contextual_chunks'))
         before_model = (s.get('provider'), s.get('model'))
         before_search = s.get('search_on_gpu')
+        before_glass = bool(s.get('see_through', True))
         s.update(compatible_base_url=self.compatible_url.text().strip())
         if self.effort.isEnabled() and self.effort.currentData() is not None:
             s['effort'] = self.effort.currentData()
@@ -3340,10 +3345,12 @@ class SettingsView(QWidget):
                   'keep_alive_minutes': self.keep_minutes.currentData(),
                   'save_chat_history': self.save_chats.isChecked(), 'answer_beyond_files': self.beyond.isChecked(),
                   'rerank_enabled': self.rerank_enabled.isChecked(), 'rerank_model': self.rerank_model.currentData() or rerank.DEFAULT,
-                  'contextual_chunks': self.contextual.isChecked()})
+                  'contextual_chunks': self.contextual.isChecked(), 'see_through': self.see_through.isChecked()})
         s.save()
         self.win.watch_folders()
         Motion.detect(s)
+        if s['see_through'] != before_glass:
+            self.win.glass_setting_changed()
         self.win.apply_theme()
         self.win.refresh_status()
         self.win.ask_view.chats_changed()
@@ -3466,6 +3473,22 @@ class Veil(QWidget):
             self._draw(p, self.new, min(1.0, ease * 1.4), 0, 10 * (1 - t))
 
 
+class EdgeFade:
+    """Fades the resting shape's rim and lens band in over EDGE_FADE seconds on the shared frame clock, repainting only
+    the edge ring."""
+
+    def __init__(self, win):
+        self.win = win
+
+    def advance(self, elapsed):
+        win = self.win
+        win.edge = min(1.0, win.edge + elapsed / EDGE_FADE)
+        win.update(win.edge_region())
+        if win.edge >= 1.0:
+            DRIVER.loops.discard(self)
+            win.sync_glass_busy()
+
+
 class AlfredWindow(QWidget):
     def __init__(self):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint)
@@ -3493,8 +3516,15 @@ class AlfredWindow(QWidget):
         self.downloads.finished.connect(self.download_finished)
         self.watcher = FolderWatcher(parent=self)
         self.watcher.changed.connect(self.auto_index)
-        self.backdrop, self.grab_origin = None, QPoint()
+        # Live glass (alfred.glass): the engine exists on a real Windows display only; plain material everywhere else.
+        live_platform = glass.WINDOWS and QGuiApplication.platformName() not in ('offscreen', 'minimal')
+        self.glass = glass.Backdrop(on_change=self.glass_changed, on_theme=lambda theme: self.apply_theme(),
+                                    margin=M, width=W, radius=R, full_shape=MAXH) if live_platform else None
+        self.glass_live, self.glass_reason = False, 'not shown yet'
+        self.edge, self.edge_fade = 1.0, EdgeFade(self)  # the resting shape's rim (0 while the height animates)
         self.setFixedSize(W + 2 * M, MAXH + 2 * M)
+        if self.glass is not None:
+            QTimer.singleShot(1500, self.warm_glass)
 
         self.height_spring = Spring(BAR, 300, 0.86, self._height, precision=0.1)
         self.appear = Spring(0, 420, 0.82, self._appear)
@@ -3552,8 +3582,18 @@ class AlfredWindow(QWidget):
         self.set_mode(SEARCH, animate=False)
 
     # ---------------------------------------------------------------- theme
+    def current_theme(self):
+        """'dark' or 'light'. A fixed Theme setting wins; Automatic follows what is behind the panel with live glass
+        (the engine's appearance) and Windows otherwise."""
+        setting = self.settings.get('theme')
+        if setting in ('dark', 'light'):
+            return setting
+        if self.glass_live and self.glass is not None and self.glass.theme:
+            return self.glass.theme
+        return 'dark' if system_dark() else 'light'
+
     def apply_theme(self):
-        self.pal = palette_for(self.settings.get('theme'))
+        self.pal = PALETTES[self.current_theme()]
         pal = self.pal
         sep = pal['separator']
         group = pal['fill']
@@ -3565,8 +3605,8 @@ class AlfredWindow(QWidget):
         placeholder.setColor(placeholder.ColorRole.Text, pal['text'])
         self.search.setPalette(placeholder)
         self.search_view.themed()
-        if self.backdrop is not None and self.grab_origin == QPoint(-1, -1):
-            self.backdrop = fallback_backdrop(self.size(), pal['name'] == 'dark')
+        if self.glass_live:
+            self.glass.set_appearance(self.settings.get('theme'))
         self.update()
 
     # ------------------------------------------------------------ geometry
@@ -3576,14 +3616,40 @@ class AlfredWindow(QWidget):
     def _height(self, value):
         self.clip.setGeometry(M, M + BAR, W, max(0, int(value - BAR)))
         previous, self.painted_height = getattr(self, 'painted_height', None), value
+        resting = value == self.height_spring.target
+        self.sync_glass_busy()
+        if not resting and self.edge > 0:
+            # The resting shape's rim and lens band go; a simple hairline anchored to the top-left follows the edge.
+            self.edge = 0.0
+            DRIVER.loops.discard(self.edge_fade)
+            self.update()
+            return
+        if resting and self.edge < 1 and self.edge_fade not in DRIVER.loops:
+            if Motion.reduced:
+                self.edge = 1.0
+                self.update(self.edge_region())
+            else:
+                DRIVER.add_loop(self.edge_fade)
         if previous is None or min(previous, value) < BAR + SEPARATOR_FADE:
             self.update()  # near the bar the separator line fades too
             return
-        # Only the band around the moving bottom edge (its rounded corners and shadow) changes: repaint just that, not
-        # the whole translucent window, which on Windows means re-sending every pixel of it to the compositor.
-        top = M + min(previous, value) - R - 2
-        bottom = M + max(previous, value) + SHADOW_DROP + SHADOW_SPREAD + 2
+        # Only the band around the moving bottom edge (its rounded corners, lens band and shadow) changes: repaint just
+        # that, not the whole translucent window, which on Windows means re-sending every pixel of it to the compositor.
+        top = M + min(previous, value) - R - 2 - glass.BAND
+        bottom = M + max(previous, value) + PANEL_SHADOW['drop'] + PANEL_SHADOW['spread'] + 2
         self.update(0, int(top), self.width(), int(math.ceil(bottom - top)))
+
+    def edge_region(self):
+        """The ring the resting shape's rim and lens band occupy: what the edge fade repaints."""
+        rect = QRectF(M, M, W, self.height_spring.target).toAlignedRect()
+        inset = glass.BAND + 4
+        return QRegion(rect.adjusted(-3, -3, 3, 3)).subtracted(QRegion(rect.adjusted(inset, inset, -inset, -inset)))
+
+    def sync_glass_busy(self):
+        """The still-background check waits while the panel itself moves (height, drop-in, edge fade)."""
+        if self.glass_live:
+            self.glass.set_animating(self.height_spring in DRIVER.springs or self.appear in DRIVER.springs
+                                     or self.edge_fade in DRIVER.loops)
 
     def glow_region(self):
         rect = self.panel_rect().toAlignedRect()
@@ -3623,12 +3689,16 @@ class AlfredWindow(QWidget):
         return self.mode != SEARCH or self.search_view.wants_expanded()
 
     def update_height(self):
-        self.height_spring.to(MAXH if self.wants_expanded() else BAR)
+        target = MAXH if self.wants_expanded() else BAR
+        if self.glass_live:
+            self.glass.set_shape(target)  # the lens band is made for the shape the panel comes to rest in
+        self.height_spring.to(target)
 
     DROP = 14  # the panel drops in from this far above
 
     def _appear(self, value):
         self.setWindowOpacity(max(0.0, min(1.0, value)))
+        self.sync_glass_busy()
         if hasattr(self, 'base_pos'):
             self._place((1 - value) * self.DROP)
         if self.hiding and value < 0.03:
@@ -3672,12 +3742,14 @@ class AlfredWindow(QWidget):
         DRIVER.follow(screen, self)
         if tune_text(screen.devicePixelRatio()):
             self.apply_theme()  # re-polish: style-sheet fonts pick up the new rendering
+        if self.glass_live and self.isVisible() and not self.hiding and abs(screen.devicePixelRatio() - self.glass.scale) > 0.01:
+            self.open_glass(screen, visible=True)  # another screen: close and reopen the engine for it
 
     def show_panel(self):
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         area = screen.geometry()
         self.base_pos = QPoint(area.center().x() - self.width() // 2, area.top() + int(area.height() * 0.17) - M)
-        self.capture_backdrop(screen)
+        self.open_glass(screen)
         self.hiding = False
         self.appear.snap(0 if not Motion.reduced else 1)
         self.native_base = None
@@ -3691,6 +3763,10 @@ class AlfredWindow(QWidget):
         self.show()
         DRIVER.follow(self.screen(), self)
         self.native_base = self._native_base()
+        resting = glass.window_rect(int(self.winId())) if self.glass_live else None
+        if resting is not None:
+            # The capture rectangle is the window's resting rectangle as Windows has it (one more capture if it differs).
+            self.glass.move(resting)
         self._place(0 if Motion.reduced else self.DROP)
         self.raise_()
         self.activateWindow()
@@ -3712,6 +3788,8 @@ class AlfredWindow(QWidget):
         if not self.isVisible():
             return
         self.hiding, self.appear_pending = True, False
+        if self.glass is not None:
+            self.glass.close(release=False)  # no hook, timer or job from now; the pictures stay for the fade-out
         if Motion.reduced:
             self.hide()
             self.hiding = False
@@ -3724,26 +3802,91 @@ class AlfredWindow(QWidget):
         else:
             self.show_panel()
 
-    def capture_backdrop(self, screen):
-        if QGuiApplication.platformName() == 'offscreen':
-            self.backdrop, self.grab_origin = fallback_backdrop(self.size(), self.pal['name'] == 'dark'), QPoint(-1, -1)
-            return
-        area = screen.geometry()
-        x, y = self.base_pos.x(), self.base_pos.y() - 20
-        shot = screen.grabWindow(0, x - area.x(), y - area.y(), self.width(), self.height() + 20)
-        self.backdrop = blurred_backdrop(shot) if not shot.isNull() else None
-        self.grab_origin = QPoint(x, y)
-        if self.backdrop is None:
-            self.backdrop, self.grab_origin = fallback_backdrop(self.size(), self.pal['name'] == 'dark'), QPoint(-1, -1)
+    # ---------------------------------------------------------------- glass
+    def open_glass(self, screen, visible=False):
+        """Choose live glass or the plain material for this showing (section 3 of the design) and, for live glass, open
+        the engine on ``screen``: it captures what is behind the resting rectangle and waits up to 80 ms for the first
+        picture. ``visible``: reopen while shown (the rectangle is the window's own)."""
+        reason = glass.plain_reason(QGuiApplication.platformName(), bool(self.settings.get('see_through', True)))
+        if reason is None and self.glass is None:
+            reason = 'platform'
+        hwnd = int(self.winId()) if reason is None else None
+        if reason is None and not glass.affinity_supported(hwnd):
+            reason = 'capture exclusion refused'
+        self.glass_live = False
+        if reason is None:
+            rect = glass.window_rect(hwnd) if visible else None
+            if rect is None:
+                rect = glass.native_rect(screen, self.base_pos.x(), self.base_pos.y(), self.width(), self.height())
+            self.glass_live = True  # the engine's first picture may switch the appearance (on_theme reads this)
+            self.glass.open(hwnd, rect, screen.devicePixelRatio(), int(self.height_spring.target), self.settings.get('theme'),
+                            'dark' if system_dark() else 'light', hidden=not self.isVisible(), others=self.other_windows)
+            if self.glass.failed:
+                reason, self.glass_live = 'first capture failed', False
+                self.glass.close()
+        elif self.glass is not None:
+            self.glass.close()
+        self.glass_reason = reason
+        if self.current_theme() != self.pal['name']:
+            self.apply_theme()
+
+    def other_windows(self):
+        """Alfred's other visible top-level windows (popover, menu, tooltip, combo list): excluded from captures too."""
+        return [int(w.winId()) for w in QApplication.topLevelWidgets()
+                if w is not self and w.isVisible() and w.testAttribute(Qt.WA_WState_Created)]
+
+    def warm_glass(self):
+        """Lens maps and rim layers for the primary screen, built on the worker ahead of the first showing."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if self.glass is not None and screen is not None:
+            dpr = screen.devicePixelRatio()
+            self.glass.warm(glass.device_size(self.width(), self.height(), dpr), dpr)
+
+    def glass_changed(self):
+        """The engine has new pictures (or gave up): repaint the panel."""
+        if self.glass_live and self.glass.failed:
+            self.glass_live, self.glass_reason = False, 'capture failed'
+            self.glass.close()
+            if self.current_theme() != self.pal['name']:
+                self.apply_theme()
+        self.update(self.panel_rect().toAlignedRect().adjusted(-2, -2, 2, 2))
+
+    def glass_setting_changed(self):
+        """Settings → See-through panel changed: switch at once."""
+        if self.isVisible() and not self.hiding:
+            self.open_glass(self.screen() or QGuiApplication.primaryScreen(), visible=True)
+            self.update()
+
+    def wallpaper_changed(self):
+        if self.glass_live:
+            self.glass.event('wallpaper')
+
+    def paint_body(self, p, rect):
+        shape = int(round(rect.height()))
+        layer = None
+        if self.edge > 0 and shape in (BAR, MAXH):
+            dpr = self.devicePixelRatioF()
+            layer = glass.edge_layer(glass.device_size(self.width(), self.height(), dpr), dpr, shape, self.pal['name'], M, W, R)
+        if self.glass_live:
+            try:
+                paint_glass(p, rect, R, self.pal, self.glass.picture(self.edge), self.glass.body_alpha, layer, self.edge)
+                return
+            except Exception as error:  # never an empty panel: the plain material, and plain for the rest of this showing
+                logging.getLogger('alfred').warning('Glass painting failed, plain material for this showing: %r', error)
+                self.glass_live, self.glass_reason = False, 'paint failed'
+                self.glass.close()
+        paint_glass(p, rect, R, self.pal, None, 1.0, layer, self.edge)
 
     # ---------------------------------------------------------------- paint
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         rect = self.panel_rect()
-        paint_shadow(p, rect, R, self.pal['shadow'])
-        origin = QPointF(0, 0) if self.grab_origin == QPoint(-1, -1) else QPointF(self.grab_origin - self.pos())
-        paint_glass(p, rect, R, self.pal, self.backdrop, origin, span=MAXH)
+        paint_shadow(p, rect, R, self.pal['shadow'], **PANEL_SHADOW)
+        self.paint_body(p, rect)
+        if self.glass_live:
+            area = event.rect()
+            self.glass.mark_dirty(area.x(), area.y(), area.width(), area.height())
         icon_rect = snapped(QRectF(M + 22, M + (BAR - 22) / 2, 22, 22), self)
         p.drawPixmap(icon_rect, sparkle_pixmap(22) if self.mode == ASK else icon_pixmap(
             {SEARCH: 'search', SETTINGS: 'gear'}.get(self.mode, 'search'), 22, self.pal['secondary']), QRectF())
@@ -3888,6 +4031,9 @@ class AlfredWindow(QWidget):
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        if self.glass is not None and not event.spontaneous():
+            self.glass.close()  # hidden: no hook, no timer, no job, pictures freed (lens maps and rim layers stay cached)
+            self.glass_live = False
         self.sync_priority()
 
     def sync_priority(self):
@@ -4387,13 +4533,15 @@ def run():
             except (OSError, ValueError) as error:
                 hotkey_error = str(error)
         if window.active_hotkey:
-            native = HotkeyFilter(window.toggle_panel)
-            app.installNativeEventFilter(native)
-            app._hotkey = (hotkey, native)
             window.hotkey = hotkey
             app.aboutToQuit.connect(hotkey.unregister)
     except Exception as error:
+        hotkey = None
         hotkey_error = str(error)
+    # The native event filter: WM_HOTKEY (when a shortcut is registered) and wallpaper changes for the live glass.
+    native = HotkeyFilter(window.toggle_panel if window.active_hotkey else None, on_wallpaper=window.wallpaper_changed)
+    app.installNativeEventFilter(native)
+    app._hotkey = (hotkey, native)
     window.settings_view.show_hotkey()
     shortcut = window.active_hotkey or 'the tray icon'
 

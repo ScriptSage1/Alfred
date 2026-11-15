@@ -57,6 +57,19 @@ def on_battery():
         return False
 
 
+def battery_saver():
+    """True only when Windows says battery saver (energy saver) is on (SYSTEM_POWER_STATUS.SystemStatusFlag == 1)."""
+    if not WINDOWS:
+        return False
+    try:
+        status = _SystemPowerStatus()
+        if not _kernel32().GetSystemPowerStatus(ctypes.byref(status)):
+            return False
+        return status.SystemStatusFlag == 1
+    except Exception:
+        return False
+
+
 class _PowerThrottlingState(ctypes.Structure):
     _fields_ = [('Version', ctypes.c_ulong), ('ControlMask', ctypes.c_ulong), ('StateMask', ctypes.c_ulong)]
 

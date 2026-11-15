@@ -52,7 +52,8 @@ DEFAULTS = {
     'index_on_battery': False,   # background indexing past the text layer also runs on battery
     # UI
     'reduce_motion': False,
-    'theme': 'system',           # 'system' | 'dark' | 'light'
+    'theme': 'system',           # 'system' (Automatic) | 'dark' | 'light'
+    'see_through': True,         # live glass: the panel shows what is behind it (off = the plain, opaque material)
     'hotkey': 'Ctrl+Alt+L',      # change in Settings; falls back if another app owns it
     'sidebar_collapsed': False,
     # Start with Windows: turned on once at first launch; after that only the Settings switch changes it.
