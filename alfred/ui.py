@@ -23,12 +23,12 @@ from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, 
 from PySide6.QtGui import (QColor, QKeySequence, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QLinearGradient,
                            QPainter, QPainterPath, QPen, QPixmap, QRegion, QShortcut)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFileIconProvider, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
-                               QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFileIconProvider, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
+                               QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QRadioButton, QScrollArea, QSpinBox, QStackedWidget,
                                QSystemTrayIcon, QTextBrowser, QToolTip, QVBoxLayout, QWidget)
 
 from . import APP_NAME, __version__, ai, chats, config, glass, keys, mcp_server, models, opener, paths, picker, power, providers, rag, render, rerank, startup
-from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, video_frame_png
+from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, discover, video_frame_png
 from .watcher import FolderWatcher
 from .ui_kit import (DRIVER, Loop, Motion, PALETTES, PANEL_SHADOW, Spring, Toggle, app_icon, brand_pixmap, dot_pixmap, icon,
                      icon_pixmap, logo_pixmap,
@@ -39,8 +39,8 @@ W, BAR, MAXH, M, R, FOOT = 780, 62, 600, 46, 26, 34
 EDGE_FADE = 0.12  # seconds: the resting shape's rim and lens band fade in after the height animation
 SEPARATOR_FADE = 60  # the line under the search bar fades in over the panel's first pixels of growth
 DEFAULT_HOTKEY, FALLBACK_HOTKEYS = 'Ctrl+Alt+L', ['Ctrl+Alt+L', 'Ctrl+Alt+K', 'Ctrl+Alt+A']
-SEARCH, ASK, SETTINGS = range(3)
-PLACEHOLDERS = {SEARCH: 'Search your files', ASK: 'Ask anything about your files', SETTINGS: 'Settings'}
+SEARCH, ASK, SETTINGS, SETUP = range(4)  # SETUP: the first-run setup (SetupView)
+PLACEHOLDERS = {SEARCH: 'Search your files', ASK: 'Ask anything about your files', SETTINGS: 'Settings', SETUP: ''}
 PENDING_REUSE_SECONDS = 5
 KIND_FILTERS = [('documents', 'Documents'), ('pdfs', 'PDFs'), ('slides', 'Slides'), ('spreadsheets', 'Sheets'), ('images', 'Images'),
                 ('videos', 'Videos'), ('text', 'Text & data')]
@@ -2270,6 +2270,16 @@ class FolderRow(QWidget):
         place = label(paths.shorten(self.folder, 58), 'caption')
         place.setToolTip(str(self.folder))
         texts.addWidget(place)
+        includes = QHBoxLayout()
+        includes.setContentsMargins(0, 0, 0, 0)
+        includes.setSpacing(2)
+        self.includes = label('', 'caption')
+        includes.addWidget(self.includes)
+        self.include_older = button('Include older files too', self.include, 'link', 'Read the files that were already there in full')
+        includes.addWidget(self.include_older)
+        includes.addStretch()
+        texts.addLayout(includes)
+        self.show_includes()
         row.addLayout(texts, 1)
         self.status = label('', 'caption')
         self.status.setTextFormat(Qt.RichText)
@@ -2283,6 +2293,18 @@ class FolderRow(QWidget):
     def set_status(self, text, color='secondary'):
         dot = f"<span style='color:{self.win.pal[color].name()}'>●</span>&nbsp; " if color != 'secondary' else ''
         self.status.setText(dot + html.escape(text))
+
+    def show_includes(self):
+        """"Everything", or "New files since 15 Nov" with "Include older files too" (a folder tracked as only new)."""
+        since = self.win.settings.since_for(self.folder)
+        when = datetime.fromtimestamp(since) if since is not None else None
+        self.includes.setText(f'New files since {when.day} {when:%b}' + (f' {when.year}' if when.year != datetime.now().year else '') + ' ·'
+                              if when else 'Everything')
+        self.include_older.setVisible(when is not None)
+
+    def include(self):
+        self.win.include_older(self.folder)
+        self.show_includes()
 
     def untrack(self):
         self.panel.untrack(self)
@@ -2433,7 +2455,7 @@ class TrackedFolders(QWidget):
         if free:
             self.chips.addWidget(label('Suggested', 'caption'))
         for name, path in free:
-            chip = button(name, lambda _=False, p=path: self.win.track_folder(p), 'chip', f'Track {paths.shorten(path)}')
+            chip = button(name, lambda _=False, p=path: self.win.offer_folder(p), 'chip', f'Track {paths.shorten(path)}')
             chip.setIcon(QIcon(folder_icon(path, 16)))
             chip.setIconSize(QSize(16, 16))
             self.chips.addWidget(chip)
@@ -2453,6 +2475,7 @@ class TrackedFolders(QWidget):
         for row in self.rows:
             key = str(Path(os.path.realpath(row.folder)))
             info = stats.get(key, {'files': 0, 'skipped': 0})
+            row.show_includes()
             if not row.folder.is_dir():
                 row.set_status('Folder missing', 'red')
             elif self.win.indexing and busy_root and paths.canonical(busy_root) == paths.canonical(row.folder):
@@ -2471,6 +2494,8 @@ class TrackedFolders(QWidget):
                 row.set_status('Waiting…')
             else:
                 text = f"{info['files']:,} file{'s' * (info['files'] != 1)}"
+                if info.get('older'):  # a folder tracked as "only new": how many are searchable by their content
+                    text += f" · {info.get('full', 0):,} fully searchable"
                 row.set_status(text + ' · up to date' if self.win.status.get('initialized') else text, 'green' if info['files'] else 'secondary')
         if self.win.indexing:
             phase = (state or {}).get('phase')
@@ -2662,9 +2687,6 @@ class SettingsView(QWidget):
         g.row('Rerank passages', self.rerank_enabled, 'When off (or not downloaded), passages keep the keyword + meaning order')
         self.rerank_status = label('', 'caption', wrap=True)
         g.outer.addWidget(self.rerank_status)
-        self.contextual = Toggle(pal)
-        g.row('Add AI context to passages', self.contextual,
-              'While indexing, the answer model on this PC writes a line saying where each passage sits in its document. Finds more; indexing is slower.')
         self.rerank_job = None
         body.addWidget(g)
 
@@ -2735,14 +2757,11 @@ class SettingsView(QWidget):
         self.embed_device = QComboBox()
         self.embed_device.addItems(['Auto (GPU when available)', 'CPU only'])
         self.embed_device.setMinimumWidth(300)
-        self.embed_batch = NumberBox()
-        self.embed_batch.setRange(1, 128)
         self.search_on_gpu = Toggle(pal)
         g.row('Use embeddings', self.embed_enabled)
         g.row('Indexing device', self.embed_device)
         g.row('Search on the graphics card', self.search_on_gpu,
               'Off: searches run on the CPU (about 20 ms each), so search needs no graphics memory')
-        g.row('Batch size', self.embed_batch, 'Lower it if the GPU runs out of memory')
         body.addWidget(g)
 
         g = Group(win, 'IMAGES & VIDEOS', 'A local OCR model (RapidOCR) reads the text in photos, screenshots, scanned PDF pages and video frames, '
@@ -2803,6 +2822,7 @@ class SettingsView(QWidget):
         hotkey_row.addWidget(button('Reset', lambda: self.change_hotkey(DEFAULT_HOTKEY)))
         g.row('Show / hide Alfred', hotkey_row, 'Click the box and press a combination with Ctrl, Alt, Shift or Win')
         g.outer.addWidget(self.hotkey_label)
+        g.row('First-run setup', button('Run setup again', lambda: self.win.run_setup(), None, 'Choose folders, search by meaning and the shortcut'))
         body.addWidget(g)
         body.addWidget(label(f'{APP_NAME} {__version__} ·{self.win.settings.path}', 'caption', wrap=True))
         body.addStretch()
@@ -2811,11 +2831,10 @@ class SettingsView(QWidget):
         self.compatible_url.textEdited.connect(lambda _: self.save_timer.start(600))
         for widget in (self.device, self.embed_device, self.theme, self.effort):
             widget.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
-        self.embed_batch.valueChanged.connect(lambda _: self.save_timer.start(600))
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
         self.keep_minutes.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
         for toggle in (self.embed_enabled, self.ocr_enabled, self.reduce_motion, self.auto_index, self.search_on_gpu, self.save_chats,
-                       self.beyond, self.rerank_enabled, self.contextual, self.see_through):
+                       self.beyond, self.rerank_enabled, self.see_through):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
         self.rerank_model.currentIndexChanged.connect(lambda _: (self.save_timer.start(250), self.show_rerank()))
         self.loading = False
@@ -2831,7 +2850,6 @@ class SettingsView(QWidget):
         self.embed_enabled.setChecked(bool(s.get('embed_enabled')))
         self.embed_device.setCurrentIndex(1 if s.get('embed_device') == 'cpu' else 0)
         self.search_on_gpu.setChecked(bool(s.get('search_on_gpu')))
-        self.embed_batch.setValue(int(s.get('embed_batch') or 16))
         self.ocr_enabled.setChecked(bool(s.get('ocr_enabled', True)))
         self.video_interval.setValue(int(s.get('video_interval') or 10))
         self.save_chats.setChecked(bool(s.get('save_chat_history', True)))
@@ -2843,7 +2861,6 @@ class SettingsView(QWidget):
         self.beyond.setChecked(bool(s.get('answer_beyond_files', False)))
         self.rerank_enabled.setChecked(bool(s.get('rerank_enabled', False)))
         self.rerank_model.setCurrentIndex(max(0, self.rerank_model.findData(s.get('rerank_model') or rerank.DEFAULT)))
-        self.contextual.setChecked(bool(s.get('contextual_chunks')))
         for widget in self.findChildren(QWidget):
             widget.blockSignals(False)
         self.show_rerank()
@@ -3339,13 +3356,13 @@ class SettingsView(QWidget):
         s.update({'device': 'cpu' if self.device.currentIndex() else 'auto',
                   'embed_enabled': self.embed_enabled.isChecked(), 'search_on_gpu': self.search_on_gpu.isChecked(),
                   'embed_device': 'cpu' if self.embed_device.currentIndex() else 'auto',
-                  'embed_batch': self.embed_batch.value(), 'ocr_enabled': self.ocr_enabled.isChecked(),
+                  'ocr_enabled': self.ocr_enabled.isChecked(),
                   'video_interval': self.video_interval.value(), 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
                   'reduce_motion': self.reduce_motion.isChecked(), 'auto_index': self.auto_index.isChecked(),
                   'keep_alive_minutes': self.keep_minutes.currentData(),
                   'save_chat_history': self.save_chats.isChecked(), 'answer_beyond_files': self.beyond.isChecked(),
                   'rerank_enabled': self.rerank_enabled.isChecked(), 'rerank_model': self.rerank_model.currentData() or rerank.DEFAULT,
-                  'contextual_chunks': self.contextual.isChecked(), 'see_through': self.see_through.isChecked()})
+                  'see_through': self.see_through.isChecked()})
         s.save()
         self.win.watch_folders()
         Motion.detect(s)
@@ -3501,6 +3518,649 @@ class EdgeFade:
             win.sync_glass_busy()
 
 
+# ------------------------------------------------------------------ setup
+SETUP_FOLDERS = ('Documents', 'Desktop', 'Downloads', 'Pictures')  # setup step 1's rows, in this order
+SETUP_TICKED = ('Documents', 'Desktop')
+SETUP_STEPS = ('What should Alfred search?', 'Search by meaning', 'Open Alfred from anywhere')
+FILES_PER_MINUTE = 1250  # a rough indexing rate for the chooser's "About N minutes" (labelled "about")
+ESTIMATE_ABOVE = 2000    # the time estimate shows only above this many files
+LARGE_FOLDER = 20000     # above this, the chooser suggests starting with new files
+ONLY_NEW_NOTE = 'Files already there stay findable by name. Anything you add or change from now on is fully searchable.'
+LARGE_HINT = 'Large folder: you can start with new files and include the rest later.'
+
+
+def count_files(folder, cancel=None):
+    """How many files Alfred would look at in ``folder`` (the index's own walk, nothing is read); None when cancelled."""
+    count = 0
+    for count, _ in enumerate(discover(folder), 1):
+        if cancel is not None and count % 256 == 0 and cancel.is_set():
+            return None
+    return count
+
+
+def estimate_text(count):
+    """'About 10 minutes' for indexing ``count`` files in full (a rough constant rate)."""
+    minutes = max(1, round(count / FILES_PER_MINUTE))
+    if minutes >= 90:
+        hours = round(minutes / 60)
+        return f'About {hours} hours'
+    return f'About {minutes} minute{"s" * (minutes != 1)}'
+
+
+def files_text(count):
+    return f'{count:,} file{"s" * (count != 1)}'
+
+
+class FolderChooser(QWidget):
+    """"Everything in it" (the default) or "Only new files from now on" for folders being tracked (design 4.1). One
+    control for setup step 1 (all ticked folders: ``plural``) and the add-folder sheet."""
+    changed = Signal()
+
+    def __init__(self, win, plural=False):
+        super().__init__()
+        self.win, self.plural, self.count = win, plural, None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(1)
+        self.everything = QRadioButton()
+        self.only_new = QRadioButton('Only new files from now on')
+        self.group = QButtonGroup(self)
+        for choice in (self.everything, self.only_new):
+            self.group.addButton(choice)
+            choice.setCursor(Qt.PointingHandCursor)
+            choice.toggled.connect(lambda _: self.changed.emit())
+        self.everything.setChecked(True)
+        self.everything_note = label('', 'caption', wrap=True)
+        self.only_new_note = label(ONLY_NEW_NOTE, 'caption', wrap=True)
+        for note in (self.everything_note, self.only_new_note):
+            note.setContentsMargins(26, 0, 0, 0)
+        self.hint = label(LARGE_HINT, 'caption', wrap=True)
+        self.hint.setContentsMargins(0, 6, 0, 0)
+        layout.addWidget(self.everything)
+        layout.addWidget(self.everything_note)
+        layout.addSpacing(6)
+        layout.addWidget(self.only_new)
+        layout.addWidget(self.only_new_note)
+        layout.addWidget(self.hint)
+        self.show_texts()
+
+    def reset(self, count=None):
+        self.everything.setChecked(True)
+        self.set_count(count)
+
+    def set_count(self, count):
+        """The number of files the folder(s) hold, or None while it is being counted."""
+        self.count = count
+        self.show_texts()
+
+    def show_texts(self):
+        self.everything.setText('Everything in them' if self.plural else 'Everything in it')
+        count = self.count
+        if count is None:
+            text = 'All files become searchable.'
+        elif count == 1:
+            text = 'Its one file becomes searchable.'
+        else:
+            text = f'All {count:,} files become searchable.'
+        if count and count > ESTIMATE_ABOVE:
+            text += f' {estimate_text(count)}.'
+        self.everything_note.setText(text)
+        self.hint.setVisible(bool(count and count > LARGE_FOLDER))
+
+    def only_new_files(self):
+        return self.only_new.isChecked()
+
+
+class StepDots(QWidget):
+    """The setup's step dots: the current one in the accent colour."""
+
+    def __init__(self, win, steps=3):
+        super().__init__()
+        self.win, self.steps, self.current = win, steps, 0
+        self.setFixedSize(steps * 14, 14)
+
+    def set(self, current):
+        self.current = current
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        for number in range(self.steps):
+            p.setBrush(self.win.pal['accent'] if number == self.current else self.win.pal['tertiary'])
+            p.drawEllipse(QPointF(7 + 14 * number, 7), 3.5, 3.5)
+
+
+class Keycaps(QWidget):
+    """The shortcut drawn as keycaps (Ctrl + Alt + L); green once it was pressed."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win, self.keys, self.done = win, [], False
+        self.key_font = text_font(13, QFont.DemiBold)
+        self.key_font.setFamilies(['Segoe UI Variable Text', 'Segoe UI'])  # as the style sheet's text
+        self.setFixedHeight(54)
+
+    def set_keys(self, text):
+        self.keys = [part for part in (text or '').split('+') if part]
+        self.done = False
+        metrics = QFontMetrics(self.key_font)
+        self.widths = [max(44, metrics.horizontalAdvance(key) + 30) for key in self.keys]
+        self.setFixedWidth(max(1, sum(self.widths) + 26 * max(0, len(self.keys) - 1) + 4))
+        self.update()
+
+    def set_done(self, done=True):
+        self.done = done
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        pal = self.win.pal
+        p.setFont(self.key_font)
+        x = 2.0
+        for number, (key, width) in enumerate(zip(self.keys, self.widths)):
+            rect = QRectF(x, 3, width, 46)
+            p.setPen(QPen(pal['green'] if self.done else pal['outline'], 1.4 if self.done else 1))
+            p.setBrush(pal['fill_strong'])
+            p.drawRoundedRect(rect, 9, 9)
+            p.setPen(pal['green'] if self.done else pal['text'])
+            p.drawText(rect, Qt.AlignCenter, key)
+            x += width
+            if number < len(self.keys) - 1:
+                p.setPen(pal['secondary'])
+                p.drawText(QRectF(x, 3, 26, 46), Qt.AlignCenter, '+')
+                x += 26
+
+
+def _card():
+    """A rounded group card (the Settings look) and its row layout."""
+    card = QFrame()
+    card.setObjectName('group')
+    rows = QVBoxLayout(card)
+    rows.setContentsMargins(14, 4, 14, 4)
+    rows.setSpacing(0)
+    return card, rows
+
+
+def _hairline():
+    line = QFrame()
+    line.setFixedHeight(1)
+    line.setObjectName('hairline')
+    return line
+
+
+def _switch_row(title, caption, toggle):
+    row = QWidget()
+    line = QHBoxLayout(row)
+    line.setContentsMargins(0, 9, 0, 9)
+    texts = QVBoxLayout()
+    texts.setSpacing(1)
+    row.title = label(title)
+    texts.addWidget(row.title)
+    texts.addWidget(label(caption, 'caption', wrap=True))
+    line.addLayout(texts, 1)
+    line.addWidget(toggle, 0, Qt.AlignRight | Qt.AlignVCenter)
+    return row
+
+
+class SetupView(QWidget):
+    """The first-run setup (design 2): three steps in the panel, one decision each. The bar shows the step title
+    (AlfredWindow.setup_title); the footer has step dots, Back, one primary button (Enter) and "Skip setup"."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self.step = 0
+        self.rows = []  # [(path, checkbox, count label)]
+        self.counts = {}  # path -> files (None while counting)
+        self.cancel = threading.Event()  # set when setup ends: background counts stop
+        self.needs = None  # what search by meaning still needs (models.first_run_needs); None while checked
+        self.download_wanted = False
+        self.start_login_initial = True
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(30, 14, 30, 10)
+        outer.setSpacing(0)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._folders_page())
+        self.pages.addWidget(self._meaning_page())
+        self.pages.addWidget(self._shortcut_page())
+        outer.addWidget(self.pages, 1)
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 8, 0, 0)
+        self.skip_button = button('Skip setup', self.skip, 'link', 'Start with an empty Alfred; folders can be added in Settings')
+        footer.addWidget(self.skip_button)
+        footer.addStretch(1)
+        self.dots = StepDots(win, len(SETUP_STEPS))
+        footer.addWidget(self.dots)
+        footer.addStretch(1)
+        self.back_button = button('Back', self.back)
+        self.primary = button('Continue', self.forward, 'primary')
+        self.primary.setMinimumWidth(110)
+        footer.addWidget(self.back_button)
+        footer.addSpacing(6)
+        footer.addWidget(self.primary)
+        outer.addLayout(footer)
+        self.setTabOrder(self.primary, self.back_button)
+        self.setTabOrder(self.back_button, self.skip_button)
+
+    # ------------------------------------------------------------- pages
+    def _page(self, sentence):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        page.sentence = label(sentence, 'secondary', wrap=True)
+        layout.addWidget(page.sentence)
+        return page, layout
+
+    def _folders_page(self):
+        page, layout = self._page('Choose the folders to start with. You can add or remove folders later in Settings.')
+        card, self.folder_rows = _card()
+        layout.addWidget(card)
+        self.add_button = button('Add another folder…', self.add_folder, 'link', 'Choose any folder on this PC')
+        add = QHBoxLayout()
+        add.setContentsMargins(0, 0, 0, 0)
+        add.addWidget(self.add_button)
+        add.addStretch()
+        layout.addLayout(add)
+        self.chooser = FolderChooser(self.win, plural=True)
+        layout.addWidget(self.chooser)
+        layout.addStretch(1)
+        lock = QHBoxLayout()
+        lock.setSpacing(7)
+        self.lock_icon = QLabel()
+        self.lock_icon.setFixedSize(14, 14)
+        lock.addWidget(self.lock_icon)
+        lock.addWidget(label('Your files are read on this PC and never leave it.', 'caption'))
+        lock.addStretch()
+        layout.addLayout(lock)
+        return page
+
+    def _meaning_page(self):
+        page, layout = self._page('Find files by what they are about, not only the words in them.')
+        card, rows = _card()
+        self.download = Toggle(lambda: self.win.pal)
+        self.download.setChecked(True)
+        self.download_row = _switch_row('Download the search model (once)',
+                                        'Search by name and text already works. You can add this later in Settings.', self.download)
+        rows.addWidget(self.download_row)
+        self.download_card = card
+        layout.addWidget(card)
+        self.ready = label('Search by meaning is ready', 'name')
+        self.ready_note = label('The search model is already on this PC.', 'caption')
+        layout.addWidget(self.ready)
+        layout.addWidget(self.ready_note)
+        layout.addStretch(1)
+        return page
+
+    def _shortcut_page(self):
+        page, layout = self._page('Press the shortcut in any app to open Alfred, and again to hide it.')
+        layout.addSpacing(8)
+        caps = QHBoxLayout()
+        caps.addStretch()
+        self.keycaps = Keycaps(self.win)
+        caps.addWidget(self.keycaps)
+        caps.addStretch()
+        layout.addLayout(caps)
+        self.try_note = label('Try it now', 'caption')
+        self.try_note.setAlignment(Qt.AlignCenter)
+        self.try_note.setTextFormat(Qt.RichText)
+        layout.addWidget(self.try_note)
+        change = QHBoxLayout()
+        change.addStretch()
+        self.change_button = button('Change shortcut', self.show_recorder, 'link', 'Choose another combination')
+        change.addWidget(self.change_button)
+        self.recorder = QKeySequenceEdit()
+        self.recorder.setMaximumSequenceLength(1)
+        self.recorder.setFixedWidth(170)
+        self.recorder.editingFinished.connect(self.record_finished)
+        self.recorder.hide()
+        change.addWidget(self.recorder)
+        change.addStretch()
+        layout.addLayout(change)
+        layout.addSpacing(10)
+        card, rows = _card()
+        self.start_login = Toggle(lambda: self.win.pal)
+        self.start_login.setChecked(True)
+        rows.addWidget(_switch_row('Start Alfred when I sign in', 'Alfred waits near the clock, so the shortcut works right away',
+                                   self.start_login))
+        layout.addWidget(card)
+        layout.addStretch(1)
+        return page
+
+    # ------------------------------------------------------------- state
+    def prepare(self):
+        """Fill the steps for this showing of setup (at the start, or "Run setup again")."""
+        self.cancel.set()
+        self.cancel = threading.Event()
+        while self.folder_rows.count():
+            item = self.folder_rows.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.rows, self.counts = [], {}
+        tracked = self.win.settings.folders
+        found = dict(suggested_folders())
+        for name in SETUP_FOLDERS:
+            if name in found:
+                done = any(paths.is_within(t, found[name]) for t in tracked)
+                self._add_row(found[name], name, ticked=name in SETUP_TICKED or done, tracked=done)
+        for folder in tracked:
+            if not any(paths.canonical(path) == paths.canonical(folder) for path, _, _ in self.rows):
+                self._add_row(folder, folder.name, ticked=True, tracked=True)
+        self.chooser.reset()
+        self.lock_icon.setPixmap(icon_pixmap('lock', 14, self.win.pal['secondary']))
+        self.download.setChecked(True)
+        self.download_wanted = False
+        self.needs = None
+        home = self.win.settings.home
+        run_job(lambda s: models.first_run_needs(home), self.needs_checked,
+                lambda error: logging.getLogger('alfred').warning('Setup could not check the search model: %s', error))
+        configured = bool(self.win.settings.get('start_with_windows_configured'))
+        self.start_login_initial = True
+        self.start_login.setChecked(True)
+        if configured:  # setup run again: the switch shows how it is now
+            run_job(lambda s: startup.enabled(), self.start_login_checked)
+        self.show_step(0)
+
+    def start_login_checked(self, on):
+        self.start_login_initial = bool(on)
+        self.start_login.setChecked(bool(on))
+
+    def _add_row(self, folder, name, ticked=True, tracked=False):
+        folder = Path(folder)
+        row = QWidget()
+        line = QHBoxLayout(row)
+        line.setContentsMargins(0, 7, 0, 7)
+        line.setSpacing(10)
+        box = QCheckBox(name)
+        box.setIcon(QIcon(folder_icon(folder, 20)))
+        box.setIconSize(QSize(20, 20))
+        box.setChecked(ticked)
+        box.setEnabled(not tracked)
+        box.setCursor(Qt.PointingHandCursor)
+        box.toggled.connect(lambda _: self.update_choice())
+        line.addWidget(box)
+        place = label(paths.shorten(folder, 46), 'caption')
+        place.setToolTip(str(folder))
+        line.addWidget(place, 1)
+        count = label('Tracked' if tracked else 'counting…', 'caption')
+        line.addWidget(count)
+        if self.rows:
+            self.folder_rows.addWidget(_hairline())
+        self.folder_rows.addWidget(row)
+        self.rows.append((folder, box, count))
+        if not tracked:
+            self.counts[folder] = None
+            cancel = self.cancel
+            run_job(lambda s: count_files(folder, cancel), lambda n: self.counted(folder, count, n))
+        self.update_choice()
+        return box
+
+    def counted(self, folder, widget, count):
+        if count is None or folder not in self.counts:
+            return
+        self.counts[folder] = count
+        try:
+            widget.setText(files_text(count))
+        except RuntimeError:  # the row went (setup prepared again)
+            return
+        self.update_choice()
+
+    def chosen(self):
+        """Ticked folders not tracked yet."""
+        return [folder for folder, box, _ in self.rows if box.isChecked() and box.isEnabled()]
+
+    def update_choice(self):
+        chosen = self.chosen()
+        counts = [self.counts.get(folder) for folder in chosen]
+        self.chooser.set_count(sum(counts) if chosen and None not in counts else None)
+        self.chooser.setEnabled(bool(chosen))
+        if self.step == 0:
+            self.primary.setText('Continue' if chosen or any(not box.isEnabled() for _, box, _ in self.rows) else 'Continue without folders')
+
+    def needs_checked(self, needs):
+        self.needs = list(needs)
+        total = sum(models.size_of(key) for key in self.needs)
+        self.download_row.title.setText(f'Download the search model ({total / 1e6:,.0f} MB, once)')
+        self.download_card.setVisible(bool(self.needs))
+        self.ready.setVisible(not self.needs)
+        self.ready_note.setVisible(not self.needs)
+        if self.download_wanted:
+            self.download_wanted = False
+            self.start_downloads()
+
+    def start_downloads(self):
+        for key in self.needs or []:
+            self.win.downloads.start(key)
+
+    # ------------------------------------------------------------- steps
+    def title(self):
+        return SETUP_STEPS[self.step]
+
+    def show_step(self, step):
+        self.step = step
+        self.pages.setCurrentIndex(step)
+        self.dots.set(step)
+        self.back_button.setVisible(step > 0)
+        if step == 0:
+            self.update_choice()
+        elif step == 1:
+            self.primary.setText('Continue')
+            ready = self.needs is not None and not self.needs
+            self.download_card.setVisible(not ready)
+            self.ready.setVisible(ready)
+            self.ready_note.setVisible(ready)
+        else:
+            self.primary.setText('Start searching')
+            self.show_shortcut()
+        self.win.setup_title.setText(self.title())
+        self.primary.setFocus()
+
+    def go(self, step, direction):
+        if self.win.mode == SETUP:
+            self.win.transition(lambda: self.show_step(step), direction)
+        else:
+            self.show_step(step)
+        self.primary.setFocus()
+
+    def forward(self):
+        if self.step == 0:
+            self.track_chosen()
+            self.go(1, 1)
+        elif self.step == 1:
+            if self.download.isChecked() and self.needs is None:
+                self.download_wanted = True  # started once the check has answered
+            elif self.download.isChecked():
+                self.start_downloads()
+            self.win.settings['model_download_asked'] = True
+            self.win.settings.save()
+            self.go(2, 1)
+        else:
+            self.finish()
+
+    def back(self):
+        if self.step > 0:
+            self.go(self.step - 1, -1)
+
+    def track_chosen(self):
+        """Step 1's Continue: track the ticked folders with the chosen mode; one indexing run for all of them."""
+        only_new = self.chooser.only_new_files()
+        tracked = []
+        for folder, box, count in self.rows:
+            if box.isChecked() and box.isEnabled() and self.win.track_folder(folder, only_new=only_new, announce=False):
+                tracked.append(folder)
+                box.setEnabled(False)
+                count.setText('Tracked')
+        if tracked:
+            self.win.toast(f'Tracking {len(tracked)} folder{"s" * (len(tracked) != 1)} · indexing now', 'green', seconds=5)
+            self.win.start_index(quiet=True, roots=tracked)
+        return tracked
+
+    def finish(self):
+        on = self.start_login.isChecked()
+        if not self.win.settings.get('start_with_windows_configured') or on != self.start_login_initial:
+            self.win.choose_start_login(on)
+        self.win.finish_setup()
+
+    def skip(self):
+        self.win.choose_start_login(True, keep_existing=True)
+        self.win.finish_setup()
+
+    def add_folder(self):
+        start = str(self.rows[0][0].parent) if self.rows else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, 'Choose a folder for Alfred to search', start)
+        if folder:
+            self.add_chosen(folder)
+
+    def add_chosen(self, folder):
+        folder = Path(os.path.realpath(folder))
+        reason = self.win.folder_problem(folder)
+        if reason:
+            self.win.toast(reason, 'orange', seconds=8)
+            return None
+        for path, box, _ in self.rows:
+            if paths.canonical(path) == paths.canonical(folder):
+                box.setChecked(True)
+                return box
+        return self._add_row(folder, folder.name or str(folder), ticked=True)
+
+    # ------------------------------------------------------------- shortcut
+    def show_shortcut(self):
+        active = self.win.active_hotkey
+        self.keycaps.set_keys(active)
+        self.keycaps.setVisible(bool(active))
+        self.change_button.setVisible(bool(active))
+        self.recorder.setVisible(not active)
+        self.try_note.setText('Try it now' if active else 'Open Alfred from its icon near the clock, or choose a shortcut:')
+
+    def hotkey_pressed(self):
+        """The global shortcut while step 3 shows: tick the keycaps instead of hiding the panel."""
+        self.keycaps.set_done(True)
+        self.try_note.setText(f"<span style='color:{self.win.pal['green'].name()}'>That’s it</span>")
+
+    def show_recorder(self):
+        self.change_button.hide()
+        self.recorder.show()
+        self.recorder.clear()
+        self.recorder.setFocus()
+
+    def record_finished(self):
+        sequence = self.recorder.keySequence().toString(QKeySequence.PortableText)
+        if sequence:
+            text = sequence.replace('Meta+', 'Win+')
+            if text != self.win.active_hotkey:
+                try:
+                    self.win.rebind_hotkey(text)
+                except (OSError, ValueError) as error:
+                    self.win.toast(f'{text}: {error}', 'red', seconds=6)
+            self.win.settings_view.show_hotkey()
+        self.show_shortcut()
+        self.primary.setFocus()
+
+    # ------------------------------------------------------------- keys
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            focused = QApplication.focusWidget()
+            target = focused if isinstance(focused, QPushButton) and self.isAncestorOf(focused) else self.primary
+            target.click()
+            return
+        if key == Qt.Key_Escape:
+            self.win.hide_panel()
+            return
+        super().keyPressEvent(event)
+
+
+class AddFolderSheet(QWidget):
+    """Adding a folder (Settings, the empty state's suggestions): the folder, its count, the chooser and "Track folder".
+    Shown in the panel in place of the current view; Enter tracks, Esc cancels."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win, self.folder, self.inner, self.token = win, None, [], 0
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(30, 22, 30, 16)
+        outer.setSpacing(12)
+        outer.addWidget(label('Track a folder', 'title'))
+        card, rows = _card()
+        rows.setContentsMargins(16, 12, 16, 14)
+        rows.setSpacing(10)
+        top = QHBoxLayout()
+        top.setSpacing(11)
+        self.art = QLabel()
+        self.art.setFixedSize(30, 30)
+        top.addWidget(self.art)
+        texts = QVBoxLayout()
+        texts.setSpacing(0)
+        self.name = label('', 'name')
+        self.place = label('', 'caption')
+        texts.addWidget(self.name)
+        texts.addWidget(self.place)
+        top.addLayout(texts, 1)
+        self.count = label('', 'caption')
+        top.addWidget(self.count)
+        rows.addLayout(top)
+        self.merge_note = label('', 'caption', wrap=True)
+        rows.addWidget(self.merge_note)
+        rows.addWidget(_hairline())
+        self.chooser = FolderChooser(win)
+        rows.addWidget(self.chooser)
+        outer.addWidget(card)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.cancel_button = button('Cancel', self.cancel)
+        self.track_button = button('Track folder', self.accept, 'primary')
+        self.track_button.setMinimumWidth(110)
+        buttons.addWidget(self.cancel_button)
+        buttons.addSpacing(6)
+        buttons.addWidget(self.track_button)
+        outer.addLayout(buttons)
+        outer.addStretch(1)
+
+    def open(self, folder, inner=()):
+        self.folder, self.inner = Path(folder), list(inner)
+        self.token += 1
+        token = self.token
+        self.art.setPixmap(folder_icon(self.folder, 28))
+        self.name.setText(self.folder.name or str(self.folder))
+        self.place.setText(paths.shorten(self.folder, 58))
+        self.place.setToolTip(str(self.folder))
+        self.count.setText('counting…')
+        names = ', '.join(Path(f).name for f in self.inner)
+        self.merge_note.setText(f'It includes {names}, already tracked: those files stay searchable as they are.' if self.inner else '')
+        self.merge_note.setVisible(bool(self.inner))
+        self.chooser.reset()
+        folder = self.folder
+        run_job(lambda s: count_files(folder), lambda n: self.counted(token, n))
+
+    def counted(self, token, count):
+        if token != self.token or count is None:
+            return
+        self.count.setText(files_text(count))
+        self.chooser.set_count(count)
+
+    def accept(self):
+        folder, only_new = self.folder, self.chooser.only_new_files()
+        self.win.close_sheet()
+        if folder is not None:
+            self.win.track_folder(folder, only_new=only_new)
+
+    def cancel(self):
+        self.win.close_sheet()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            focused = QApplication.focusWidget()
+            (focused if isinstance(focused, QPushButton) and self.isAncestorOf(focused) else self.track_button).click()
+            return
+        if event.key() == Qt.Key_Escape:
+            self.cancel()
+            return
+        super().keyPressEvent(event)
+
+
 class AlfredWindow(QWidget):
     def __init__(self):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint)
@@ -3555,6 +4215,10 @@ class AlfredWindow(QWidget):
         self.modes = ModeSwitch(self)
         self.modes.move(M + W - self.modes.width() - 14, M + (BAR - self.modes.height()) // 2)
         self.modes.changed.connect(lambda i: self.set_mode(i))
+        self.setup_title = label('', 'hero')  # in setup the bar shows the step's title instead of the search box
+        self.setup_title.setParent(self)
+        self.setup_title.setGeometry(M + 56, M + (BAR - 40) // 2, W - 56 - 34, 40)
+        self.setup_title.hide()
 
         self.clip = QWidget(self)
         self.clip.setObjectName('clear')
@@ -3566,9 +4230,13 @@ class AlfredWindow(QWidget):
         self.views = QStackedWidget()
         self.search_view, self.ask_view = SearchView(self), AskView(self)
         self.settings_view = SettingsView(self)
-        for view in (self.search_view, self.ask_view, self.settings_view):
+        self.setup_view = SetupView(self)
+        for view in (self.search_view, self.ask_view, self.settings_view, self.setup_view):
             self.views.addWidget(view)
         inner.addWidget(self.views, 1)
+        self.sheet, self.sheet_open = AddFolderSheet(self), False  # adding a folder: shown in place of the views
+        self.sheet.hide()
+        inner.addWidget(self.sheet, 1)
         footer = QWidget()
         footer.setFixedHeight(FOOT)
         row = QHBoxLayout(footer)
@@ -3698,7 +4366,7 @@ class AlfredWindow(QWidget):
         self.inner.move(0, 0)
 
     def wants_expanded(self):
-        return self.mode != SEARCH or self.search_view.wants_expanded()
+        return self.mode != SEARCH or self.sheet_open or self.search_view.wants_expanded()
 
     def update_height(self):
         target = MAXH if self.wants_expanded() else BAR
@@ -3791,7 +4459,7 @@ class AlfredWindow(QWidget):
         # The drop-in starts once the first frame is on screen (see paintEvent): that first paint and hand-over to the
         # compositor is the slowest of all, and inside the animation it would swallow its opening frames.
         self.appear_pending = True
-        self.search.setFocus()
+        self.focus_input()
         self.search.selectAll()
         self.refresh_status()
         self.warm_up()
@@ -3813,6 +4481,13 @@ class AlfredWindow(QWidget):
             self.hide_panel()
         else:
             self.show_panel()
+
+    def hotkey_pressed(self):
+        """The global shortcut: shows or hides the panel; while setup's shortcut step shows, it ticks the keycaps."""
+        if self.mode == SETUP and self.setup_view.step == 2 and self.isVisible() and not self.hiding:
+            self.setup_view.hotkey_pressed()
+        else:
+            self.toggle_panel()
 
     # ---------------------------------------------------------------- glass
     def open_glass(self, screen, visible=False):
@@ -3900,7 +4575,7 @@ class AlfredWindow(QWidget):
             area = event.rect()
             self.glass.mark_dirty(area.x(), area.y(), area.width(), area.height())
         icon_rect = snapped(QRectF(M + 22, M + (BAR - 22) / 2, 22, 22), self)
-        p.drawPixmap(icon_rect, sparkle_pixmap(22) if self.mode == ASK else icon_pixmap(
+        p.drawPixmap(icon_rect, sparkle_pixmap(22) if self.mode in (ASK, SETUP) else icon_pixmap(
             {SEARCH: 'search', SETTINGS: 'gear'}.get(self.mode, 'search'), 22, self.pal['secondary']), QRectF())
         expansion = max(0.0, min(1.0, (self.height_spring.value - BAR) / SEPARATOR_FADE))
         if expansion > 0:
@@ -3948,7 +4623,18 @@ class AlfredWindow(QWidget):
     def set_mode(self, mode, animate=True):
         previous = self.mode
         self.mode = mode
-        self.modes.set(mode, animate)
+        if self.sheet_open:
+            self.sheet_open = False
+            self.sheet.hide()
+            self.views.show()
+        setup = mode == SETUP
+        self.search.setVisible(not setup)
+        self.modes.setVisible(not setup)
+        self.setup_title.setVisible(setup)
+        if setup:
+            self.setup_title.setText(self.setup_view.title())
+        else:
+            self.modes.set(mode, animate and previous != SETUP)
         self.search.setPlaceholderText(PLACEHOLDERS[mode])
         self.search.setReadOnly(mode == SETTINGS)
         if mode == SETTINGS:
@@ -3975,12 +4661,20 @@ class AlfredWindow(QWidget):
             change()
         self.update_height()
         self.update()
-        self.search.setFocus()
+        self.focus_input()
+
+    def focus_input(self):
+        """The search box, or in setup its primary button."""
+        if self.mode == SETUP:
+            self.setup_view.primary.setFocus()
+        else:
+            self.search.setFocus()
 
     def update_hints(self):
         hints = {SEARCH: '↑↓ Select   ↵ Open   Ctrl+↵ Show in folder   ⇥ Ask Alfred   Esc Close',
                  ASK: '↵ Ask   Ctrl+N New chat   Ctrl+H History   Esc Close',
-                 SETTINGS: 'Changes save automatically   Esc Back'}
+                 SETTINGS: 'Changes save automatically   Esc Back',
+                 SETUP: '↵ Continue   Esc Close (setup resumes next time)'}
         if not self.toasting:
             self.hints.setText(hints[self.mode])
 
@@ -3993,6 +4687,9 @@ class AlfredWindow(QWidget):
         if obj is self.search and event.type() == QEvent.KeyPress:
             key, mods = event.key(), event.modifiers()
             ctrl = bool(mods & Qt.ControlModifier)
+            if self.sheet_open and key in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter):
+                self.sheet.keyPressEvent(event)
+                return True
             if key == Qt.Key_Escape:
                 if self.search.text() and self.mode in (SEARCH, ASK):
                     self.search.clear()
@@ -4064,11 +4761,13 @@ class AlfredWindow(QWidget):
         self.start_index(quiet=True, auto=True)
 
     def maybe_hide(self):
+        if self.mode == SETUP:
+            return  # setup stays while the user looks elsewhere (the folder dialog, the shortcut); Esc closes it
         if QApplication.activeWindow() is None and QApplication.activeModalWidget() is None and not self.hiding:
             self.hide_panel()
 
     def mousePressEvent(self, event):
-        if not self.panel_rect().contains(event.position()):
+        if not self.panel_rect().contains(event.position()) and self.mode != SETUP:
             self.hide_panel()
         else:
             super().mousePressEvent(event)
@@ -4077,7 +4776,7 @@ class AlfredWindow(QWidget):
     def problem_state(self):
         st = self.status
         if not st['folders']:
-            suggestions = [(f'Track {name}', lambda _=False, p=path: self.track_folder(p)) for name, path in suggested_folders()[:1]]
+            suggestions = [(f'Track {name}', lambda _=False, p=path: self.offer_folder(p)) for name, path in suggested_folders()[:1]]
             return ('Track a folder to start searching',
                     'Alfred searches the folders you track — like Downloads or Pictures — including the text inside documents, '
                     'images and videos, and keeps up with new files automatically.',
@@ -4148,30 +4847,6 @@ class AlfredWindow(QWidget):
             self.start_index(quiet=True, background=True)
         else:
             self.toast(f'{name[0].upper()}{name[1:]} is downloaded', 'green', seconds=4)
-
-    def offer_model_download(self):
-        """First run (the engine or the search model missing): ask once whether to download them. Keyword and name
-        search work meanwhile; No is remembered, and Settings still offers each file. Nothing is asked when both are
-        here, or after the question was answered once."""
-        if self.settings.get('model_download_asked'):
-            return
-        home = self.settings.home
-
-        def ask(needs):
-            if not needs or self.settings.get('model_download_asked'):
-                return
-            total = sum(models.size_of(key) for key in needs)
-            what = 'the search model and engine' if len(needs) == 2 else DOWNLOAD_ROWS[needs[0]][1]
-            answer = ask_box(self, 'Search by meaning', f'Download {what} ({total / 1e6:,.0f} MB)? Keyword and name search work '
-                             'already; this adds search by meaning. You can also download them later in Settings.',
-                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-            self.settings['model_download_asked'] = True
-            self.settings.save()
-            if answer == QMessageBox.Yes:
-                for key in needs:
-                    self.downloads.start(key)
-        run_job(lambda s: models.first_run_needs(home), ask,
-                lambda error: logging.getLogger('alfred').warning('First-run check: %s', error))
 
     def rebind_hotkey(self, text):
         """Switch the global shortcut live; GlobalHotkey restores the old one if the new one is taken."""
@@ -4380,25 +5055,57 @@ class AlfredWindow(QWidget):
         start = next((str(path) for _, path in suggested_folders()), str(Path.home()))
         folder = QFileDialog.getExistingDirectory(self, 'Choose a folder for Alfred to track', start)
         if folder:
-            self.track_folder(folder)
+            self.offer_folder(folder)
 
-    def track_folder(self, folder, only_new=False):
-        """Track a folder: index it right away, then watch it for changes. ``only_new``: "only new files from now on"
-        (the files already there are found by name only; see Index.track_only_new)."""
+    def folder_problem(self, folder):
+        """Why ``folder`` can't be tracked (a message), or None."""
         folder = Path(os.path.realpath(folder))
         reason = paths.forbidden_reason(folder, self.settings.home)
+        if reason:
+            return reason
+        parent = next((t for t in self.settings.folders if paths.is_within(t, folder)), None)
+        if parent is not None:
+            return f'{folder.name} is already tracked' + (f' as part of {parent.name}' if paths.canonical(parent) != paths.canonical(folder) else '')
+        saved_chats = self.settings.chats_folder
+        if paths.is_within(saved_chats, folder) or paths.is_within(folder, saved_chats):
+            return 'That folder holds your saved chats, so Alfred won’t search it'
+        return None
+
+    def offer_folder(self, folder):
+        """Adding a folder: the sheet with its count and the "Everything / Only new files" chooser (Enter tracks it)."""
+        folder = Path(os.path.realpath(folder))
+        reason = self.folder_problem(folder)
+        if reason:
+            self.toast(reason, 'orange', seconds=8)
+            return False
+        inner = [t for t in self.settings.folders if paths.is_within(folder, t)]
+        self.sheet.open(folder, inner)
+        if not self.sheet_open:
+            self.sheet_open = True
+            self.transition(lambda: (self.views.hide(), self.sheet.show()), 0)
+        self.update_height()
+        self.sheet.track_button.setFocus()
+        return True
+
+    def close_sheet(self):
+        if not self.sheet_open:
+            return
+        self.sheet_open = False
+        self.transition(lambda: (self.sheet.hide(), self.views.show()), 0)
+        self.update_height()
+        self.focus_input()
+
+    def track_folder(self, folder, only_new=False, announce=True):
+        """Track a folder: index it right away, then watch it for changes. ``only_new``: "only new files from now on"
+        (the files already there are found by name only; see Index.track_only_new). Tracked folders inside it keep their
+        indexed files (Index.adopt). ``announce`` False (setup tracks several): no toast and no indexing run; the
+        caller starts one."""
+        folder = Path(os.path.realpath(folder))
+        reason = self.folder_problem(folder)
         if reason:
             self.toast(reason, 'orange', seconds=8)
             return False
         tracked = self.settings.folders
-        parent = next((t for t in tracked if paths.is_within(t, folder)), None)
-        if parent is not None:
-            self.toast(f'{folder.name} is already tracked as part of {parent.name}', 'orange', seconds=6)
-            return False
-        saved_chats = self.settings.chats_folder
-        if paths.is_within(saved_chats, folder) or paths.is_within(folder, saved_chats):
-            self.toast('That folder holds your saved chats, so Alfred won’t search it', 'orange', seconds=6)
-            return False
         inside = [t for t in tracked if paths.is_within(folder, t)]
         self.settings['tracked_folders'] = [str(t) for t in tracked if t not in inside] + [str(folder)]
         for merged_folder in inside:
@@ -4408,17 +5115,81 @@ class AlfredWindow(QWidget):
         else:
             self.settings.clear_since(folder)
         self.settings.save()
+        if inside:  # before any indexing run could drop the inner folders' files as untracked
+            if self.indexing:
+                index = self.index
+                run_job(lambda s: index.adopt(folder, inside, include_older=not only_new),
+                        lambda _: announce and self.start_index(quiet=True, roots=[folder]),
+                        lambda error: self.toast(f'Couldn’t move the files of {inside[0].name}: {error}', 'red', seconds=8))
+                announce_run = False
+            else:
+                self.index.adopt(folder, inside, include_older=not only_new)
+                announce_run = announce
+        else:
+            announce_run = announce
         self.watch_folders()
         if self.mode == SETTINGS:
             if inside:
                 self.settings_view.tracked.load()
             else:
                 self.settings_view.tracked.added(folder)
-        merged = f" (it includes {', '.join(t.name for t in inside)})" if inside else ''
-        self.toast(f'Tracking {folder.name}{merged} · indexing now', 'green', seconds=5)
         self.refresh_status()
-        self.start_index(quiet=True, roots=[folder])
+        if announce:
+            merged = f" (it includes {', '.join(t.name for t in inside)})" if inside else ''
+            self.toast(f'Tracking {folder.name}{merged} · indexing now', 'green', seconds=5)
+        if announce_run:
+            self.start_index(quiet=True, roots=[folder])
         return True
+
+    def include_older(self, folder):
+        """"Include older files too" for a folder tracked as only new: they are read in full in the background."""
+        index, name = self.index, Path(folder).name
+
+        def done(count):
+            self.refresh_status()
+            self.toast(f'Reading {count:,} older file{"s" * (count != 1)} in {name}', 'green', seconds=5)
+            self.start_index(quiet=True, roots=[folder])
+        run_job(lambda s: index.include_older(folder), done,
+                lambda error: self.toast(f'Couldn’t include the older files of {name}: {error}', 'red', seconds=8))
+
+    # ---------------------------------------------------------------- setup
+    def start_setup_if_needed(self):
+        """At start: a first run (setup not done, no folder tracked) opens in setup. An Alfred that already tracks
+        folders is marked as set up, silently (and its start-at-sign-in is settled as it always was). True when setup shows."""
+        if self.settings.get('setup_done'):
+            return False
+        if self.settings.folders:
+            self.settings['setup_done'] = True
+            self.settings.save()
+            self.choose_start_login(True, keep_existing=True)
+            return False
+        self.run_setup()
+        return True
+
+    def run_setup(self):
+        """Show setup from its first step (at the first run, or Settings → Run setup again)."""
+        self.setup_view.prepare()
+        self.set_mode(SETUP, animate=self.isVisible())
+
+    def finish_setup(self):
+        """Setup finished or skipped: never shown by itself again; Search with the cursor in the box."""
+        self.setup_view.cancel.set()
+        self.settings['setup_done'] = True
+        self.settings.save()
+        self.set_mode(SEARCH)
+        self.refresh_status()
+
+    def choose_start_login(self, on, keep_existing=False):
+        """Start Alfred at sign-in (on) or not, chosen in setup; ``keep_existing``: only when it was never settled.
+        The Startup shortcut is written off the UI thread (PowerShell)."""
+        if keep_existing and self.settings.get('start_with_windows_configured'):
+            return
+        self.settings['start_with_windows_configured'] = True
+        self.settings.save()
+
+        def work(signals):
+            startup.enable() if on else startup.disable()
+        run_job(work, None, lambda error: logging.getLogger('alfred').warning('Could not change start with Windows: %s', error))
 
     def untrack_folder(self, folder):
         """Stop tracking a folder; its files leave the index (nothing on disk is touched)."""
@@ -4533,7 +5304,7 @@ def run():
     server = QLocalServer()
     server.listen(INSTANCE)
     window = AlfredWindow()
-    startup.first_run(window.settings)
+    window.start_setup_if_needed()  # a first run opens in setup; existing users are marked as set up
     # On quit, stop indexing at the next file and let background work finish before Python shuts down.
     app.aboutToQuit.connect(lambda: (window.index.cancel.set(), QThreadPool.globalInstance().waitForDone(5000)))
     server.newConnection.connect(lambda: serve_command(server.nextPendingConnection(), window))
@@ -4557,7 +5328,7 @@ def run():
         hotkey = None
         hotkey_error = str(error)
     # The native event filter: WM_HOTKEY (when a shortcut is registered) and wallpaper changes for the live glass.
-    native = HotkeyFilter(window.toggle_panel if window.active_hotkey else None, on_wallpaper=window.wallpaper_changed)
+    native = HotkeyFilter(window.hotkey_pressed if window.active_hotkey else None, on_wallpaper=window.wallpaper_changed)
     app.installNativeEventFilter(native)
     app._hotkey = (hotkey, native)
     window.settings_view.show_hotkey()
@@ -4584,7 +5355,6 @@ def run():
     else:
         window.show_panel()
         QTimer.singleShot(700, lambda: window.start_index(quiet=True, background=True))
-        QTimer.singleShot(1500, window.offer_model_download)  # first run without the search model or engine: ask once
     if window.active_hotkey:
         tray.showMessage('Alfred is ready' if at_sign_in else 'Alfred is running',
                          f'Press {window.active_hotkey} anywhere to open Alfred. Esc hides it.', app_icon(), 4000)

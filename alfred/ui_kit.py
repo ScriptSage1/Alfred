@@ -103,6 +103,9 @@ QFrame#sourcerow {{ background: {f}; border: 1px solid {sep}; border-radius: 9px
 QFrame#sourcerow:hover {{ background: {fs}; }}
 QCheckBox::indicator {{ width: 15px; height: 15px; border-radius: 4px; border: 1px solid {rgba(p['tertiary'])}; background: {f}; }}
 QCheckBox::indicator:checked {{ background: {acc}; border-color: {acc}; }}
+QRadioButton {{ spacing: 9px; }}
+QRadioButton::indicator {{ width: 15px; height: 15px; border-radius: 8px; border: 1px solid {rgba(p['tertiary'])}; background: {f}; }}
+QRadioButton::indicator:checked {{ width: 9px; height: 9px; background: white; border: 4px solid {acc}; }}
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 1px; }}
 QScrollBar::handle:vertical {{ background: {rgba(p['tertiary'], .55)}; border-radius: 3px; min-height: 28px; }}
 QScrollBar::handle:vertical:hover {{ background: {s}; }}
@@ -442,6 +445,7 @@ SVG = {
     'check': '<path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="C" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>',
     'chevron_down': '<path d="M6 9l6 6 6-6" fill="none" stroke="C" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>',
     'plus': '<path d="M12 5v14M5 12h14" stroke="C" stroke-width="2.2" stroke-linecap="round"/>',
+    'lock': '<rect x="5" y="10.5" width="14" height="10" rx="2.2" fill="C"/><path d="M8.3 10.5V8a3.7 3.7 0 0 1 7.4 0v2.5" fill="none" stroke="C" stroke-width="2"/>',
     'note': '<path d="M6 3h8l5 5v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" fill="C"/><path d="M8.5 12h7M8.5 15.5h7" stroke="#000" stroke-opacity=".35" stroke-width="1.5" stroke-linecap="round"/>',
 }
 _icon_cache = {}

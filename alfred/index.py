@@ -503,6 +503,28 @@ class Index:
                 con.close()
         return count
 
+    def adopt(self, parent, inner, include_older=False):
+        """A newly tracked ``parent`` contains the tracked folders ``inner``: their files move to ``parent`` as they are
+        (nothing is read again, no passage or vector is lost). ``include_older`` (the parent includes everything): their
+        skipped files become pending. Call before the next update; waits while one runs. Returns how many files moved."""
+        key = str(Path(os.path.realpath(parent)))
+        inner = [str(Path(os.path.realpath(folder))) for folder in inner]
+        moved = 0
+        with self._lock:
+            con = connect(self.db_path)
+            try:
+                with con:
+                    for folder in inner:
+                        if include_older:
+                            con.execute("UPDATE files SET status='pending', error='' WHERE root=? AND status='skipped'", (folder,))
+                        moved += con.execute('UPDATE files SET root=? WHERE root=?', (key, folder)).rowcount
+                        con.execute('DELETE FROM meta WHERE key=?', ('since_baseline:' + folder,))
+            finally:
+                con.close()
+        for folder in inner:
+            self._baseline.discard(paths.canonical(folder))
+        return moved
+
     def _skip_rule(self, con, root):
         """For layer 1 in ``root``: (folder_since or None, skip every new file?). A folder tracked as "only new" takes
         its baseline once (every file found then is skipped); an index made from nothing (no baseline recorded) skips

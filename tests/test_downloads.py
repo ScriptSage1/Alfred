@@ -1,4 +1,4 @@
-"""Model and engine downloads (alfred.models) and their Settings rows and first-run question (alfred.ui).
+"""Model and engine downloads (alfred.models) and their Settings rows (alfred.ui).
 
 No internet: a small HTTP server on 127.0.0.1 serves fake files, with Range support. No test starts a llama-server
 (runtime.program_dir is patched, PROGRAM_OVERRIDE is None), and every ALFRED_HOME is a temporary folder.
@@ -280,7 +280,7 @@ class EngineTests(Base):
 
 
 class FirstRunTests(unittest.TestCase):
-    """The first-run question and the Settings rows, on a headless window."""
+    """The Settings rows, on a headless window (the first-run download is setup step 2: tests/test_setup.py)."""
 
     def setUp(self):
         from PySide6.QtWidgets import QApplication
@@ -317,34 +317,6 @@ class FirstRunTests(unittest.TestCase):
         QThreadPool.globalInstance().waitForDone(10000)
         for _ in range(5):
             self.app.processEvents()
-
-    def offer(self, needs, answer):
-        from PySide6.QtWidgets import QMessageBox
-        asked = []
-        reply = QMessageBox.Yes if answer else QMessageBox.No
-        with mock.patch.object(models, 'first_run_needs', lambda home=None: list(needs)), \
-                mock.patch.object(self.ui, 'ask_box', lambda *args: (asked.append(args[2]), reply)[1]):
-            self.win.offer_model_download()
-            self.settle()
-        return asked
-
-    def test_asked_once_when_something_is_missing(self):
-        asked = self.offer([models.ENGINE, 'embed-text'], answer=False)
-        self.assertEqual(len(asked), 1)
-        total = models.BUILD['size'] + models.FILES['embed-text'].size
-        self.assertIn(f'Download the search model and engine ({total / 1e6:,.0f} MB)?', asked[0])
-        self.assertEqual(self.started, [])
-        self.assertTrue(self.win.settings['model_download_asked'])
-        self.assertEqual(self.offer([models.ENGINE, 'embed-text'], answer=True), [])  # No is remembered
-        self.assertEqual(self.started, [])
-
-    def test_yes_starts_both_downloads(self):
-        self.offer([models.ENGINE, 'embed-text'], answer=True)
-        self.assertEqual(self.started, [models.ENGINE, 'embed-text'])
-
-    def test_not_asked_when_both_are_here(self):
-        self.assertEqual(self.offer([], answer=True), [])
-        self.assertFalse(self.win.settings['model_download_asked'])
 
     def test_no_download_offered_for_the_answer_model(self):
         view = self.win.settings_view

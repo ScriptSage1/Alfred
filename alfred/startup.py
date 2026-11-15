@@ -189,10 +189,9 @@ def add_to_start_menu():
 
 
 def install(settings):
-    """Setup-Alfred.cmd: add Alfred to the Start menu, and to sign-in unless the user turned that off."""
-    link = add_to_start_menu()
-    first_run(settings)
-    return link
+    """Setup-Alfred.cmd: add Alfred to the Start menu. Starting at sign-in is chosen in Alfred's first-run setup (or
+    switched on when setup is skipped), never before."""
+    return add_to_start_menu()
 
 
 def disable(folder=None):
@@ -202,7 +201,8 @@ def disable(folder=None):
 
 
 def first_run(settings):
-    """Turn on start-at-sign-in once; afterwards only the Settings switch changes it."""
+    """Turn on start-at-sign-in once, for an Alfred that tracked folders before the first-run setup existed;
+    afterwards only the Settings switch changes it."""
     if settings.get('start_with_windows_configured'):
         return
     try:
