@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import (QColor, QKeySequence, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QLinearGradient,
+from PySide6.QtGui import (QBrush, QColor, QKeySequence, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QLinearGradient,
                            QPainter, QPainterPath, QPen, QPixmap, QRegion, QShortcut)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFileIconProvider, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
@@ -1942,7 +1942,7 @@ class AskView(QWidget):
 
     def picked(self, item):
         if item.get('action') == 'settings':
-            self.win.set_mode(SETTINGS)
+            self.win.open_settings('Ask Alfred')
         elif item.get('action') == 'effort':
             self.choose_effort(item['value'], item['title'])
         else:
@@ -1997,7 +1997,7 @@ class AskView(QWidget):
     # -------------------------------------------------------------- history
     def toggle_history(self):
         if not self.saving:
-            self.win.toast('Chat history is off', 'orange', ('Turn on in Settings', lambda: self.win.set_mode(SETTINGS)), 6)
+            self.win.toast('Chat history is off', 'orange', ('Turn on in Settings', lambda: self.win.open_settings('Ask Alfred')), 6)
             return
         opening = not self.panel.is_open
         self.panel.set_open(opening)
@@ -2165,7 +2165,7 @@ class Group(QFrame):
         self.card = QFrame()
         self.card.setObjectName('group')
         self.rows = QVBoxLayout(self.card)
-        self.rows.setContentsMargins(14, 6, 14, 6)
+        self.rows.setContentsMargins(14, 4, 14, 4)
         self.rows.setSpacing(0)
         self.outer.addWidget(self.card)
         if note:
@@ -2183,7 +2183,9 @@ class Group(QFrame):
         self.rows.addWidget(widget)
         return widget
 
-    def row(self, title, widget=None, caption=None):
+    def row(self, title, widget=None, caption=None, tip=None):
+        """A row: its name, at most one line of help (``caption``; '' makes an empty line to fill later, kept as
+        ``holder.caption``) and one control on the right. ``tip``: the longer explanation, as the name's tooltip."""
         line = None
         if self.count:
             line = QFrame()
@@ -2195,11 +2197,17 @@ class Group(QFrame):
         holder.hairline = line  # hide it together with the row
         row = QHBoxLayout(holder)
         row.setContentsMargins(0, 7, 0, 7)
+        row.setSpacing(10)
         texts = QVBoxLayout()
         texts.setSpacing(0)
-        texts.addWidget(label(title))
-        if caption:
-            texts.addWidget(label(caption, 'caption', wrap=True))
+        holder.title = label(title)
+        if tip:
+            holder.title.setToolTip(tip)
+        texts.addWidget(holder.title)
+        holder.caption = None
+        if caption is not None:
+            holder.caption = label(caption, 'caption', wrap=True)
+            texts.addWidget(holder.caption)
         row.addLayout(texts, 1)
         if widget is not None:
             if isinstance(widget, QWidget):
@@ -2208,6 +2216,264 @@ class Group(QFrame):
                 row.addLayout(widget)
         self.rows.addWidget(holder)
         return holder
+
+
+# Settings' words for text that comes from elsewhere (the runtime, the reranker, diagnostics): design 3.2 bans the jargon.
+PLAIN_WORDS = [(r'\s*\(llama\.cpp\)', ''), (r'llama\.cpp', 'the engine'), (r'nvidia-smi', 'the graphics driver'),
+               (r'[Tt]he picture part of the search model', 'The picture search model'), (r'(?i)picture part', 'picture search model'),
+               (r'\bGPUs\b', 'graphics cards'), (r'\bGPU\b', 'graphics card'), (r'(?i)\bembeddings\b', 'meaning vectors'),
+               (r'\bpassages\b', 'pieces of text'), (r'\bpassage\b', 'piece of text'), (r'\binference\b', 'test'),
+               (r'ALFRED_MODELS_DIR|ALFRED_LLAMA_DIR', 'a folder set up outside Alfred')]
+
+
+def plain(text):
+    """``text`` in Settings' words (see PLAIN_WORDS)."""
+    for pattern, words in PLAIN_WORDS:
+        text = re.sub(pattern, words, text or '')
+    return text
+
+
+class SectionHeader(QWidget):
+    """The heading of a Section: its name and a chevron; a click, Space or Enter opens or closes it."""
+
+    def __init__(self, section, title):
+        super().__init__()
+        self.section = section
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 10, 12, 10)
+        row.addWidget(label(title, 'name'), 1)
+        self.chevron = Chevron(section.win)
+        row.addWidget(self.chevron)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.section.set_open(not self.section.open)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            self.section.set_open(not self.section.open)
+        else:
+            super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        if not self.hasFocus():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(self.section.win.pal['accent'], 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5), 10, 10)
+
+
+class Section(QFrame):
+    """A closed section that springs open on click (Settings → Advanced): a card with its heading, and its rows below a
+    hairline. ``row`` and ``add`` are its Group's."""
+
+    def __init__(self, win, title):
+        super().__init__()
+        self.setObjectName('group')
+        self.win, self.title, self.open = win, title, False
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.header = SectionHeader(self, title)
+        outer.addWidget(self.header)
+        self.body = QWidget()
+        self.body.setMaximumHeight(0)
+        inner = QVBoxLayout(self.body)
+        inner.setContentsMargins(14, 0, 14, 0)
+        inner.setSpacing(0)
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setObjectName('hairline')
+        inner.addWidget(line)
+        self.group = Group(win)
+        self.group.card.setObjectName('plain')
+        self.group.rows.setContentsMargins(0, 2, 0, 6)
+        inner.addWidget(self.group)
+        outer.addWidget(self.body)
+        self.row, self.add = self.group.row, self.group.add
+        self.height_spring = Spring(0, 300, 0.86, self._height, precision=0.1)
+
+    def set_open(self, on, animate=True):
+        self.open = on
+        shown = self.body.height() if self.body.maximumHeight() >= QWIDGETSIZE else self.body.maximumHeight()
+        self.height_spring.snap(shown)
+        target = self.body.sizeHint().height() if on else 0
+        if animate:
+            self.header.chevron.set_open(on)
+            self.height_spring.to(target)
+        else:
+            self.header.chevron.angle.snap(90 if on else 0)
+            self.height_spring.snap(target)
+
+    def _height(self, value):
+        try:
+            settled = value == self.height_spring.target and not self.height_spring.velocity
+            # Open and at rest: no cap, so rows whose text changes later (a download's progress) are never cut.
+            self.body.setMaximumHeight(QWIDGETSIZE if self.open and settled else max(0, int(value)))
+        except RuntimeError:
+            pass
+
+
+QWIDGETSIZE = 16777215  # Qt's "no maximum"
+
+
+class PageList(QWidget):
+    """Settings' list of pages on the left: one painted row per page; the selected one has the selected-row fill of the
+    chat history and glides to a new choice. Click a row, or Up/Down while it has focus (or from the search box)."""
+    ROW, TOP, WIDTH = 34, 4, 150
+    changed = Signal(int)
+
+    def __init__(self, win, names, icons):
+        super().__init__()
+        self.win, self.names, self.icons = win, list(names), list(icons)
+        self.current, self.hover = 0, -1
+        self.setFixedWidth(self.WIDTH)
+        self.setFixedHeight(2 * self.TOP + self.ROW * len(self.names))
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.glide = Spring(self.TOP, 420, 0.86, lambda v: self.update(), precision=0.1)
+
+    def set_current(self, index):
+        index = max(0, min(len(self.names) - 1, index))
+        if index == self.current:
+            return
+        self.current = index
+        self.glide.to(self.TOP + index * self.ROW)
+        self.update()
+        self.changed.emit(index)
+
+    def move(self, delta):
+        self.set_current(self.current + delta)
+
+    def row_at(self, y):
+        index = int((y - self.TOP) // self.ROW)
+        return index if 0 <= index < len(self.names) else -1
+
+    def mouseMoveEvent(self, event):
+        index = self.row_at(event.position().y())
+        if index != self.hover:
+            self.hover = index
+            self.update()
+
+    def leaveEvent(self, event):
+        self.hover = -1
+        self.update()
+
+    def mousePressEvent(self, event):
+        index = self.row_at(event.position().y())
+        if event.button() == Qt.LeftButton and index >= 0:
+            self.setFocus()
+            self.set_current(index)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Up, Qt.Key_Down):
+            self.move(-1 if key == Qt.Key_Up else 1)
+        elif key in (Qt.Key_Home, Qt.Key_End):
+            self.set_current(0 if key == Qt.Key_Home else len(self.names) - 1)
+        else:
+            super().keyPressEvent(event)  # Tab goes on into the page; Esc reaches SettingsView
+
+    def focusInEvent(self, event):
+        self.update()
+
+    def focusOutEvent(self, event):
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
+        pal = self.win.pal
+        width = self.width()
+        p.setPen(Qt.NoPen)
+        if 0 <= self.hover < len(self.names) and self.hover != self.current:
+            p.setBrush(pal['hover'])
+            p.drawRoundedRect(QRectF(12, self.TOP + self.hover * self.ROW + 1, width - 18, self.ROW - 2), 9, 9)
+        selected = QRectF(12, self.glide.value + 1, width - 18, self.ROW - 2)
+        p.setBrush(pal['fill_strong'])
+        p.drawRoundedRect(selected, 9, 9)
+        if self.hasFocus():
+            p.setPen(QPen(pal['accent'], 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(selected.adjusted(0.5, 0.5, -0.5, -0.5), 9, 9)
+        p.setFont(self.font())
+        for index, (name, art) in enumerate(zip(self.names, self.icons)):
+            top = self.TOP + index * self.ROW
+            color = pal['text'] if index == self.current else pal['secondary']
+            p.drawPixmap(QPointF(24, top + (self.ROW - 16) / 2), icon_pixmap(art, 16, color))
+            p.setPen(color)
+            p.drawText(QRectF(50, top, width - 56, self.ROW), Qt.AlignLeft | Qt.AlignVCenter, name)
+
+
+class PageBody(QWidget):
+    """A page's rows. Its minimum height is what the rows need at the page's width (QScrollArea asks heightForWidth),
+    not at their narrowest, where every wrapped help line is tall: so a page that fits does not scroll."""
+
+    def minimumSizeHint(self):
+        return QSize(0, 0)
+
+
+class Page(QScrollArea):
+    """One page of Settings. It scrolls only when its rows do not fit, and then they fade out over the last FADE pixels
+    at the top and bottom edge instead of being cut mid-line: an opacity mask on the viewport (real transparency, so it
+    works on the see-through panel), there only while something is out of sight."""
+    FADE = 16
+
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.NoFrame)
+        holder = PageBody()
+        holder.setObjectName('clear')
+        self.body = QVBoxLayout(holder)
+        self.body.setSizeConstraint(QVBoxLayout.SetNoConstraint)
+        self.body.setContentsMargins(8, 10, 22, 14)
+        self.body.setSpacing(12)
+        self.setWidget(holder)
+        self.mask = None
+        bar = self.verticalScrollBar()
+        bar.valueChanged.connect(self.fade_edges)
+        bar.rangeChanged.connect(self.fade_edges)
+
+    def add(self, widget):
+        self.body.addWidget(widget)
+        return widget
+
+    def scrolls(self):
+        return self.verticalScrollBar().maximum() > 0
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fade_edges()
+
+    def fade_edges(self, *_):
+        bar, viewport = self.verticalScrollBar(), self.viewport()
+        top, bottom = bar.value() > bar.minimum(), bar.value() < bar.maximum()
+        if not (top or bottom):
+            if self.mask is not None:
+                viewport.setGraphicsEffect(None)  # deletes it
+                self.mask = None
+            return
+        if self.mask is None:
+            self.mask = QGraphicsOpacityEffect(viewport)
+            self.mask.setOpacity(1.0)  # 0.7 by default
+            viewport.setGraphicsEffect(self.mask)
+        height = max(1, viewport.height())
+        edge = min(0.45, self.FADE / height)
+        solid, clear = QColor(0, 0, 0, 255), QColor(0, 0, 0, 0)
+        gradient = QLinearGradient(0, 0, 0, height)
+        gradient.setColorAt(0, clear if top else solid)
+        gradient.setColorAt(edge, solid)
+        gradient.setColorAt(1 - edge, solid)
+        gradient.setColorAt(1, clear if bottom else solid)
+        self.mask.setOpacityMask(QBrush(gradient))
 
 
 def folder_icon(path, size=28):
@@ -2267,7 +2533,7 @@ class FolderRow(QWidget):
         texts = QVBoxLayout()
         texts.setSpacing(0)
         texts.addWidget(label(self.folder.name or str(self.folder), 'name'))
-        place = label(paths.shorten(self.folder, 58), 'caption')
+        place = label(paths.shorten(self.folder, 46), 'caption')
         place.setToolTip(str(self.folder))
         texts.addWidget(place)
         includes = QHBoxLayout()
@@ -2330,91 +2596,60 @@ class FolderRow(QWidget):
 
 
 class TrackedFolders(QWidget):
-    """Settings → Tracked folders: track a folder (indexed at once, then watched), quick-add chips
-    for common folders, and a disclosure that springs open to list what is tracked."""
+    """Settings → Folders: the tracked folders as an open list (each with its live status), Add folder… with quick-add
+    chips for common folders, then how the index keeps up: automatically, on battery, Rescan all and Rebuild index."""
 
     def __init__(self, win):
         super().__init__()
         self.win = win
-        self.rows, self.open = [], False
+        self.rows = []
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(5)
-        outer.addWidget(label('TRACKED FOLDERS', 'section'))
+        outer.setSpacing(12)
+        self.note = label('Alfred reads the files in these folders on this PC and keeps up as they change.', 'caption', wrap=True)
+        outer.addWidget(self.note)
         card = QFrame()
         card.setObjectName('group')
         self.card = QVBoxLayout(card)
-        self.card.setContentsMargins(14, 6, 14, 6)
+        self.card.setContentsMargins(14, 4, 14, 4)
         self.card.setSpacing(0)
         outer.addWidget(card)
-        self.note = label('Alfred reads documents, PDFs, slides, spreadsheets, and the text in images and videos — all on this PC — '
-                          'and keeps up as files are added, changed or deleted.', 'caption', wrap=True)
-        outer.addWidget(self.note)
 
+        self.list = QVBoxLayout()
+        self.list.setContentsMargins(0, 0, 0, 0)
+        self.list.setSpacing(0)
+        self.card.addLayout(self.list)
+        self.empty = label('No folders yet. Add one to start searching.', 'caption')
+        self.empty.setContentsMargins(0, 10, 0, 10)
+        self.card.addWidget(self.empty)
+
+        self.add_line = self._hairline()
+        self.card.addWidget(self.add_line)
         track = QWidget()
         row = QHBoxLayout(track)
-        row.setContentsMargins(0, 7, 0, 7)
-        texts = QVBoxLayout()
-        texts.setSpacing(0)
-        texts.addWidget(label('Track a folder'))
-        texts.addWidget(label('Indexed right away, then watched for new files', 'caption'))
-        row.addLayout(texts, 1)
-        row.addWidget(button('Track folder…', self.win.choose_folder, 'primary', 'Choose any folder to search',
-                             icon('plus', 13, QColor('white'))))
-        self.card.addWidget(track)
-
-        self.chips_line, self.chips_holder = self._hairline(), QWidget()
-        self.chips = QHBoxLayout(self.chips_holder)
-        self.chips.setContentsMargins(0, 8, 0, 8)
-        self.chips.setSpacing(7)
-        self.card.addWidget(self.chips_line)
-        self.card.addWidget(self.chips_holder)
-
-        self.disclosure_line, self.disclosure = self._hairline(), QWidget()
-        self.disclosure.setCursor(Qt.PointingHandCursor)
-        self.disclosure.mousePressEvent = lambda event: self.set_open(not self.open)
-        row = QHBoxLayout(self.disclosure)
-        row.setContentsMargins(0, 9, 0, 9)
-        self.count_label = label('')
-        row.addWidget(self.count_label, 1)
+        row.setContentsMargins(0, 8, 0, 8)
+        row.addWidget(button('Add folder…', self.win.choose_folder, 'primary', 'Choose any folder to search', icon('plus', 13, QColor('white'))))
+        row.addStretch()
         self.summary = label('', 'caption')
         self.summary.setTextFormat(Qt.RichText)
         row.addWidget(self.summary)
-        self.chevron = Chevron(win)
-        row.addWidget(self.chevron)
-        self.card.addWidget(self.disclosure_line)
-        self.card.addWidget(self.disclosure)
+        self.card.addWidget(track)
 
-        self.body = QWidget()
-        self.body.setMaximumHeight(0)
-        self.list = QVBoxLayout(self.body)
-        self.list.setContentsMargins(0, 0, 0, 0)
-        self.list.setSpacing(0)
-        self.footer = QWidget()
-        foot = QHBoxLayout(self.footer)
-        foot.setContentsMargins(40, 2, 0, 8)
-        foot.setSpacing(2)
-        foot.addWidget(button('Rescan now', lambda: self.win.start_index(), 'link', 'Check every tracked folder for changes'))
-        foot.addWidget(label('·', 'caption'))
-        foot.addWidget(button('Rebuild index', lambda: self.win.start_index(force=True), 'link', 'Read every file again from scratch'))
-        foot.addStretch()
-        self.list.addWidget(self.footer)
-        self.card.addWidget(self.body)
-        self.height = Spring(0, 300, 0.86, self._height, precision=0.1)
+        self.chips_holder = QWidget()
+        self.chips = QHBoxLayout(self.chips_holder)
+        self.chips.setContentsMargins(0, 0, 0, 9)
+        self.chips.setSpacing(7)
+        self.card.addWidget(self.chips_holder)
 
-        self.auto_line = self._hairline()
-        self.card.addWidget(self.auto_line)
-        auto = QWidget()
-        row = QHBoxLayout(auto)
-        row.setContentsMargins(0, 7, 0, 7)
-        texts = QVBoxLayout()
-        texts.setSpacing(0)
-        texts.addWidget(label('Index new files automatically'))
-        texts.addWidget(label('Alfred watches tracked folders while it runs (also from the tray)', 'caption'))
-        row.addLayout(texts, 1)
-        self.auto_index = Toggle(lambda: self.win.pal)
-        row.addWidget(self.auto_index, 0, Qt.AlignRight | Qt.AlignVCenter)
-        self.card.addWidget(auto)
+        keep = Group(win)
+        pal = lambda: self.win.pal
+        self.auto_index = Toggle(pal)
+        keep.row('Keep the index up to date automatically', self.auto_index, 'Alfred watches these folders while it runs')
+        self.index_on_battery = Toggle(pal)
+        keep.row('Also index on battery', self.index_on_battery, 'Off: on battery, automatic runs read names and text only')
+        keep.row('Rescan all', button('Rescan now', lambda: self.win.start_index(), None, 'Check every tracked folder for changes'))
+        keep.row('Rebuild index', button('Rebuild', lambda: self.win.start_index(force=True), None, 'Read every file again from scratch'))
+        outer.addWidget(keep)
 
     def _hairline(self):
         line = QFrame()
@@ -2425,23 +2660,27 @@ class TrackedFolders(QWidget):
     # ------------------------------------------------------------- content
     def load(self):
         """Rebuild rows and chips from settings (when Settings opens)."""
-        for row in self.rows:
-            row.setParent(None)
-            row.deleteLater()
+        while self.list.count():  # the rows and the hairlines between them
+            item = self.list.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+                item.widget().deleteLater()
         self.rows = []
-        for number, folder in enumerate(self.win.settings.folders):
+        for folder in self.win.settings.folders:
             self._add_row(folder, delay=None)
         self.fill_chips()
         self.refresh()
-        self._snap_height()
 
     def _add_row(self, folder, delay=0):
         row = FolderRow(self, folder)
-        self.list.insertWidget(len(self.rows), row)
+        if self.rows:
+            row.hairline = self._hairline()
+            self.list.addWidget(row.hairline)
+        self.list.addWidget(row)
         self.rows.append(row)
         if delay is not None:
             row.hide()
-            QTimer.singleShot(0 if Motion.reduced else delay, lambda r=row: (r.show(), fade_in(r), self._retarget()))
+            QTimer.singleShot(0 if Motion.reduced else delay, lambda r=row: (r.show(), fade_in(r)))
         return row
 
     def fill_chips(self):
@@ -2461,15 +2700,13 @@ class TrackedFolders(QWidget):
             self.chips.addWidget(chip)
         self.chips.addStretch()
         self.chips_holder.setVisible(bool(free))
-        self.chips_line.setVisible(bool(free))
 
     def refresh(self, state=None):
-        """Update the count, the summary and each folder's live status."""
+        """Update the summary and each folder's live status."""
         folders = self.win.settings.folders
         stats = getattr(self.win, 'folder_stats', {}) or {}
-        self.disclosure.setVisible(bool(folders))
-        self.disclosure_line.setVisible(bool(folders))
-        self.count_label.setText(f'{len(folders)} folder{"s" * (len(folders) != 1)} tracked')
+        self.empty.setVisible(not self.rows)
+        self.add_line.setVisible(bool(self.rows))
         total = sum(s.get('files', 0) for s in stats.values())
         busy_root = state.get('root') if state else None
         for row in self.rows:
@@ -2497,76 +2734,52 @@ class TrackedFolders(QWidget):
                 if info.get('older'):  # a folder tracked as "only new": how many are searchable by their content
                     text += f" · {info.get('full', 0):,} fully searchable"
                 row.set_status(text + ' · up to date' if self.win.status.get('initialized') else text, 'green' if info['files'] else 'secondary')
+        count = f'{len(folders)} folder{"s" * (len(folders) != 1)}' if folders else ''
         if self.win.indexing:
             phase = (state or {}).get('phase')
             text = (f"{phase_label(phase)} {state.get('done', 0)}/{state.get('total', 0)}"
                     if phase in ('embedding', 'names', 'reading pictures', 'embedding pictures', 'adding context') else 'Indexing…')
-            layers = layers_text(self.win.layers)
+            layers = layers_text(self.win.layers, unfinished_only=True)
             self.summary.setText(f"<span style='color:{self.win.pal['accent'].name()}'>●</span>&nbsp; {text}" + (f' · {layers}' if layers else ''))
         else:
-            text = f'{total:,} searchable file{"s" * (total != 1)}' if folders else ''
+            text = f'{count} · {total:,} searchable file{"s" * (total != 1)}' if folders else ''
             if folders and self.win.paused == 'battery':
-                text += ' · ' + BATTERY_TEXT
+                text += ' · paused on battery'
             elif folders and layers_incomplete(self.win.layers):
-                text += ' · ' + layers_text(self.win.layers)
+                text += ' · ' + layers_text(self.win.layers, unfinished_only=True)
             self.summary.setText(text)
-
-    # ------------------------------------------------------------- motion
-    def set_open(self, on):
-        self.open = on
-        self.chevron.set_open(on)
-        self.height.snap(self.body.maximumHeight())
-        self.height.to(self.body.sizeHint().height() if on else 0)
-        if on:
-            for number, row in enumerate(self.rows):
-                row.hide()
-                QTimer.singleShot(0 if Motion.reduced else 40 + 45 * number, lambda r=row: (r.show(), fade_in(r), self._retarget()))
-
-    def _retarget(self):
-        if self.open:
-            self.height.to(self.body.sizeHint().height())
-
-    def _snap_height(self):
-        self.chevron.angle.snap(90 if self.open else 0)
-        self.height.snap(self.body.sizeHint().height() if self.open else 0)
-
-    def _height(self, value):
-        try:
-            self.body.setMaximumHeight(max(0, int(value)))
-        except RuntimeError:
-            pass
 
     # ------------------------------------------------------------- actions
     def added(self, folder):
-        """A folder was just tracked: open the list and slide its row in."""
+        """A folder was just tracked: slide its row in."""
         self.fill_chips()
-        if not self.open:
-            self.open = True
-            self.chevron.set_open(True)
         self._add_row(folder, delay=60)
         self.refresh()
-        self.height.snap(self.body.maximumHeight())
-        self._retarget()
 
     def untrack(self, row):
         def gone():
             if row in self.rows:
+                index = self.rows.index(row)
                 self.rows.remove(row)
+                line = getattr(row, 'hairline', None)
+                if line is None and self.rows and index == 0:  # the first row went: the next one loses its line
+                    line = getattr(self.rows[0], 'hairline', None)
+                    self.rows[0].hairline = None
+                if line is not None:
+                    line.setParent(None)
+                    line.deleteLater()
             row.setParent(None)
             row.deleteLater()
             self.fill_chips()
             self.refresh()
-            self._retarget()
-            if not self.rows:
-                self.set_open(False)
         self.win.untrack_folder(row.folder)
         row.fade_out(gone)
 
 
 # Settings rows for the files Alfred runs locally: key -> (row title, name in a sentence, caption).
 DOWNLOAD_ROWS = {'embed-text': ('Search model', 'the search model', 'EmbeddingGemma 2: search by meaning'),
-                 'embed-pictures': ('Picture part', 'the picture part', 'EmbeddingGemma 2: find pictures by what they show'),
-                 models.ENGINE: ('Engine', 'the engine', 'llama.cpp: runs the models on this PC'),
+                 'embed-pictures': ('Picture search model', 'the picture search model', 'EmbeddingGemma 2: find pictures by what they show'),
+                 models.ENGINE: ('Engine', 'the engine', 'Runs the models on this PC'),
                  'answer': ('Answer model', 'the answer model', 'gemma3:4b: answers on this PC')}
 
 
@@ -2624,208 +2837,242 @@ class ModelDownloads(QObject):
         return f'Downloading {what}… {done / 1e6:,.0f} of {total / 1e6:,.0f} MB'
 
 
+SETTINGS_PAGES = ('General', 'Folders', 'Search', 'Ask Alfred', 'AI tools', 'Advanced')
+PAGE_ICONS = ('gear', 'folder', 'search', 'sparkle', 'server', 'graph')
+MEANING_FILES = (models.ENGINE, 'embed-text')  # what search by meaning needs (the Search page's Download button)
+CALLS_SHOWN = 6  # recent AI-tool requests shown before "Show more"
+
+
+def call_text(call):
+    """One logged AI-tool request in plain words: '2026-01-01 10:00 · Claude Code searched for “tides” · 2 files'."""
+    client, outcome = call.get('client') or 'A tool', call.get('outcome')
+    if call.get('tool') == 'search_files':
+        what = f"searched for “{call.get('query') or ''}”"
+    elif call.get('tool') == 'read_passage':
+        what = f"read {Path(call.get('path') or '').name or 'a file'}"
+    else:
+        what = f"asked for {call.get('tool') or 'something'}"
+    count = call.get('count', 0)
+    result = {'denied': 'not allowed', 'error': 'failed'}.get(outcome, f"{count} file{'s' * (count != 1)}")
+    return f"{str(call.get('time', ''))[:16]} · {client} {what} · {result}"
+
+
 class SettingsView(QWidget):
+    """Settings: a list of six pages on the left and one page of rows on the right (design 3.1). It opens on General and
+    keeps the last page while Alfred runs (show_page). Every change saves itself after a short pause (save)."""
+
     def __init__(self, win):
         super().__init__()
         self.win = win
-        layout = QVBoxLayout(self)
+        layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        holder = QWidget()
-        holder.setObjectName('clear')
-        body = QVBoxLayout(holder)
-        body.setContentsMargins(26, 14, 26, 18)
-        body.setSpacing(16)
-        scroll.setWidget(holder)
-        layout.addWidget(scroll)
+        layout.setSpacing(0)
+        self.pages_list = PageList(win, SETTINGS_PAGES, PAGE_ICONS)
+        column = QVBoxLayout()
+        column.setContentsMargins(0, 8, 0, 0)
+        column.addWidget(self.pages_list)
+        column.addStretch()
+        layout.addLayout(column)
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack, 1)
+        self.pages, self.sections = {}, {}
+        self.pages_list.changed.connect(self.stack.setCurrentIndex)
+        self.file_status, self.file_button, self.file_states = {}, {}, {}
+        self.account_status, self.account_dot, self.account_button = {}, {}, {}
+        self.rerank_job, self.calls_limit = None, CALLS_SHOWN
         pal = lambda: self.win.pal
 
-        self.tracked = TrackedFolders(win)
-        self.auto_index = self.tracked.auto_index
-        body.addWidget(self.tracked)
-        self.index_info = label('', 'caption', wrap=True, selectable=True)
-        body.addWidget(self.index_info)
+        # ---------------------------------------------------------- General
+        page = self.page('General')
+        g = page.add(Group(win))
+        self.theme = QComboBox()
+        self.theme.addItems(['Automatic', 'Dark', 'Light'])
+        self.theme.setMinimumWidth(150)
+        g.row('Theme', self.theme, 'Automatic follows what is behind the panel, or Windows')
+        self.see_through = Toggle(pal)
+        g.row('See-through panel', self.see_through, 'Off: an opaque panel that needs no screen capture')
+        self.reduce_motion = Toggle(pal)
+        g.row('Reduce motion', self.reduce_motion, 'Also follows the Windows animation setting')
+        self.start_login = Toggle(pal)
+        self.start_login.toggled.connect(self.change_start_login)
+        g.row('Start Alfred when you sign in', self.start_login, 'Starts hidden in the tray, so the shortcut works at once')
+        self.hotkey_edit = QKeySequenceEdit()
+        self.hotkey_edit.setMaximumSequenceLength(1)
+        self.hotkey_edit.setFixedWidth(150)
+        self.hotkey_edit.setToolTip('Click the box and press a combination with Ctrl, Alt, Shift or Win')
+        self.hotkey_edit.editingFinished.connect(self.change_hotkey)
+        hotkey_row = QHBoxLayout()
+        hotkey_row.addWidget(self.hotkey_edit)
+        hotkey_row.addWidget(button('Reset', lambda: self.change_hotkey(DEFAULT_HOTKEY), None, f'Back to {DEFAULT_HOTKEY}'))
+        self.hotkey_label = g.row('Shortcut', hotkey_row, '', 'Shows and hides Alfred from anywhere').caption
+        g.row('Run setup again', button('Start', lambda: self.win.run_setup(), None, 'Choose folders, search by meaning and the shortcut'),
+              'Folders, search by meaning and the shortcut, step by step')
+        about = page.add(label(f'{APP_NAME} {__version__} · settings in {paths.shorten(self.win.settings.path, 60)}', 'caption', selectable=True))
+        about.setToolTip(str(self.win.settings.path))
 
-        g = Group(win, 'AI MODEL', 'Indexing, OCR and search always run on this PC. Only the chat model can be in the cloud.')
+        # ---------------------------------------------------------- Folders
+        page = self.page('Folders')
+        self.tracked = page.add(TrackedFolders(win))
+        self.auto_index, self.index_on_battery = self.tracked.auto_index, self.tracked.index_on_battery
+
+        # ----------------------------------------------------------- Search
+        page = self.page('Search')
+        page.add(label('Search by name and by the text inside your files always works, on this PC.', 'caption', wrap=True))
+        g = page.add(Group(win))
+        self.embed_enabled = Toggle(pal)
+        self.meaning_button = button('Download…', self.meaning_action)
+        self.meaning_button.hide()
+        line = QHBoxLayout()
+        line.setSpacing(10)
+        line.addWidget(self.meaning_button)
+        line.addWidget(self.embed_enabled)
+        self.meaning_row = g.row('Search by meaning', line, 'Checking…', 'Finds files by what they are about, not only the words in them')
+        self.ocr_enabled = Toggle(pal)
+        g.row('Read text in pictures and videos', self.ocr_enabled, 'Photos, screenshots, scanned pages and video frames')
+        self.picture_search = Toggle(pal)
+        self.picture_row = g.row('Find pictures by what they show', self.picture_search, '')
+        self.embed_enabled.toggled.connect(lambda _: self.show_pictures())
+
+        # ------------------------------------------------------- Ask Alfred
+        page = self.page('Ask Alfred')
+        g = page.add(Group(win))
         self.model = picker.ModelButton(win, compact=False)
-        self.model.setMinimumWidth(300)
+        self.model.setMinimumWidth(240)
         self.model.clicked.connect(lambda: self.win.ask_view.show_model_menu(self.model))
         chat_row = QHBoxLayout()
         chat_row.addWidget(self.model)
-        chat_row.addWidget(button('', self.refresh_models, None, 'Check accounts and refresh the model list', icon('refresh', 14, QColor(140, 140, 150))))
-        g.row('Chat model', chat_row, 'Also in the model button at the top of Ask Alfred')
+        chat_row.addWidget(button('', self.refresh_models, 'ghost', 'Check the accounts and refresh the list of models',
+                                  icon('refresh', 14, QColor(140, 140, 150))))
+        self.location = g.row('Answer model', chat_row, '', 'Also in the model button at the top of Ask Alfred').caption
         self.effort = QComboBox()
-        self.effort.setMinimumWidth(300)
-        self.effort_note = label('', 'caption', wrap=True)
-        self.effort_row = g.row('Thinking', self.effort)
-        self.location = label('', 'caption', wrap=True)
-        g.outer.addWidget(self.location)
-        g.outer.addWidget(self.effort_note)
-        body.addWidget(g)
-
-        g = Group(win, 'ANSWERS FROM YOUR FILES', 'Alfred finds passages by keyword and by meaning, ranks them, and the chat model answers '
-                                                 'from them, citing each one. Passages are treated as data, never as instructions.')
+        self.effort.setMinimumWidth(240)
+        self.effort_row = g.row('Thinking', self.effort, 'How long the model thinks before it answers')
+        g = page.add(Group(win))
+        for kind, title, plan, action in (('claude_code', 'Claude', 'Your Pro or Max plan', 'Sign in…'),
+                                          ('codex', 'ChatGPT', 'Your Plus or Pro plan', 'Sign in…')):
+            g.add(self.account_row(kind, title, plan, action))
+        other = QHBoxLayout()
+        other.setContentsMargins(30, 0, 0, 4)
+        other.addWidget(button('Use an API key or another server instead…', lambda: self.show_page('Advanced', 'API keys'), 'link'))
+        other.addStretch()
+        g.rows.addLayout(other)
+        g = page.add(Group(win))
         self.beyond = Toggle(pal)
-        g.row('Allow answers beyond your files', self.beyond,
-              'The model may add general knowledge after what your files say — marked “General knowledge” and never cited')
+        g.row('Allow answers beyond your files', self.beyond, 'General knowledge is marked as such and never cited')
+        self.save_chats = Toggle(pal)
+        g.row('Save chat history', self.save_chats, 'Off: new chats are not saved; saved ones stay', 'Reopen saved chats from the history panel (Ctrl+H)')
+        place = QHBoxLayout()
+        place.addWidget(button('Open folder', self.open_chats_folder))
+        place.addWidget(button('Change…', self.change_chats_folder, None, 'The chats folder is never added to search'))
+        self.chats_place = g.row('Saved in', place, '').caption
+        self.delete_chats = button('Delete all chats…', self.delete_all_chats, None, 'Permanently deletes every saved chat (asks first)')
+        self.delete_chats_note = g.row('Delete saved chats', self.delete_chats, 'Permanently, after asking first').caption
+
+        # --------------------------------------------------------- AI tools
+        page = self.page('AI tools')
+        page.add(label('Claude Code, Codex and similar tools can search your tracked folders through Alfred: read-only, on this PC. '
+                       'Each tool asks once before it may.', 'caption', wrap=True))
+        g = page.add(Group(win))
+        self.mcp_command = g.row('Add Alfred to a tool', button('Copy', self.copy_mcp_command, None, 'Copy the command'), '',
+                                 'Run it in a terminal (for Claude Code); other tools take the same program and arguments').caption
+        self.mcp_command.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        page.add(label('Connected tools', 'section'))
+        g = page.add(Group(win))
+        self.mcp_clients = QVBoxLayout()
+        self.mcp_clients.setContentsMargins(0, 4, 0, 4)
+        holder = QWidget()
+        holder.setLayout(self.mcp_clients)
+        g.add(holder)
+        page.add(label('Recent requests', 'section'))
+        g = page.add(Group(win))
+        calls = QWidget()
+        lines = QVBoxLayout(calls)
+        lines.setContentsMargins(0, 8, 0, 8)
+        lines.setSpacing(4)
+        self.mcp_calls = label('', 'caption', wrap=True, selectable=True)
+        lines.addWidget(self.mcp_calls)
+        self.more_calls = button('Show more', self.toggle_calls, 'link')
+        lines.addWidget(self.more_calls, 0, Qt.AlignLeft)
+        g.add(calls)
+
+        # --------------------------------------------------------- Advanced
+        page = self.page('Advanced')
+        s = self.section(page, 'Performance')
+        self.device = QComboBox()
+        self.device.addItems(['Auto (graphics card when available)', 'CPU only'])
+        self.device.setMinimumWidth(250)
+        s.row('Answer model device', self.device)
+        self.embed_device = QComboBox()
+        self.embed_device.addItems(['Auto (graphics card when available)', 'CPU only'])
+        self.embed_device.setMinimumWidth(250)
+        s.row('Indexing device', self.embed_device, None, 'Where search by meaning reads your files while indexing')
+        self.search_on_gpu = Toggle(pal)
+        s.row('Search on the graphics card', self.search_on_gpu, 'Off: searches run on the CPU and need no graphics memory')
+        self.keep_minutes = QComboBox()
+        for minutes in KEEP_LOADED:
+            self.keep_minutes.addItem(duration_text(minutes), minutes)
+        s.row('Keep models loaded', self.keep_minutes, 'After the last use; then their memory is freed')
+        self.gpu_check = s.row('Graphics card check', button('Check again', self.check_gpu_again, None,
+                                                             'Forget the last result; the next indexing run on the graphics card checks it again'),
+                               'Not checked yet.', 'Once per driver: the graphics card must compute the same results as the CPU').caption
+
+        s = self.section(page, 'Model files')
+        for key, (title, _, caption) in DOWNLOAD_ROWS.items():
+            self.file_button[key] = button('Download…', lambda _=False, k=key: self.file_action(k))
+            self.file_button[key].hide()
+            self.file_status[key] = s.row(title, self.file_button[key], 'Checking…', caption).caption
+        win.downloads.changed.connect(self.show_file)
+        win.downloads.finished.connect(self.file_finished)
+
+        s = self.section(page, 'Answer quality')
         self.rerank_model = QComboBox()
         for name, info in rerank.MODELS.items():
-            self.rerank_model.addItem(f"{info['label']} · {info['languages']} · {info['size_mb']} MB", name)
-        self.rerank_model.setMinimumWidth(300)
+            self.rerank_model.addItem(f"{info['label']} · {info['languages']}", name)
+            self.rerank_model.setItemData(self.rerank_model.count() - 1, f"{info['size_mb']} MB", Qt.ToolTipRole)
+        self.rerank_model.setMinimumWidth(200)
+        self.rerank_model.setMaximumWidth(250)
         self.rerank_button = button('Download…', self.rerank_action)
-        self.rerank_gpu_button = button('GPU version…', self.rerank_gpu_action)
-        self.rerank_gpu_button.setToolTip('A half-precision copy of the model that your graphics card runs several times faster')
+        self.rerank_gpu_button = button('Faster copy…', self.rerank_gpu_action)
         self.rerank_gpu_button.hide()
         rr = QHBoxLayout()
         rr.addWidget(self.rerank_model)
         rr.addWidget(self.rerank_button)
         rr.addWidget(self.rerank_gpu_button)
-        g.row('Reranker', rr, 'Reads your question together with each candidate passage and keeps the most relevant. Runs on this PC.')
+        self.rerank_status = s.row('Reranker', rr, '', 'Reads your question together with each result and keeps the most relevant. '
+                                                       'Runs on this PC.').caption
         self.rerank_enabled = Toggle(pal)
-        g.row('Rerank passages', self.rerank_enabled, 'When off (or not downloaded), passages keep the keyword + meaning order')
-        self.rerank_status = label('', 'caption', wrap=True)
-        g.outer.addWidget(self.rerank_status)
-        self.rerank_job = None
-        body.addWidget(g)
+        s.row('Re-order results with the reranker', self.rerank_enabled, 'Off or not downloaded: keyword and meaning order')
+        self.video_interval = NumberBox()
+        self.video_interval.setRange(2, 120)
+        self.video_interval.setSuffix(' s')
+        s.row('Video: one frame every', self.video_interval, 'Frames that look the same are read once; at most 120 per video')
 
-        g = Group(win, 'ACCOUNTS', 'Use Claude or ChatGPT with your subscription (through their official command-line tools, which you sign in to '
-                                   'yourself) or with an API key. Keys are kept in Windows Credential Manager, never in Alfred’s files.')
-        self.account_status, self.account_dot, self.account_button = {}, {}, {}
-        rows = [('claude_code', 'Claude', 'Your Pro or Max plan', 'Sign in…'), ('codex', 'ChatGPT', 'Your Plus or Pro plan', 'Sign in…'),
-                ('anthropic', 'Claude API', 'Pay as you go with an API key', 'Add key…'),
-                ('openai', 'OpenAI API', 'Pay as you go with an API key', 'Add key…')]
-        for kind, title, plan, action in rows:
-            g.add(self.account_row(kind, title, plan, action))
-        g.add(self.account_row('compatible', 'Custom server', 'Any OpenAI-compatible API: OpenRouter, Groq, LM Studio, llama.cpp…', 'Key…'))
+        s = self.section(page, 'API keys')
+        for kind, title, plan, action in (('anthropic', 'Claude API', 'Pay as you go with an API key', 'Add key…'),
+                                          ('openai', 'OpenAI API', 'Pay as you go with an API key', 'Add key…'),
+                                          ('compatible', 'Custom server', 'Any OpenAI-compatible server: OpenRouter, Groq, LM Studio…', 'Key…')):
+            s.add(self.account_row(kind, title, plan, action))
         self.compatible_url = QLineEdit()
         self.compatible_url.setPlaceholderText('Server address, e.g. https://openrouter.ai/api/v1 or http://localhost:1234/v1')
         holder = QWidget()
         line = QHBoxLayout(holder)
-        line.setContentsMargins(36, 0, 0, 9)
+        line.setContentsMargins(36, 0, 0, 6)
         line.addWidget(self.compatible_url)
-        g.rows.addWidget(holder)
-        body.addWidget(g)
+        s.group.rows.addWidget(holder)
+        s.header.setToolTip('Keys are kept in Windows Credential Manager, never in Alfred’s files')
 
-        g = Group(win, 'ON THIS PC', 'Alfred runs its local models itself (llama.cpp): the answer model when you choose it, plus the '
-                                     'search model (which also reads pictures). Nothing runs until it is needed.')
-        self.file_status, self.file_button, self.file_states = {}, {}, {}
-        for key, (title, _, caption) in DOWNLOAD_ROWS.items():
-            self.file_status[key] = label('Checking…', 'caption')
-            self.file_button[key] = button('Download…', lambda _=False, k=key: self.file_action(k))
-            self.file_button[key].hide()
-            line = QHBoxLayout()
-            line.addWidget(self.file_status[key])
-            line.addWidget(self.file_button[key])
-            g.row(title, line, caption)
-        win.downloads.changed.connect(self.show_file)
-        win.downloads.finished.connect(self.file_finished)
-        self.device = QComboBox()
-        self.device.addItems(['Auto (GPU when available)', 'CPU only'])
-        self.device.setMinimumWidth(260)
-        g.row('Answer model device', self.device)
-        self.keep_minutes = QComboBox()
-        for minutes in KEEP_LOADED:
-            self.keep_minutes.addItem(duration_text(minutes), minutes)
-        g.row('Keep models loaded', self.keep_minutes, 'After the last use; then the model is unloaded and its memory is freed')
-        self.gpu_check = label('Not checked yet.', 'caption', wrap=True)
-        gpu_row = QHBoxLayout()
-        gpu_row.addWidget(self.gpu_check, 1)
-        gpu_row.addWidget(button('Check again', self.check_gpu_again, None,
-                                 'Forget the last result; the next indexing run on the graphics card checks it again'))
-        g.row('Graphics card check', gpu_row, 'Once per driver: the graphics card must compute the same vectors as the CPU')
-        body.addWidget(g)
-
-        g = Group(win, 'CHATS', 'Chats are saved as files on this PC, so you can reopen them from the history panel (Ctrl+H) in Ask Alfred. '
-                               'The chats folder is never added to search.')
-        self.save_chats = Toggle(pal)
-        g.row('Save chat history', self.save_chats, 'When off, new chats aren’t saved; chats already saved stay until you delete them')
-        place = QHBoxLayout()
-        self.chats_place = label('', 'caption')
-        place.addWidget(self.chats_place)
-        place.addWidget(button('Open folder', self.open_chats_folder))
-        place.addWidget(button('Change…', self.change_chats_folder))
-        g.row('Saved in', place)
-        self.delete_chats = button('Delete all chats…', self.delete_all_chats, None, 'Permanently deletes every saved chat (asks first)')
-        g.row('Saved chats', self.delete_chats)
-        body.addWidget(g)
-
-        g = Group(win, 'SEARCH BY MEANING', 'EmbeddingGemma 2 runs on this PC and finds passages by meaning, not just matching words. '
-                                         'Keyword search always works, even while the search model is not running.')
-        self.embed_enabled = Toggle(pal)
-        self.embed_device = QComboBox()
-        self.embed_device.addItems(['Auto (GPU when available)', 'CPU only'])
-        self.embed_device.setMinimumWidth(300)
-        self.search_on_gpu = Toggle(pal)
-        g.row('Use embeddings', self.embed_enabled)
-        g.row('Indexing device', self.embed_device)
-        g.row('Search on the graphics card', self.search_on_gpu,
-              'Off: searches run on the CPU (about 20 ms each), so search needs no graphics memory')
-        body.addWidget(g)
-
-        g = Group(win, 'IMAGES & VIDEOS', 'A local OCR model (RapidOCR) reads the text in photos, screenshots, scanned PDF pages and video frames, '
-                                          'on this PC.')
-        self.ocr_enabled = Toggle(pal)
-        g.row('Read text in images and videos', self.ocr_enabled)
-        self.video_interval = NumberBox()
-        self.video_interval.setRange(2, 120)
-        self.video_interval.setSuffix(' s')
-        g.row('Video: one frame every', self.video_interval,
-              'Frames that look the same (a still slide) are read once. Long videos are capped at 120 frames.')
-        body.addWidget(g)
-
-        g = Group(win, 'OTHER AI TOOLS', 'Claude Code, Codex and similar tools can search your tracked folders through Alfred and read passages '
-                                         'from them (read-only, this PC only). Each tool is asked once before it may. Every call is listed here.')
-        self.mcp_command = label('', 'caption', wrap=True, selectable=True)
-        command = QVBoxLayout()
-        command.addWidget(button('Copy', self.copy_mcp_command))
-        g.row('Add Alfred to a tool', command, 'Run this in a terminal (for Claude Code); other tools take the same program and arguments')
-        g.outer.addWidget(self.mcp_command)
-        self.mcp_clients = QVBoxLayout()
-        holder = QWidget()
-        holder.setLayout(self.mcp_clients)
-        g.add(holder)
-        self.mcp_calls = label('', 'caption', wrap=True, selectable=True)
-        g.add(self.mcp_calls)
-        body.addWidget(g)
-
-        g = Group(win, 'DIAGNOSTICS', 'A detected GPU is not the same as an accelerated model. Device facts come from nvidia-smi and from the servers Alfred started — nothing is inferred.')
+        s = self.section(page, 'Diagnostics')
         row = QHBoxLayout()
         row.addWidget(button('Check status', lambda: self.diagnose(False)))
-        row.addWidget(button('Run test inference', lambda: self.diagnose(True), 'primary'))
-        g.row('GPU & models', row)
-        self.diag = label('Not checked yet.', 'caption', wrap=True, selectable=True)
+        row.addWidget(button('Run test', lambda: self.diagnose(True), 'primary', 'Loads the models and answers one test question'))
+        self.diag = s.row('Graphics card and models', row, 'Not checked yet.').caption
         self.diag.setTextFormat(Qt.MarkdownText)
-        g.outer.addWidget(self.diag)
-        body.addWidget(g)
-
-        g = Group(win, 'APPEARANCE')
-        self.theme = QComboBox()
-        self.theme.addItems(['Automatic', 'Dark', 'Light'])
-        g.row('Theme', self.theme, 'Automatic follows what is behind the panel (Windows’ setting when the panel is opaque)')
-        self.see_through = Toggle(pal)
-        g.row('See-through panel', self.see_through, 'Shows what is behind Alfred; off, the panel is opaque and uses no capture')
-        self.reduce_motion = Toggle(pal)
-        g.row('Reduce motion', self.reduce_motion, 'Also follows Windows “Animation effects”')
-        self.start_login = Toggle(pal)
-        self.start_login.toggled.connect(self.change_start_login)
-        g.row('Start Alfred when you sign in', self.start_login,
-              'Starts hidden in the tray, so the shortcut works right away; models load only when first needed')
-        self.hotkey_edit = QKeySequenceEdit()
-        self.hotkey_edit.setMaximumSequenceLength(1)
-        self.hotkey_edit.setFixedWidth(170)
-        self.hotkey_edit.editingFinished.connect(self.change_hotkey)
-        self.hotkey_label = label('', 'caption')
-        hotkey_row = QHBoxLayout()
-        hotkey_row.addWidget(self.hotkey_edit)
-        hotkey_row.addWidget(button('Reset', lambda: self.change_hotkey(DEFAULT_HOTKEY)))
-        g.row('Show / hide Alfred', hotkey_row, 'Click the box and press a combination with Ctrl, Alt, Shift or Win')
-        g.outer.addWidget(self.hotkey_label)
-        g.row('First-run setup', button('Run setup again', lambda: self.win.run_setup(), None, 'Choose folders, search by meaning and the shortcut'))
-        body.addWidget(g)
-        body.addWidget(label(f'{APP_NAME} {__version__} ·{self.win.settings.path}', 'caption', wrap=True))
-        body.addStretch()
+        self.diag.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.index_info = label('', 'caption', wrap=True, selectable=True)
+        self.index_info.setContentsMargins(0, 6, 0, 6)
+        s.add(self.index_info)
+        for page in self.pages.values():
+            page.body.addStretch()
 
         self.save_timer = QTimer(self, singleShot=True, timeout=self.save)
         self.compatible_url.textEdited.connect(lambda _: self.save_timer.start(600))
@@ -2834,11 +3081,58 @@ class SettingsView(QWidget):
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
         self.keep_minutes.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
         for toggle in (self.embed_enabled, self.ocr_enabled, self.reduce_motion, self.auto_index, self.search_on_gpu, self.save_chats,
-                       self.beyond, self.rerank_enabled, self.see_through):
+                       self.beyond, self.rerank_enabled, self.see_through, self.index_on_battery, self.picture_search):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
         self.rerank_model.currentIndexChanged.connect(lambda _: (self.save_timer.start(250), self.show_rerank()))
         self.loading = False
         guard_wheel(self)
+
+    # ------------------------------------------------------------ pages
+    def page(self, name):
+        page = Page(name)
+        self.pages[name] = page
+        self.stack.addWidget(page)
+        return page
+
+    def section(self, page, title):
+        section = page.add(Section(self.win, title))
+        self.sections[title] = section
+        return section
+
+    def current_page(self):
+        return SETTINGS_PAGES[self.pages_list.current]
+
+    def show_page(self, name, section=None):
+        """Show page ``name`` (one of SETTINGS_PAGES); ``section``: also open that section of it and scroll to it."""
+        self.pages_list.set_current(SETTINGS_PAGES.index(name))
+        if section:
+            target = self.sections[section]
+            target.set_open(True, animate=False)
+            page = self.pages[name]
+            QTimer.singleShot(0, lambda: page.ensureWidgetVisible(target, 0, 0))
+
+    def enter_page(self):
+        """Tab from the search box: the first control of the page that is showing gets the focus."""
+        page = self.stack.currentWidget()
+        widget = self.pages_list.nextInFocusChain()
+        while widget is not None and widget is not self.pages_list:
+            if (page.isAncestorOf(widget) and widget.isVisibleTo(page) and widget.isEnabled() and widget.focusPolicy() & Qt.TabFocus):
+                widget.setFocus(Qt.TabFocusReason)
+                page.ensureWidgetVisible(widget)
+                return True
+            widget = widget.nextInFocusChain()
+        self.pages_list.setFocus(Qt.TabFocusReason)
+        return False
+
+    def keyPressEvent(self, event):
+        """Keys that reach Settings from the page list or a control on a page (the search box has its own)."""
+        key, ctrl = event.key(), bool(event.modifiers() & Qt.ControlModifier)
+        if key == Qt.Key_Escape:
+            self.win.set_mode(SEARCH)
+        elif ctrl and Qt.Key_1 <= key <= Qt.Key_3:
+            self.win.set_mode(key - Qt.Key_1)
+        else:
+            super().keyPressEvent(event)
 
     def activated(self):
         self.loading = True
@@ -2851,12 +3145,14 @@ class SettingsView(QWidget):
         self.embed_device.setCurrentIndex(1 if s.get('embed_device') == 'cpu' else 0)
         self.search_on_gpu.setChecked(bool(s.get('search_on_gpu')))
         self.ocr_enabled.setChecked(bool(s.get('ocr_enabled', True)))
+        self.picture_search.setChecked(bool(s.get('picture_search', True)))
         self.video_interval.setValue(int(s.get('video_interval') or 10))
         self.save_chats.setChecked(bool(s.get('save_chat_history', True)))
         self.theme.setCurrentIndex({'system': 0, 'dark': 1, 'light': 2}.get(s.get('theme'), 0))
         self.reduce_motion.setChecked(bool(s.get('reduce_motion')))
         self.see_through.setChecked(bool(s.get('see_through', True)))
         self.auto_index.setChecked(bool(s.get('auto_index', True)))
+        self.index_on_battery.setChecked(bool(s.get('index_on_battery', False)))
         self.show_keep_loaded(ai.keep_alive_minutes(s))
         self.beyond.setChecked(bool(s.get('answer_beyond_files', False)))
         self.rerank_enabled.setChecked(bool(s.get('rerank_enabled', False)))
@@ -2864,6 +3160,7 @@ class SettingsView(QWidget):
         for widget in self.findChildren(QWidget):
             widget.blockSignals(False)
         self.show_rerank()
+        self.show_pictures()
         self.load_files()
         self.load_models()
         self.load_effort()
@@ -2876,11 +3173,73 @@ class SettingsView(QWidget):
         self.show_gpu_check()
         self.loading = False
 
+    def show_meaning(self):
+        """The Search page's "Search by meaning" row: what it needs and its download, in the row itself."""
+        downloads, caption = self.win.downloads, self.meaning_row.caption
+        running = [key for key in MEANING_FILES if downloads.running(key)]
+        if running:
+            done = sum(downloads.progress.get(key, (0, 0))[0] for key in running)
+            total = sum(downloads.progress.get(key, (0, models.size_of(key)))[1] for key in running)
+            caption.setText(f'Downloading the search model… {done / 1e6:,.0f} of {total / 1e6:,.0f} MB')
+            self.meaning_button.setText('Cancel')
+            self.meaning_button.show()
+            return
+        states = [self.file_states.get(key) for key in MEANING_FILES]
+        if any(state is None for state in states):
+            caption.setText('Checking…')
+            self.meaning_button.hide()
+            return
+        missing = [state for state in states if state['where'] == 'missing']
+        if not missing:
+            caption.setText('Finds files by what they are about · ready on this PC')
+            self.meaning_button.hide()
+            return
+        left = sum(state['size'] - state['part'] for state in missing)
+        offered = all(state['downloadable'] for state in missing)
+        caption.setText(f'Needs the search model ({left / 1e6:,.0f} MB, once) · not downloaded yet' if offered else
+                        'Needs the search model, which this copy of Alfred cannot download')
+        self.meaning_button.setText('Download…')
+        self.meaning_button.setVisible(offered)
+
+    def meaning_action(self):
+        downloads = self.win.downloads
+        running = [key for key in MEANING_FILES if downloads.running(key)]
+        if running:
+            for key in running:
+                downloads.cancel(key)
+            return
+        missing = [key for key in MEANING_FILES if (self.file_states.get(key) or {}).get('where') == 'missing'
+                   and self.file_states[key]['downloadable']]
+        if not missing:
+            return
+        left = sum(self.file_states[key]['size'] - self.file_states[key]['part'] for key in missing)
+        home = self.win.settings.home
+        answer = ask_box(self, 'Download the search model?',
+                         f'Download what search by meaning needs: {left / 1e6:,.0f} MB, once. Free space on this drive: '
+                         f'{models.free_space(home) / 1e9:,.1f} GB. It comes from github.com and is checked against its SHA-256 '
+                         'before Alfred uses it.', QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+        if answer == QMessageBox.Ok:
+            for key in missing:
+                downloads.start(key)
+
+    def show_pictures(self):
+        """"Find pictures by what they show" needs search by meaning (and the picture search model): its help line says so."""
+        on = self.embed_enabled.isChecked()
+        self.picture_search.setEnabled(on)
+        state = self.file_states.get('embed-pictures')
+        if not on:
+            text = 'Turn on search by meaning first'
+        elif state is not None and state['where'] == 'missing':
+            text = f"Needs the picture search model ({state['size'] / 1e6:,.0f} MB) · Advanced → Model files"
+        else:
+            text = 'Find a photo by describing it, like “dog on a beach”'
+        self.picture_row.caption.setText(text)
+
     def show_gpu_check(self):
         """The graphics card check's verdict or reason (asking llama-server for devices takes a moment: in the background)."""
         settings = self.win.settings
-        run_job(lambda s: ai.runtime.gpu_summary(settings), lambda text: self.gpu_check.setText(text),
-                lambda error: self.gpu_check.setText(f'Unknown ({error})'))
+        run_job(lambda s: ai.runtime.gpu_summary(settings), lambda text: self.gpu_check.setText(plain(text)),
+                lambda error: self.gpu_check.setText(plain(f'Unknown ({error})')))
 
     def check_gpu_again(self):
         ai.runtime.clear_gpu_verdict(self.win.settings.home)
@@ -2920,13 +3279,14 @@ class SettingsView(QWidget):
             row.addWidget(button('Remove', lambda _=False, n=name: (mcp_server.remove_client(home, n), self.show_other_tools()),
                                  None, 'Forget this tool; it is asked again next time'))
             self.mcp_clients.addWidget(line)
-        lines = []
-        for call in mcp_server.recent_calls(home, 50):
-            what = call.get('query') or call.get('path') or ''
-            outcome = '' if call.get('outcome') == 'ok' else f" · {call.get('outcome')}"
-            lines.append(f"{call.get('time', '')} · {call.get('client', '')} · {call.get('tool', '')} · {what} · "
-                         f"{call.get('count', 0)} files{outcome}")
-        self.mcp_calls.setText('\n'.join(lines) if lines else 'No calls yet.')
+        lines = [call_text(call) for call in mcp_server.recent_calls(home, 50)]
+        self.mcp_calls.setText('\n'.join(lines[:self.calls_limit]) if lines else 'No requests yet.')
+        self.more_calls.setVisible(len(lines) > CALLS_SHOWN)
+        self.more_calls.setText('Show fewer' if self.calls_limit > CALLS_SHOWN else f'Show more ({len(lines) - CALLS_SHOWN})')
+
+    def toggle_calls(self):
+        self.calls_limit = CALLS_SHOWN if self.calls_limit > CALLS_SHOWN else 50
+        self.show_other_tools()
 
     def show_keep_loaded(self, minutes):
         """Select ``minutes`` in the Keep models loaded list (a value saved by hand that isn't listed is added to it)."""
@@ -2940,14 +3300,17 @@ class SettingsView(QWidget):
         if self.rerank_job is not None:
             return
         state = rerank.state(dict(self.win.settings, rerank_model=self.rerank_model.currentData()))
-        self.rerank_button.setText('Remove' if state['installed'] else f"Download ({state['size_mb']} MB)…")
+        self.rerank_button.setText('Remove' if state['installed'] else 'Download…')
         self.rerank_gpu_button.setVisible(bool(state['installed'] and state['gpu'] and state['gpu_size_mb']))
-        self.rerank_gpu_button.setText('Remove GPU version' if state['gpu_model'] else f"GPU version ({state['gpu_size_mb']:,} MB)…")
-        if state['installed'] and state['gpu']:
-            state['detail'] += ' · half precision' if state['gpu_model'] else ' · 8-bit (the GPU version is faster)'
-        self.rerank_status.setText(f"Reranker: {state['detail']}" if state['installed'] else
-                                   f"Reranker not downloaded — answers use the keyword + meaning order. {state['label']} is "
-                                   f"{state['size_mb']} MB from Hugging Face, checked against its published checksum.")
+        self.rerank_gpu_button.setText('Remove faster copy' if state['gpu_model'] else 'Faster copy…')
+        self.rerank_gpu_button.setToolTip(f"A half-precision copy ({state['gpu_size_mb'] or 0:,} MB) that your graphics card runs several times faster")
+        if state['ready']:
+            text = 'Ready · runs on the graphics card' + (' (half precision)' if state['gpu_model'] else ' (8-bit)') if state['gpu'] else 'Ready · runs on this PC'
+        else:
+            text = plain(state['detail']) if state['installed'] else f"Not downloaded · {state['size_mb']} MB"
+        self.rerank_status.setText(text)
+        self.rerank_status.setToolTip('' if state['installed'] else
+                                      f"{state['label']} is {state['size_mb']} MB from Hugging Face, checked against its published checksum")
 
     def rerank_action(self):
         name = self.rerank_model.currentData()
@@ -2993,7 +3356,7 @@ class SettingsView(QWidget):
             self.rerank_job.set()
             return
         if rerank.gpu_model_installed(name):
-            answer = ask_box(self, 'Remove the GPU version?', f"Delete the GPU version of {info['label']} ({info['gpu_size_mb']:,} MB)? "
+            answer = ask_box(self, 'Remove the faster copy?', f"Delete the graphics card copy of {info['label']} ({info['gpu_size_mb']:,} MB)? "
                              'The reranker keeps working with the smaller copy.', QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
             if answer == QMessageBox.Yes:
                 for local in info.get('gpu_files', {}):
@@ -3001,7 +3364,7 @@ class SettingsView(QWidget):
                 rerank.forget()
                 self.show_rerank()
             return
-        answer = ask_box(self, 'Download the GPU version?',
+        answer = ask_box(self, 'Download the faster copy?',
                          f"Download the half-precision copy of {info['label']} ({info['gpu_size_mb']:,} MB) from huggingface.co/{info['repo']}? "
                          'Your graphics card runs it several times faster, and it scores closer to the original model.',
                          QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
@@ -3012,7 +3375,7 @@ class SettingsView(QWidget):
 
         def progress(value):
             done, total = value
-            self.rerank_status.setText(f'Downloading the GPU version… {done / 2 ** 20:,.0f} of {total / 2 ** 20:,.0f} MB')
+            self.rerank_status.setText(f'Downloading the faster copy… {done / 2 ** 20:,.0f} of {total / 2 ** 20:,.0f} MB')
 
         def finished(result=None, error=None):
             self.rerank_job = None
@@ -3033,12 +3396,16 @@ class SettingsView(QWidget):
             self.file_states.update(states)
             for key in DOWNLOAD_ROWS:
                 self.show_file(key)
+            self.show_meaning()
+            self.show_pictures()
         run_job(lambda s: {key: models.state(key, home) for key in DOWNLOAD_ROWS}, shown,
                 lambda error: logging.getLogger('alfred').warning('Model files: %s', error))
 
     def show_file(self, key):
         status, action = self.file_status[key], self.file_button[key]
         downloads = self.win.downloads
+        if key in MEANING_FILES:
+            self.show_meaning()
         if downloads.running(key):
             done, total = downloads.progress.get(key, (0, models.size_of(key)))
             status.setText(f'Downloading… {done / 1e6:,.0f} of {total / 1e6:,.0f} MB')
@@ -3058,7 +3425,7 @@ class SettingsView(QWidget):
         elif where == 'ollama':
             status.setText(f'Using Ollama’s copy · {size}')
         elif where == 'external':
-            status.setText('Using the copy in ALFRED_LLAMA_DIR' if key == models.ENGINE else f'Using the copy in ALFRED_MODELS_DIR · {size}')
+            status.setText('Using a copy set up outside Alfred' + ('' if key == models.ENGINE else f' · {size}'))
         elif where == 'included':
             status.setText('Came with Alfred')
         elif not state['downloadable']:
@@ -3103,9 +3470,9 @@ class SettingsView(QWidget):
 
     def show_index_info(self):
         st = self.win.status
-        self.index_info.setText(f"{st['files']} files indexed · {st['segments']} passages · {st['vectors']} embeddings · "
+        self.index_info.setText(f"Index: {st['files']:,} files · {st['segments']:,} pieces of text · {st['vectors']:,} searchable by meaning · "
                                 f"{st['errors']} failed · {st['unsupported']} unsupported · last indexed {st['last_indexed'] or 'never'}"
-                                + ''.join(f"\n{p['status']}: {p['path']} — {p['error']}" for p in self.win.index.problems(6)))
+                                + ''.join(f"\n{p['status']}: {p['path']} — {plain(p['error'])}" for p in self.win.index.problems(6)))
 
     def load_models(self, announce=False):
         """Check every account and show the current chat model."""
@@ -3182,7 +3549,10 @@ class SettingsView(QWidget):
             if state in ('no_key', 'missing'):
                 note = {'missing': 'not installed', 'no_key': 'no address yet' if kind == 'compatible' else 'no key yet'}[state]
                 detail = f"{self.account_status[kind].plan} · {note}"
-            self.account_status[kind].setText(detail)
+            if kind in ('claude_code', 'codex'):  # a subscription: "Signed in" or not; what the tool said is the tooltip
+                self.account_status[kind].setToolTip(plain(entry['status']['detail'] or ''))
+                detail = {'ready': 'Signed in', 'signed_out': 'Not signed in', 'missing': 'Its command-line tool is not installed'}.get(state, detail)
+            self.account_status[kind].setText(plain(detail))
             if kind in ('claude_code', 'codex'):
                 self.account_button[kind].setText({'ready': 'Re-check', 'missing': 'How to install'}.get(state, 'Sign in…'))
             elif kind in ('anthropic', 'openai'):
@@ -3193,12 +3563,11 @@ class SettingsView(QWidget):
     def show_location(self):
         provider = providers.for_settings(self.win.settings)
         if not provider.describe()['configured']:
-            self.location.setText('Choose a chat model to use Ask Alfred.')
+            self.location.setText('Choose an answer model to use Ask Alfred')
         elif provider.cloud:
-            self.location.setText(f'Answers come {provider.via}: your questions (and the passages Alfred finds for them) are sent there. '
-                                  'Your files stay on this PC.')
+            self.location.setText(f'Answers come {provider.via}: your questions and the text found for them go there')
         else:
-            self.location.setText('Answers are written on this PC — nothing leaves it.')
+            self.location.setText('Answers are written on this PC; nothing leaves it')
 
     def account_action(self, kind):
         provider = providers.for_settings(self.win.settings, kind, '')
@@ -3244,7 +3613,8 @@ class SettingsView(QWidget):
         settings = dict(self.win.settings)
 
         def show(value):
-            fill_effort(self.effort, self.effort_note, value[0], value[1], settings.get('effort'))
+            fill_effort(self.effort, None, value[0], value[1], settings.get('effort'))
+            self.effort.setToolTip(plain(value[1]))
             for widget in (self.effort_row, self.effort_row.hairline):
                 widget.setVisible(bool(value[0]))  # only for models that can think
         run_job(lambda s: providers.for_settings(settings).effort_options(), show)
@@ -3256,6 +3626,7 @@ class SettingsView(QWidget):
         self.chats_place.setToolTip(str(store.folder))
         self.delete_chats.setText(f'Delete all chats ({count})…' if count else 'Delete all chats…')
         self.delete_chats.setEnabled(bool(count))
+        self.delete_chats_note.setText('Permanently, after asking first' if count else 'No saved chats yet')
 
     def open_chats_folder(self):
         folder = self.win.settings.chats_folder
@@ -3323,7 +3694,7 @@ class SettingsView(QWidget):
         self.hotkey_edit.blockSignals(True)
         self.hotkey_edit.setKeySequence(QKeySequence(active.replace('Win+', 'Meta+')) if active else QKeySequence())
         self.hotkey_edit.blockSignals(False)
-        self.hotkey_label.setText(f'Active: {active}' if active else 'No global shortcut is active — use the tray icon.')
+        self.hotkey_label.setText(f'Active: {active}' if active else 'None is active: open Alfred from its icon near the clock')
 
     def change_hotkey(self, text=None):
         if text is None:
@@ -3346,7 +3717,7 @@ class SettingsView(QWidget):
         if self.loading:
             return
         s = self.win.settings
-        before = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('video_interval'), s.get('contextual_chunks'))
+        before = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('picture_search', True), s.get('video_interval'), s.get('contextual_chunks'))
         before_model = (s.get('provider'), s.get('model'))
         before_search = s.get('search_on_gpu')
         before_glass = bool(s.get('see_through', True))
@@ -3356,7 +3727,8 @@ class SettingsView(QWidget):
         s.update({'device': 'cpu' if self.device.currentIndex() else 'auto',
                   'embed_enabled': self.embed_enabled.isChecked(), 'search_on_gpu': self.search_on_gpu.isChecked(),
                   'embed_device': 'cpu' if self.embed_device.currentIndex() else 'auto',
-                  'ocr_enabled': self.ocr_enabled.isChecked(),
+                  'ocr_enabled': self.ocr_enabled.isChecked(), 'picture_search': self.picture_search.isChecked(),
+                  'index_on_battery': self.index_on_battery.isChecked(),
                   'video_interval': self.video_interval.value(), 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
                   'reduce_motion': self.reduce_motion.isChecked(), 'auto_index': self.auto_index.isChecked(),
                   'keep_alive_minutes': self.keep_minutes.currentData(),
@@ -3376,7 +3748,7 @@ class SettingsView(QWidget):
             self.show_location()
         if s.get('search_on_gpu') != before_search:
             ai.runtime.stop('search', s)  # this process's search server restarts on its new device at the next search
-        after = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('video_interval'), s.get('contextual_chunks'))
+        after = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('picture_search', True), s.get('video_interval'), s.get('contextual_chunks'))
         if after != before:
             self.win.toast('Saved · updating your index', 'green', seconds=4)
             self.win.start_index(quiet=True)
@@ -3388,7 +3760,7 @@ class SettingsView(QWidget):
 
     def diagnose(self, probe):
         settings = dict(self.win.settings)
-        self.diag.setText('Checking…' + (' loading models for a test inference' if probe else ''))
+        self.diag.setText('Checking…' + (' loading the models for a test' if probe else ''))
         if probe:
             self.win.thinking(True)
 
@@ -3396,19 +3768,20 @@ class SettingsView(QWidget):
             self.win.thinking(False)
             lines = []
             for g in r['gpu']['gpus']:
-                lines.append(f"**GPU detected:** {g['name']} · {g['vram_used_mib']:,} / {g['vram_total_mib']:,} MiB in use · driver {g['driver']}")
+                lines.append(f"**Graphics card:** {g['name']} · {g['vram_used_mib']:,} / {g['vram_total_mib']:,} MiB in use · driver {g['driver']}")
             if not r['gpu']['available']:
-                lines.append(f"**GPU detected:** none — {r['gpu'].get('note', '')}")
-            for key, name in (('chat', 'Chat'), ('embeddings', 'Search by meaning')):
+                lines.append(f"**Graphics card:** none — {plain(r['gpu'].get('note', ''))}")
+            for key, name in (('chat', 'Answer model'), ('embeddings', 'Search by meaning')):
                 info = r.get(key, {})
                 if (key == 'chat' and not info.get('configured')) or (key != 'chat' and not info.get('enabled')):
                     lines.append(f'**{name}:** off')
                     continue
-                state = {True: 'GPU ACTIVE', False: 'CPU', None: 'device not confirmed'}[info.get('gpu_active')] if info.get('location') == 'local' else 'remote'
-                lines.append(f"**{name}:** {info.get('model')} · **{state}** — {info.get('execution', '')}")
-            lines += [f'**Error:** {e}' for e in r['errors']]
+                state = ({True: 'on the graphics card', False: 'on the CPU', None: 'device not confirmed'}[info.get('gpu_active')]
+                         if info.get('location') == 'local' else 'in the cloud')
+                lines.append(f"**{name}:** {info.get('model')} · **{state}** — {plain(str(info.get('execution', '')))}")
+            lines += [f'**Error:** {plain(str(e))}' for e in r['errors']]
             self.diag.setText('  \n'.join(lines))
-        run_job(lambda s: ai.diagnostics(settings, probe), done, lambda e: (self.win.thinking(False), self.diag.setText(f'Failed: {e}')))
+        run_job(lambda s: ai.diagnostics(settings, probe), done, lambda e: (self.win.thinking(False), self.diag.setText(plain(f'Failed: {e}'))))
 
 
 # ------------------------------------------------------------------ window
@@ -4663,6 +5036,12 @@ class AlfredWindow(QWidget):
         self.update()
         self.focus_input()
 
+    def open_settings(self, page=None, section=None):
+        """Settings, on ``page`` (one of SETTINGS_PAGES; the last page shown when None) and, in Advanced, ``section`` open."""
+        if page:
+            self.settings_view.show_page(page, section)
+        self.set_mode(SETTINGS)
+
     def focus_input(self):
         """The search box, or in setup its primary button."""
         if self.mode == SETUP:
@@ -4673,7 +5052,7 @@ class AlfredWindow(QWidget):
     def update_hints(self):
         hints = {SEARCH: '↑↓ Select   ↵ Open   Ctrl+↵ Show in folder   ⇥ Ask Alfred   Esc Close',
                  ASK: '↵ Ask   Ctrl+N New chat   Ctrl+H History   Esc Close',
-                 SETTINGS: 'Changes save automatically   Esc Back',
+                 SETTINGS: '↑↓ Pages   ⇥ Into the page   Changes save automatically   Esc Back',
                  SETUP: '↵ Continue   Esc Close (setup resumes next time)'}
         if not self.toasting:
             self.hints.setText(hints[self.mode])
@@ -4698,6 +5077,9 @@ class AlfredWindow(QWidget):
                 else:
                     self.hide_panel()
                 return True
+            if key == Qt.Key_Tab and self.mode == SETTINGS:
+                self.settings_view.enter_page()  # Tab goes into the page that is showing
+                return True
             if key == Qt.Key_Tab or key == Qt.Key_Backtab:
                 self.set_mode(SEARCH if self.mode == ASK else ASK)
                 return True
@@ -4720,6 +5102,8 @@ class AlfredWindow(QWidget):
                 delta = -1 if key == Qt.Key_Up else 1
                 if self.mode == SEARCH:
                     self.search_view.list.move(delta)
+                elif self.mode == SETTINGS:
+                    self.settings_view.pages_list.move(delta)
                 return True
             if key in (Qt.Key_Return, Qt.Key_Enter):
                 if self.mode == SEARCH:
@@ -4783,7 +5167,7 @@ class AlfredWindow(QWidget):
                     [('Track folder…', self.choose_folder)] + suggestions, 'folder')
         if not st['root_exists']:
             return ('Your tracked folders are missing', 'They may have been moved, renamed or be on a drive that isn’t connected.',
-                    [('Open Settings', lambda: self.set_mode(SETTINGS)), ('Track folder…', self.choose_folder)], 'folder')
+                    [('Open Settings', lambda: self.open_settings('Folders')), ('Track folder…', self.choose_folder)], 'folder')
         if not st['files']:
             if self.indexing:
                 return ('Reading your files…', 'Results appear here as soon as the first files are indexed.', [], 'refresh')
@@ -5339,7 +5723,7 @@ def run():
     menu = QMenu()
     window.open_action = menu.addAction(f'Open Alfred	{window.active_hotkey}', window.show_panel)
     menu.addAction('Rescan files', lambda: (window.show_panel(), window.start_index()))
-    menu.addAction('Settings', lambda: (window.show_panel(), window.set_mode(SETTINGS)))
+    menu.addAction('Settings', lambda: (window.show_panel(), window.open_settings()))
     menu.addSeparator()
     menu.addAction('Quit Alfred', app.quit)
     tray.setContextMenu(menu)

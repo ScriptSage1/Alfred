@@ -795,6 +795,8 @@ class Toggle(QAbstractButton):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(0.4)  # disabled: its row's help line says why
         pal = self.palette_ref()
         t = max(0.0, min(1.0, self.knob.value))
         off, on = QColor(pal['fill_strong']), QColor(pal['green'])

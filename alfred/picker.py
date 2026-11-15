@@ -13,7 +13,7 @@ LOGOS = {'local': 'pc', 'claude_code': 'claude', 'anthropic': 'anthropic', 'code
 EXPERIMENTAL = {'claude_code', 'codex'}  # subscription routes through CLIs
 SUBTITLES = {'local': '2.5 GB · runs on this PC', 'claude_code': 'Your Claude plan', 'codex': 'Your ChatGPT plan', 'anthropic': 'Claude API', 'openai': 'OpenAI API',
              'compatible': 'Custom server'}
-NOTES = {'missing': 'Not installed', 'signed_out': 'Sign in under Settings → Accounts', 'no_key': 'Add a key under Settings → Accounts',
+NOTES = {'missing': 'Not installed', 'signed_out': 'Sign in under Settings → Ask Alfred', 'no_key': 'Add a key in Settings → Advanced',
          'unreachable': 'Unavailable right now'}
 ROW, HEADER, NOTE, GAP, PAD, RADIUS, SHADOW = 44, 28, 42, 9, 6, 14, 22
 
@@ -28,7 +28,7 @@ def model_items(entries, current, efforts=(), effort=None):
             note = NOTES.get(state, 'No models found') if state != 'ready' else (
                 'No models found')
             if kind == 'compatible' and state == 'no_key':
-                note = 'Add its address under Settings → Accounts'
+                note = 'Add its address in Settings → Advanced'
             unavailable.append({'type': 'note', 'kind': kind, 'title': entry['group'], 'subtitle': note})
             continue
         items.append({'type': 'header', 'title': entry['group'], 'cloud': entry['cloud']})

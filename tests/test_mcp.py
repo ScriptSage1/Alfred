@@ -280,7 +280,7 @@ class ConsentAndLogTests(McpBase):
         self.answer = None
         result = self.search()
         self.assertTrue(result['isError'])
-        self.assertIn('Settings → Other AI tools', result['content'][0]['text'])
+        self.assertIn('Settings → AI tools', result['content'][0]['text'])
         self.assertIsNone(mcp_server.client_allowed(self.settings.home, 'test-client'))
 
     def test_revocation_and_removal_are_honoured_at_once(self):

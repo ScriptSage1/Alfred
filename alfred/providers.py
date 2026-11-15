@@ -95,7 +95,7 @@ def _http_message(error):
     except ValueError:
         detail = body[:200]
     if error.code in (401, 403):
-        return f'The key was rejected ({error.code}). Check it in Settings → AI model.'
+        return f'The key was rejected ({error.code}). Check it in Settings → Advanced → API keys.'
     if error.code == 429:
         return f'Rate or usage limit reached — try again shortly. {detail or ""}'.strip()
     return f'HTTP {error.code}: {detail or "request failed"}'
@@ -199,7 +199,7 @@ class OpenAICompatible(Provider):
     def stream(self, messages, on_token=lambda t: None, cancel=None, on_status=lambda text: None):
         self.require()
         if self.status()['state'] != 'ready':
-            raise NotConfigured(f'{self.label} isn’t set up — add it in Settings → AI model.')
+            raise NotConfigured(f'{self.label} isn’t set up — add it in Settings → Advanced → API keys.')
         payload = dict(self.options(), model=self.model, messages=messages, stream=True)
         parts = []
         with _post_stream(self.base + '/chat/completions', payload, self.headers()) as response:
@@ -335,7 +335,7 @@ class Anthropic(Provider):
     def stream(self, messages, on_token=lambda t: None, cancel=None, on_status=lambda text: None):
         self.require()
         if not keys.has('anthropic'):
-            raise NotConfigured('Add your Anthropic API key in Settings → AI model.')
+            raise NotConfigured('Add your Anthropic API key in Settings → Advanced → API keys.')
         system = '\n\n'.join(m['content'] for m in messages if m['role'] == 'system')
         payload = {'model': self.model, 'max_tokens': 4096, 'stream': True,
                    'messages': [{'role': m['role'], 'content': m['content']} for m in messages if m['role'] in ('user', 'assistant')]}
@@ -532,7 +532,7 @@ class ClaudeCode(CLIProvider):
             message = str(result.get('result') or self.stderr or f'Claude Code exited with code {code}')
             if 'login' in message.lower() or 'logged in' in message.lower() or 'authenticate' in message.lower():
                 forget_status()
-                raise NotConfigured('Claude Code isn’t signed in. Settings → AI model → Sign in with Claude.')
+                raise NotConfigured('Claude Code isn’t signed in. Settings → Ask Alfred → Claude → Sign in.')
             if 'limit' in message.lower():
                 raise ProviderError(f'Your Claude plan’s usage limit was reached. {message}')
             raise ProviderError(message[:400])
@@ -633,7 +633,7 @@ class Codex(CLIProvider):
             message = failure[0] if failure else (self.stderr or f'Codex exited with code {code}')
             if 'login' in message.lower() or 'not logged in' in message.lower() or '401' in message:
                 forget_status()
-                raise NotConfigured('Codex isn’t signed in. Settings → AI model → Sign in with ChatGPT.')
+                raise NotConfigured('Codex isn’t signed in. Settings → Ask Alfred → ChatGPT → Sign in.')
             if 'limit' in message.lower():
                 raise ProviderError(f'Your ChatGPT plan’s usage limit was reached. {message}')
             raise ProviderError(message[:400])

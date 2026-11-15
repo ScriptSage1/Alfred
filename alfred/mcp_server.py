@@ -6,7 +6,7 @@ need not be running. It never indexes, never writes to the index and never opens
 It does not import the window, the reranker, the answer pipeline or the chat providers.
 
 Each AI tool is asked once (a Windows message box) before it may search; the answer is kept in mcp_clients.json and
-can be changed under Settings → Other AI tools. Every call is logged to mcp_calls.jsonl. Both files live in the
+can be changed under Settings → AI tools. Every call is logged to mcp_calls.jsonl. Both files live in the
 Alfred data folder. stdout carries only protocol messages; anything else goes to stderr.
 """
 import json
@@ -362,10 +362,10 @@ class Server:
         if decision is None:
             decision = self.ask(name)
             if decision is None:
-                raise Denied(f'Alfred could not ask the user. Allow {name} in Alfred → Settings → Other AI tools.')
+                raise Denied(f'Alfred could not ask the user. Allow {name} in Alfred → Settings → AI tools.')
             set_allowed(self.home, name, bool(decision))
         if not decision:
-            raise Denied(f'The user has not allowed {name} to use Alfred. They can change this in Alfred → Settings → Other AI tools.')
+            raise Denied(f'The user has not allowed {name} to use Alfred. They can change this in Alfred → Settings → AI tools.')
 
     def _open_index(self):
         if self.index is None:
