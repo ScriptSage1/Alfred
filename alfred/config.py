@@ -11,10 +11,16 @@ import threading
 import time
 from pathlib import Path
 
+from . import paths
+
 DEFAULTS = {
     # Folders Alfred indexes and watches (absolute paths), added under Settings → Tracked folders.
     'tracked_folders': [],
-    'auto_index': True,          # watch tracked folders and index new/changed files automatically
+    # Folders tracked as "only new files from now on": {folder: epoch seconds when tracked}. Files already there are
+    # findable by name only (files.status 'skipped'); absent = the folder's whole content is indexed.
+    'folder_since': {},
+    'setup_done': False,         # the first-run setup was finished or skipped (folders already tracked count as done)
+    'auto_index': True,         # watch tracked folders and index new/changed files automatically
     # Chat (Ask Alfred): which provider writes answers (see alfred.providers) and its model. Empty until you choose.
     'provider': 'local',         # local | claude_code | codex | anthropic | openai | compatible
     'model': '',
@@ -27,8 +33,8 @@ DEFAULTS = {
     'keep_alive_minutes': 5,     # a local model stays loaded this long after its last use
     'answer_context': 10240,     # tokens the answer model on this PC reads at once (passages + chat so far + answer)
     # Answers from your files (alfred.rag).
-    'answer_beyond_files': True, # the model may add general knowledge, clearly labelled, after what your files say
-    'rerank_enabled': True,      # reorder candidate passages with the local reranker once it's downloaded
+    'answer_beyond_files': False,  # the model may add general knowledge, clearly labelled, after what your files say
+    'rerank_enabled': False,     # reorder candidate passages with the local reranker once it's downloaded
     'rerank_model': 'bge-reranker-v2-m3',
     'contextual_chunks': False,  # the answer model on this PC writes a line of context for every passage while indexing (slow, better recall)
     # Chat history: one JSON file per chat. Empty folder = %LOCALAPPDATA%\Alfred\Chats.
@@ -106,7 +112,7 @@ class Settings(dict):
 
     def __init__(self, home=None, retire=True):
         super().__init__(DEFAULTS)
-        self['tracked_folders'] = []
+        self['tracked_folders'], self['folder_since'] = [], {}
         self.home = Path(home) if home else data_home()
         self.home.mkdir(parents=True, exist_ok=True)
         self.path = self.home / 'settings.json'
@@ -131,6 +137,35 @@ class Settings(dict):
     def folders(self):
         """Tracked folders as Paths, in the order they were added."""
         return [Path(p) for p in self.get('tracked_folders') or []]
+
+    def _since_key(self, folder):
+        """The folder_since key naming ``folder`` (compared like tracked folders, with paths.canonical), or None."""
+        target = paths.canonical(folder)
+        return next((key for key in self.get('folder_since') or {} if paths.canonical(key) == target), None)
+
+    def since_for(self, folder):
+        """Epoch seconds when ``folder`` was tracked as "only new files from now on", or None (everything is indexed)."""
+        key = self._since_key(folder)
+        return (self.get('folder_since') or {})[key] if key is not None else None
+
+    def set_since(self, folder, when=None):
+        """Mark ``folder`` as "only new files from now on" (``when``: epoch seconds, default now). Not saved."""
+        since = {k: v for k, v in (self.get('folder_since') or {}).items() if k != self._since_key(folder)}
+        since[str(folder)] = float(time.time() if when is None else when)
+        self['folder_since'] = since
+        return since[str(folder)]
+
+    def clear_since(self, folder):
+        """``folder`` includes everything again (untracked, or "Include older files too"). Not saved."""
+        key = self._since_key(folder)
+        if key is not None:
+            self['folder_since'] = {k: v for k, v in self['folder_since'].items() if k != key}
+
+    def untrack(self, folder):
+        """Remove ``folder`` from tracked_folders and folder_since. Not saved."""
+        target = paths.canonical(folder)
+        self['tracked_folders'] = [str(t) for t in self.folders if paths.canonical(t) != target]
+        self.clear_since(folder)
 
     @property
     def db_path(self):

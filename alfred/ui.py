@@ -2840,8 +2840,8 @@ class SettingsView(QWidget):
         self.see_through.setChecked(bool(s.get('see_through', True)))
         self.auto_index.setChecked(bool(s.get('auto_index', True)))
         self.show_keep_loaded(ai.keep_alive_minutes(s))
-        self.beyond.setChecked(bool(s.get('answer_beyond_files', True)))
-        self.rerank_enabled.setChecked(bool(s.get('rerank_enabled', True)))
+        self.beyond.setChecked(bool(s.get('answer_beyond_files', False)))
+        self.rerank_enabled.setChecked(bool(s.get('rerank_enabled', False)))
         self.rerank_model.setCurrentIndex(max(0, self.rerank_model.findData(s.get('rerank_model') or rerank.DEFAULT)))
         self.contextual.setChecked(bool(s.get('contextual_chunks')))
         for widget in self.findChildren(QWidget):
@@ -4382,8 +4382,9 @@ class AlfredWindow(QWidget):
         if folder:
             self.track_folder(folder)
 
-    def track_folder(self, folder):
-        """Track a folder: index it right away, then watch it for changes."""
+    def track_folder(self, folder, only_new=False):
+        """Track a folder: index it right away, then watch it for changes. ``only_new``: "only new files from now on"
+        (the files already there are found by name only; see Index.track_only_new)."""
         folder = Path(os.path.realpath(folder))
         reason = paths.forbidden_reason(folder, self.settings.home)
         if reason:
@@ -4400,6 +4401,12 @@ class AlfredWindow(QWidget):
             return False
         inside = [t for t in tracked if paths.is_within(folder, t)]
         self.settings['tracked_folders'] = [str(t) for t in tracked if t not in inside] + [str(folder)]
+        for merged_folder in inside:
+            self.settings.clear_since(merged_folder)
+        if only_new:
+            self.index.track_only_new(folder)
+        else:
+            self.settings.clear_since(folder)
         self.settings.save()
         self.watch_folders()
         if self.mode == SETTINGS:
@@ -4415,8 +4422,7 @@ class AlfredWindow(QWidget):
 
     def untrack_folder(self, folder):
         """Stop tracking a folder; its files leave the index (nothing on disk is touched)."""
-        key = paths.canonical(folder)
-        self.settings['tracked_folders'] = [str(t) for t in self.settings.folders if paths.canonical(t) != key]
+        self.settings.untrack(folder)  # and its folder_since entry
         self.settings.save()
         self.watch_folders()
         index = self.index

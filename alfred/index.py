@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS layers(path TEXT, layer TEXT, signature TEXT, status 
 CREATE TABLE IF NOT EXISTS media_cache(hash TEXT, layer TEXT, signature TEXT, payload BLOB, used_at REAL,
                                        PRIMARY KEY(hash, layer, signature));
 '''
-# files.status: 'pending' (found, text not read yet) | 'ok' | 'error' | 'unsupported'.
+# files.status: 'pending' (found, text not read yet) | 'ok' | 'error' | 'unsupported' | 'skipped' (already in a folder
+# tracked as "only new files from now on": findable by its name passage, content never read, no vectors, until it changes).
 # segments.kind: 'file' (name only), 'text', 'page', 'slide', 'sheet', 'ocr', 'video'
 # and 'picture' (a picture vector: no text and no fts row, ord -2, -3, …).
 # layers: per file, the 'ocr' and 'picture' layers (status 'pending' | 'ok' | 'error'; detail {"pages": [...]} for the
@@ -80,6 +81,16 @@ MEDIA = IMAGE_SUFFIXES | VIDEO_SUFFIXES
 MEDIA_SQL = '(' + ' OR '.join(f"lower(f.path) LIKE '%{suffix}'" for suffix in sorted(MEDIA)) + ')'
 _LOSSLESS = {'.png', '.bmp', '.gif', '.webp', '.tif', '.tiff'}
 _Stat = collections.namedtuple('_Stat', 'st_mtime_ns st_size')
+SKIPPED_NOTE = 'Already in the folder when it was tracked with only new files: found by its name only'
+NOT_SKIPPED = "s.path NOT IN (SELECT path FROM files WHERE status='skipped')"  # name passages of skipped files get no vector
+
+
+def _file_time(st):
+    """The later of a file's modified and created time, in epoch seconds (st_ctime is the created time on Windows)."""
+    created = getattr(st, 'st_birthtime', None)
+    if created is None and os.name == 'nt':
+        created = st.st_ctime
+    return max(st.st_mtime_ns / 1e9, created or 0)
 
 
 class IndexBusy(RuntimeError):
@@ -433,6 +444,7 @@ class Index:
         self._roots_cache = None  # (tracked folders as set, canonical roots, {path: (root, display folder)})
         self._local = threading.local()  # one read connection per thread (searches run on UI worker threads)
         self._readers = weakref.WeakSet()
+        self._baseline = set()  # canonical folders just tracked as "only new": their next scan skips every file it finds
         connect(self.db_path).close()  # the schema is created here, once; read connections skip it
 
     def _reader(self):
@@ -466,6 +478,42 @@ class Index:
 
     def roots(self):
         return list(self._tracked()[1])
+
+    def track_only_new(self, folder, when=None):
+        """Mark ``folder`` (being tracked now) as "only new files from now on": the next update writes every file it
+        finds there as 'skipped' (name passage only, nothing read). Sets settings folder_since (not saved); returns it."""
+        since = self.settings.set_since(folder, when)
+        self._baseline.add(paths.canonical(folder))
+        return since
+
+    def include_older(self, folder):
+        """"Include older files too": ``folder`` leaves folder_since (settings saved) and its 'skipped' files become
+        'pending', so the next update reads them in full. Waits while an update runs. Returns how many files."""
+        self.settings.clear_since(folder)
+        self.settings.save()
+        self._baseline.discard(paths.canonical(folder))
+        key = str(Path(os.path.realpath(folder)))
+        with self._lock:
+            con = connect(self.db_path)
+            try:
+                with con:
+                    count = con.execute("UPDATE files SET status='pending', error='' WHERE root=? AND status='skipped'", (key,)).rowcount
+                    con.execute('DELETE FROM meta WHERE key=?', ('since_baseline:' + key,))
+            finally:
+                con.close()
+        return count
+
+    def _skip_rule(self, con, root):
+        """For layer 1 in ``root``: (folder_since or None, skip every new file?). A folder tracked as "only new" takes
+        its baseline once (every file found then is skipped); an index made from nothing (no baseline recorded) skips
+        the files older than folder_since instead."""
+        since = self.settings.since_for(root)
+        if since is None:
+            return None, False
+        row = con.execute('SELECT value FROM meta WHERE key=?', ('since_baseline:' + str(root),)).fetchone()
+        if row and row[0] == repr(float(since)):
+            return None, False  # baseline taken: a file not in the index is new
+        return float(since), paths.canonical(root) in self._baseline
 
     def root_of(self, path):
         return next((root for root in self.roots() if paths.is_within(root, path)), None)
@@ -564,7 +612,7 @@ class Index:
         return {'folders': len(roots), 'missing': [str(r) for r in roots if not r.is_dir()],
                 'root_exists': any(r.is_dir() for r in roots), 'initialized': bool(meta.get('last_indexed')),
                 'files': counts.get('ok', 0), 'pending': counts.get('pending', 0),
-                'errors': counts.get('error', 0), 'unsupported': counts.get('unsupported', 0),
+                'errors': counts.get('error', 0), 'unsupported': counts.get('unsupported', 0), 'older': counts.get('skipped', 0),
                 'segments': segments, 'vectors': vectors, 'last_indexed': meta.get('last_indexed'),
                 'embed_model': meta.get('embed_signature'), 'contexts': self._context_count()}
 
@@ -579,19 +627,25 @@ class Index:
             con.close()
 
     def folder_stats(self):
-        """{root: {'files': searchable, 'skipped': unsupported or failed, 'pending': text not read yet}} for each
-        tracked folder. Pending files are findable by name, so they count among the searchable ones too."""
+        """{root: {'files': searchable, 'skipped': unsupported or failed, 'pending': text not read yet, 'full': fully
+        indexed (or being read), 'older': found by name only (status 'skipped', a folder tracked as "only new")}} for each
+        tracked folder. Pending and older files are findable by name, so they count among the searchable ones too:
+        files = full + older."""
         con = connect(self.db_path)
         try:
             rows = list(con.execute('SELECT root, status, count(*) FROM files GROUP BY root, status'))
         finally:
             con.close()
-        stats = {str(root): {'files': 0, 'skipped': 0, 'pending': 0} for root in self.roots()}
+        stats = {str(root): {'files': 0, 'skipped': 0, 'pending': 0, 'full': 0, 'older': 0} for root in self.roots()}
         for root, status, count in rows:
             if root in stats:
-                stats[root]['files' if status in ('ok', 'pending') else 'skipped'] += count
+                stats[root]['files' if status in ('ok', 'pending', 'skipped') else 'skipped'] += count
+                if status in ('ok', 'pending'):
+                    stats[root]['full'] += count
                 if status == 'pending':
                     stats[root]['pending'] += count
+                if status == 'skipped':
+                    stats[root]['older'] += count
         return stats
 
     def problems(self, limit=50):
@@ -677,7 +731,7 @@ class Index:
 
     def _update(self, con, progress, embedder, force, only, background=False):
         started = time.time()
-        summary = {'found': 0, 'changed': 0, 'unchanged': 0, 'removed': 0, 'indexed': 0, 'errors': 0, 'unsupported': 0,
+        summary = {'found': 0, 'changed': 0, 'unchanged': 0, 'skipped': 0, 'removed': 0, 'indexed': 0, 'errors': 0, 'unsupported': 0,
                    'embedded': 0, 'warnings': [], 'seconds_to_names': None, 'seconds_to_text': None,
                    'seconds_to_core': None, 'ocr_device': 'off', 'ocr_read': 0, 'pictures_embedded': 0, 'cache_hits': 0,
                    'paused': None}
@@ -686,8 +740,8 @@ class Index:
         tracked_keys = {str(r) for r in tracked}
         # Files of folders that are no longer tracked leave the index.
         stale = [p for p, root in con.execute('SELECT path, root FROM files') if root not in tracked_keys]
-        if force:
-            stale = [p for (p,) in con.execute('SELECT path FROM files')]
+        if force:  # skipped files of tracked folders keep their row and name passage: their content was never read
+            stale = [p for p, root, status in con.execute('SELECT path, root, status FROM files') if status != 'skipped' or root not in tracked_keys]
             with con:
                 con.execute('DELETE FROM media_cache')  # a rebuild reads everything again
         self._delete_files(con, stale)
@@ -726,15 +780,22 @@ class Index:
             removed = [p for p in known if p not in present]
             self._delete_files(con, removed)
             new = [(p, st) for p, st in found if p not in known]
-            self._add_names(con, root, new, summary)
+            since, skip_all = self._skip_rule(con, root)
+            skipped = {p for p, st in new if (skip_all or _file_time(st) < since) and extract.unsupported_reason(p) is None} if since is not None else set()
+            self._add_names(con, root, new, summary, skipped)
+            if since is not None:
+                with con:
+                    con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('since_baseline:' + str(root), repr(since)))
+                self._baseline.discard(paths.canonical(root))
             waiting = []
             for path, st in found:
-                status = self._needs_text(path, st, known.get(path), reread_documents)
+                status = path not in skipped and self._needs_text(path, st, known.get(path), reread_documents)
                 if status:
                     waiting.append((root, path, st))
             summary['found'] += len(found)
-            summary['changed'] += len(new) + sum(1 for _, p, _ in waiting if p in known)
-            summary['unchanged'] += len(found) - len(new) - sum(1 for _, p, _ in waiting if p in known)
+            summary['skipped'] += len(skipped)
+            summary['changed'] += len(new) - len(skipped) + sum(1 for _, p, _ in waiting if p in known)
+            summary['unchanged'] += len(found) - len(new) + len(skipped) - sum(1 for _, p, _ in waiting if p in known)
             summary['removed'] += len(removed)
             todo += waiting
             run.refresh()
@@ -819,20 +880,22 @@ class Index:
     @staticmethod
     def _needs_text(path, st, known, reread_documents):
         """Whether layer 2 must (re)read a file: changed, still pending, read before the chunk headers, or a
-        picture / video an older version could not index."""
+        picture / video an older version could not index. A skipped file is read only once it has changed."""
         if known is None:
             return extract.unsupported_reason(path) is None and Path(path).suffix.lower() not in MEDIA
         mtime, size, status = known
         suffix = Path(path).suffix.lower()
+        if status == 'skipped':
+            return (mtime, size) != (st.st_mtime_ns, st.st_size)
         if (mtime, size) != (st.st_mtime_ns, st.st_size) or status == 'pending':
             return True
         if reread_documents and suffix in REREAD_FOR_ENRICH:
             return True  # read again for the headings and titles the chunk headers use
         return suffix in MEDIA and status != 'ok'
 
-    def _add_names(self, con, root, new, summary):
+    def _add_names(self, con, root, new, summary, skipped=()):
         """Layer 1 for new files: a files row and one name-only passage each. Documents wait as 'pending' for
-        layer 2; for a picture or video the name is its text layer."""
+        layer 2; for a picture or video the name is its text layer. Paths in ``skipped`` get status 'skipped'."""
         if not new:
             return
         now = time.time()
@@ -848,6 +911,10 @@ class Index:
                 kind, text, loc = _name_only(path)
                 cursor = con.execute('INSERT INTO segments(path,ord,kind,text,location) VALUES(?,?,?,?,?)', (path, 0, kind, text, json.dumps(loc)))
                 con.execute('INSERT INTO fts(rowid,text,name) VALUES(?,?,?)', (cursor.lastrowid, text, name_terms(path)))
+                if path in skipped:
+                    con.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?)',
+                                (path, str(root), st.st_mtime_ns, st.st_size, 'skipped', SKIPPED_NOTE, 1, now))
+                    continue
                 con.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?)',
                             (path, str(root), st.st_mtime_ns, st.st_size, 'ok' if media else 'pending', '', 1, now))
                 if media:
@@ -1174,7 +1241,7 @@ class Index:
         embedder = ai.Embedder.from_settings(self.settings)
         if embedder is not None:
             passages, embedded = con.execute("SELECT count(*), count(v.segment_id) FROM segments s "
-                                             "LEFT JOIN vectors v ON v.segment_id = s.id WHERE s.kind != 'picture'").fetchone()
+                                             f"LEFT JOIN vectors v ON v.segment_id = s.id WHERE s.kind != 'picture' AND {NOT_SKIPPED}").fetchone()
             counts['meaning'] = [embedded, passages]
         media = con.execute(f"SELECT count(*) FROM files f WHERE f.status = 'ok' AND {MEDIA_SQL}").fetchone()[0]
         required = done = 0
@@ -1198,10 +1265,13 @@ class Index:
     def remove_root(self, root):
         """Forget every file of ``root`` (after it is untracked)."""
         key = str(Path(os.path.realpath(root)))
+        self._baseline.discard(paths.canonical(root))
         with self._lock:
             con = connect(self.db_path)
             try:
                 self._delete_files(con, [p for (p,) in con.execute('SELECT path FROM files WHERE root=?', (key,))])
+                with con:
+                    con.execute('DELETE FROM meta WHERE key=?', ('since_baseline:' + key,))
             finally:
                 con.close()
 
@@ -1239,7 +1309,7 @@ class Index:
                 con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('embed_signature', signature))
         # Embed what keyword search sees too: the passage with its header (and AI context, when on).
         rows = list(con.execute('SELECT s.id, s.path, f.text FROM segments s JOIN fts f ON f.rowid = s.id '
-                                'LEFT JOIN vectors v ON v.segment_id=s.id WHERE v.segment_id IS NULL'))
+                                f'LEFT JOIN vectors v ON v.segment_id=s.id WHERE v.segment_id IS NULL AND {NOT_SKIPPED}'))
         done = 0
         plan = getattr(embedder, 'plan', None)  # a small job goes through the search server, a larger one to the index server
         size = plan(len(rows)) if plan is not None and rows else embedder.batch

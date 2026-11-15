@@ -516,7 +516,7 @@ def ask(index, settings, question, history=(), on_token=lambda t: None, cancel=N
     info = provider.describe()
     question = question.strip()
     history = list(history or [])
-    beyond = bool(settings.get('answer_beyond_files', True))
+    beyond = bool(settings.get('answer_beyond_files', False))
 
     if is_small_talk(question) and not only_path:
         messages = [{'role': 'system', 'content': SMALL_TALK_PROMPT}] + \

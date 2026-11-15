@@ -89,13 +89,13 @@ def state(settings):
               'Needs the tokenizers package (run Setup-Alfred.cmd again)' if installed(name) else
               f"Not downloaded ({info['size_mb']} MB)")
     return {'name': name, 'label': info['label'], 'size_mb': info['size_mb'], 'installed': installed(name), 'ready': ready,
-            'enabled': bool(settings.get('rerank_enabled', True)), 'detail': detail, 'gpu': gpu,
+            'enabled': bool(settings.get('rerank_enabled', False)), 'detail': detail, 'gpu': gpu,
             'gpu_model': gpu_model_installed(name), 'gpu_size_mb': info.get('gpu_size_mb')}
 
 
 def for_settings(settings):
     """The loaded reranker to use, or None (turned off, not downloaded, or failed to load)."""
-    if not settings.get('rerank_enabled', True):
+    if not settings.get('rerank_enabled', False):
         return None
     name = settings.get('rerank_model') or DEFAULT
     if not installed(name) or not dependencies_ok():
