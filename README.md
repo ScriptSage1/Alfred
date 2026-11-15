@@ -17,6 +17,9 @@ text inside images and videos — by keyword and by meaning. Everything runs on 
 3. Double-click `Setup-Alfred.cmd`. It creates `.venv`, installs the requirements, adds Alfred to the Start menu
    and starts it.
 
+A ready-to-run folder build that needs no Python (`Alfred.exe`) is made with `packaging\build.cmd`; see
+`packaging\README.md`.
+
 Setup (or Alfred's first launch) also adds Alfred to your Windows Startup folder, so from then on it starts
 hidden in the tray when you sign in (no model is loaded until it is needed). No administrator rights
 are needed. Turn this off or back on under **Settings → Start Alfred when you sign in**; once you

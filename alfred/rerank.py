@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import urllib.error
@@ -86,7 +87,8 @@ def state(settings):
     gpu = ready and gpu_available()
     where = 'on this PC’s graphics card' if gpu else 'on this PC'
     detail = (f"{info['label']} · {info['languages']} · runs {where}" if ready else
-              'Needs the tokenizers package (run Setup-Alfred.cmd again)' if installed(name) else
+              ('Needs the tokenizers package, which this build is missing' if getattr(sys, 'frozen', False) else
+               'Needs the tokenizers package (run Setup-Alfred.cmd again)') if installed(name) else
               f"Not downloaded ({info['size_mb']} MB)")
     return {'name': name, 'label': info['label'], 'size_mb': info['size_mb'], 'installed': installed(name), 'ready': ready,
             'enabled': bool(settings.get('rerank_enabled', False)), 'detail': detail, 'gpu': gpu,

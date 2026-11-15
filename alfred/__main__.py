@@ -6,6 +6,8 @@
     python -m alfred --search QUERY   search with the running Alfred and print JSON
     python -m alfred --status         print the running Alfred's index status
     python -m alfred --mcp            serve search_files and read_passage to other AI tools over stdio (no window)
+    python -m alfred --selftest [DIR] check the installation without a window, in a temporary data folder
+                                      (--selftest-log PATH: where the report goes; see alfred.selftest)
 """
 import json
 import os
@@ -16,6 +18,11 @@ COMMANDS = {'--track': 'track', '--search': 'search', '--status': 'status'}
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if any(a.startswith('--multiprocessing') for a in argv):
+        return 0  # a worker start that freeze_support did not take: never open a window for it
+    if '--selftest' in argv:  # before anything that relaunches, opens a window or reads the real data folder
+        from .selftest import run
+        return run(argv)
     if '--mcp' in argv:
         out, sys.stdout = sys.stdout, sys.stderr  # stdout belongs to the protocol; a stray print goes to stderr
         # numpy's maths library reserves about 30 MB per thread (640 MB on 20 threads) before a single search.
