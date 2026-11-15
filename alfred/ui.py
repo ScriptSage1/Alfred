@@ -3395,6 +3395,18 @@ class SettingsView(QWidget):
 
 
 # ------------------------------------------------------------------ window
+def snapshot(widget):
+    """A picture of ``widget`` and its children at the screen's pixel ratio on a transparent background.
+    QWidget.grab() fills the picture with the palette's opaque window colour first, which shows as a dark slab over
+    the see-through panel."""
+    ratio = widget.devicePixelRatioF()
+    picture = QPixmap(widget.size() * ratio)
+    picture.setDevicePixelRatio(ratio)
+    picture.fill(Qt.transparent)
+    widget.render(picture, QPoint(), QRegion(widget.rect()), QWidget.RenderFlag.DrawChildren)
+    return picture
+
+
 class Veil(QWidget):
     """Transitions the panel's content: a snapshot of what was showing glides out while a snapshot of what comes next
     glides in, both on one spring, and then the real widgets take over pixel for pixel.
@@ -3430,7 +3442,7 @@ class Veil(QWidget):
 
     def frame(self):
         """What is on screen right now (to start the next transition from mid-flight)."""
-        return self.grab()
+        return snapshot(self)
 
     def _step(self, value):
         if not self.active:
@@ -3663,7 +3675,7 @@ class AlfredWindow(QWidget):
             change()
             return
         # Snapshots are taken at the screen's pixel ratio (QWidget.grab renders at devicePixelRatio), never scaled.
-        old = self.veil.frame() if self.veil.active else self.inner.grab()
+        old = self.veil.frame() if self.veil.active else snapshot(self.inner)
         Motion.instant = True  # anything the change animates (fades, reveals) is photographed finished
         try:
             change()
@@ -3680,7 +3692,7 @@ class AlfredWindow(QWidget):
         for spring in [s for s in DRIVER.springs if getattr(s, 'fade', False)]:
             spring.snap(spring.target)  # a fade still running inside the content would be photographed half-done
         QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
-        self.veil.arrive(self.inner.grab())
+        self.veil.arrive(snapshot(self.inner))
 
     def _transition_done(self):
         self.inner.move(0, 0)
