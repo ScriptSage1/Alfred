@@ -3,9 +3,29 @@
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules, copy_metadata
+from PyInstaller.utils.win32.versioninfo import (FixedFileInfo, StringFileInfo, StringStruct, StringTable, VarFileInfo,
+                                                 VarStruct, VSVersionInfo)
 
 REPO = Path(SPECPATH).resolve().parent
 ICON = REPO / 'alfred' / 'assets' / 'alfred.ico'
+VERSION = next(line.split("'")[1] for line in (REPO / 'alfred' / '__init__.py').read_text(encoding='utf-8').splitlines()
+               if line.startswith('__version__'))
+NUMBERS = tuple((list(map(int, VERSION.split('.'))) + [0, 0, 0, 0])[:4])
+
+# The exe's Details tab (product, description, version). An exe without them looks more like malware to antivirus
+# heuristics, which is part of why Microsoft Defender once flagged Alfred.exe.
+VERSION_INFO = VSVersionInfo(
+    ffi=FixedFileInfo(filevers=NUMBERS, prodvers=NUMBERS, mask=0x3F, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0),
+    kids=[StringFileInfo([StringTable('040904B0', [
+              StringStruct('CompanyName', 'Alfred'),
+              StringStruct('FileDescription', 'Alfred - search and answers from your own files'),
+              StringStruct('FileVersion', VERSION),
+              StringStruct('InternalName', 'Alfred'),
+              StringStruct('LegalCopyright', 'Alfred contributors'),
+              StringStruct('OriginalFilename', 'Alfred.exe'),
+              StringStruct('ProductName', 'Alfred'),
+              StringStruct('ProductVersion', VERSION)])]),
+          VarFileInfo([VarStruct('Translation', [0x0409, 1200])])])
 
 # Inference engines RapidOCR can use but Alfred does not (onnxruntime only), and libraries nothing here needs.
 UNUSED_OCR = ('pytorch', 'paddle', 'openvino', 'mnn', 'tensorrt')
@@ -52,6 +72,7 @@ exe = EXE(
     exclude_binaries=True,
     name='Alfred',
     icon=str(ICON) if ICON.is_file() else None,
+    version=VERSION_INFO,
     console=False,  # no console window; --mcp still talks over the pipes an AI tool gives it
     upx=False,
 )

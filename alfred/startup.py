@@ -13,8 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import REPO
-from .console import hidden
+from . import REPO, shortcut
 
 NAME = 'Alfred.lnk'
 # Windows identifies Alfred's notifications by this ID; register_app() gives it the name "Alfred".
@@ -109,11 +108,10 @@ def register_app():
     except OSError as error:
         logging.getLogger('alfred').warning('Could not register Alfred with Windows notifications: %s', error)
 
-    def refresh_shortcut():  # keep the sign-in shortcut's icon current (in the background: it runs PowerShell)
+    def refresh_shortcut():  # keep the sign-in shortcut current (in the background, off the UI thread)
         try:
-            if (startup_folder() / NAME).is_file() and enabled():
-                enable()
-        except (OSError, subprocess.SubprocessError):
+            refresh()
+        except OSError:
             pass
     import threading
     threading.Thread(target=refresh_shortcut, daemon=True).start()
@@ -139,33 +137,41 @@ def command(at_sign_in=True):
     return pythonw(), '-m alfred' + flag
 
 
-def _powershell(script):
-    return subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', script], capture_output=True, text=True,
-                          timeout=30, **hidden())
+ICON = ASSETS / 'alfred.ico'
 
 
-def _quote(value):
-    return str(value).replace("'", "''")
+def _same(a, b):
+    return bool(a) and bool(b) and os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _points_here(found):
+    """True when a shortcut read with shortcut.read starts this Alfred."""
+    return _same(found['target'], command()[0]) and _same(found['workdir'] or '.', REPO)
 
 
 def enabled(folder=None):
     """True when the Startup shortcut exists and points at this Alfred."""
     link = Path(folder or startup_folder()) / NAME
+    return link.is_file() and _points_here(shortcut.read(link))
+
+
+def refresh(folder=None):
+    """Rewrite the Startup shortcut only when it points at this Alfred but is out of date (arguments or icon), so a normal
+    start writes nothing to the Startup folder."""
+    link = Path(folder or startup_folder()) / NAME
     if not link.is_file():
         return False
-    out = _powershell(f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{_quote(link)}'); $s.TargetPath + '|' + $s.WorkingDirectory")
-    target, _, workdir = out.stdout.strip().partition('|')
-    return bool(target) and Path(target).resolve() == command()[0].resolve() and Path(workdir or '.').resolve() == REPO.resolve()
+    found = shortcut.read(link)
+    if not _points_here(found) or (found['arguments'] == command()[1] and _same(found['icon'], ICON)):
+        return False
+    enable(folder)
+    return True
 
 
 def _shortcut(link, target, arguments, description):
-    script = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{_quote(link)}');"
-              f"$s.TargetPath='{_quote(target)}'; $s.Arguments='{arguments}'; $s.WorkingDirectory='{_quote(REPO)}';"
-              f"$s.IconLocation='{_quote(ASSETS / 'alfred.ico')},0';"
-              f"$s.WindowStyle=7; $s.Description='{_quote(description)}'; $s.Save()")
-    out = _powershell(script)
-    if out.returncode or not link.is_file():
-        raise OSError(f'Could not create the shortcut {link.name}: {(out.stderr or out.stdout).strip()[:200]}')
+    shortcut.write(link, target, arguments, REPO, ICON, 0, shortcut.SW_SHOWMINNOACTIVE, description)
+    if not link.is_file():
+        raise OSError(f'Could not create the shortcut {link.name}')
     return link
 
 

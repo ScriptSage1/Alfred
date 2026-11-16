@@ -1,4 +1,4 @@
-"""Starting console programs (ffmpeg, llama-server, PowerShell, the Claude and Codex command-line tools) without a window.
+"""Starting console programs (ffmpeg, llama-server, the Claude and Codex command-line tools) without a window.
 
 Alfred runs under pythonw, which has no console. On Windows a console program started from it gets a new console
 window of its own, shown for as long as it runs (Windows 11 opens it in Windows Terminal), unless it is started

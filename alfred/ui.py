@@ -5641,7 +5641,7 @@ class AlfredWindow(QWidget):
 
     def choose_start_login(self, on, keep_existing=False):
         """Start Alfred at sign-in (on) or not, chosen in setup; ``keep_existing``: only when it was never settled.
-        The Startup shortcut is written off the UI thread (PowerShell)."""
+        The Startup shortcut is written off the UI thread."""
         if keep_existing and self.settings.get('start_with_windows_configured'):
             return
         self.settings['start_with_windows_configured'] = True
