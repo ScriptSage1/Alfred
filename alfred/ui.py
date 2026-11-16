@@ -2998,8 +2998,9 @@ class SettingsView(QWidget):
             holder = self.mcp_tools.row(tool.name, action, '')
             holder.action = action
             self.mcp_tool_rows[tool.id] = holder
-        self.mcp_command = self.mcp_tools.row('Any other tool', button('Copy', self.copy_mcp_command, None, 'Copy the server entry as JSON'), '',
-                                              'Most MCP tools take this {"mcpServers": …} entry in their settings').caption
+        self.mcp_other = self.mcp_tools.row('Any other tool', button('Copy', self.copy_mcp_command, None, 'Copy the server entry as JSON'), '',
+                                            'Most MCP tools take this {"mcpServers": …} entry in their settings')
+        self.mcp_command = self.mcp_other.caption
         self.mcp_command.setTextInteractionFlags(Qt.TextSelectableByMouse)
         page.add(label('Allowed tools', 'section'))
         g = page.add(Group(win))
@@ -3283,14 +3284,19 @@ class SettingsView(QWidget):
 
     def show_tool_rows(self):
         """Each AI tool found on this PC, with Connect / Update / Remove; tools that aren't installed stay hidden."""
+        shown = 0
         for tool in connect.TOOLS:
             holder = self.mcp_tool_rows[tool.id]
-            found = tool.found()
+            try:
+                found = tool.found()
+            except OSError:
+                found = False
             holder.setVisible(found)
             if holder.hairline is not None:
-                holder.hairline.setVisible(found)
+                holder.hairline.setVisible(found and shown > 0)  # no line above the first row shown
             if not found:
                 continue
+            shown += 1
             if tool.id in self.mcp_busy:
                 holder.caption.setText('Working…')
                 holder.action.setEnabled(False)
@@ -3303,6 +3309,7 @@ class SettingsView(QWidget):
             holder.action.setEnabled(True)
             holder.action.setText({'connected': 'Remove', 'outdated': 'Update'}.get(status['state'], 'Connect'))
             holder.state = status['state']
+        self.mcp_other.hairline.setVisible(shown > 0)
 
     def connect_tool(self, tool_id):
         """Connect (or update, or remove) Alfred in one AI tool, in the background: the CLIs take a few seconds."""
@@ -3319,7 +3326,7 @@ class SettingsView(QWidget):
             elif remove:
                 self.win.toast(f'Removed Alfred from {tool.name}', 'green', seconds=4)
             else:
-                self.win.toast(f'Connected to {tool.name}. If it is open, restart it; it asks once before its first search', 'green', seconds=7)
+                self.win.toast(f'Connected to {tool.name} and checked that it can start Alfred. If it is open, restart it', 'green', seconds=7)
 
         run_job(lambda *_: tool.disconnect() if remove else tool.connect(), finish, lambda error: finish(error=error))
 

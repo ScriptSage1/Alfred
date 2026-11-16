@@ -3,13 +3,18 @@
 Every tool runs the same server (``server_spec``). Tools with an ``mcp add`` command (Claude Code, Codex) are changed
 through that command, given as an argument list, so no shell quoting is involved (Windows PowerShell drops a bare
 ``--``). Editors and desktop apps keep their servers in a JSON file; Alfred changes only its own ``alfred`` entry
-there and refuses files it can't parse (JSON with comments) rather than rewrite them. Any other tool gets the same
-program, arguments and environment to paste (``other_tool_json``).
+there, keeps the original once (``<file>.before-alfred``) and refuses files it can't parse (JSON with comments)
+rather than rewrite them. Any other tool gets the same entry to paste (``other_tool_json``).
+
+After connecting, ``check_server`` starts the server exactly as the tool will (its command, arguments and environment,
+from an unrelated working folder) and runs the MCP handshake, so "Connected" means the tool can really start it.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -17,6 +22,8 @@ from .console import hidden
 
 NAME = 'alfred'
 CLI_TIMEOUT = 60
+CHECK_TIMEOUT = 45  # a cold start imports numpy and opens the index
+PASSED_ENV = ('ALFRED_HOME', 'ALFRED_MODELS_DIR', 'ALFRED_LLAMA_DIR')  # the tools' server uses this Alfred's data
 
 
 class ConnectError(Exception):
@@ -25,13 +32,15 @@ class ConnectError(Exception):
 
 def server_spec():
     """What every AI tool runs: the packaged Alfred.exe, or this install's Python with the install folder on its path
-    (Alfred isn't installed into its .venv, and the tools start the server from their own working folder)."""
+    (Alfred isn't installed into its .venv, and the tools start the server from their own working folder). Data and
+    model folders this Alfred was started with are passed on, so the server reads the same index."""
+    env = {name: os.environ[name] for name in PASSED_ENV if os.environ.get(name)}
     exe = sys.executable
     if getattr(sys, 'frozen', False):
-        return {'command': exe, 'args': ['--mcp'], 'env': {}}
+        return {'command': exe, 'args': ['--mcp'], 'env': env}
     quiet = Path(exe).with_name('pythonw.exe')  # no console window for tools that don't hide one
     folder = str(Path(__file__).resolve().parent.parent)
-    return {'command': str(quiet if quiet.is_file() else exe), 'args': ['-m', 'alfred', '--mcp'], 'env': {'PYTHONPATH': folder}}
+    return {'command': str(quiet if quiet.is_file() else exe), 'args': ['-m', 'alfred', '--mcp'], 'env': dict(env, PYTHONPATH=folder)}
 
 
 def other_tool_json():
@@ -41,7 +50,7 @@ def other_tool_json():
 
 def _same(entry, spec):
     return (isinstance(entry, dict) and entry.get('command') == spec['command'] and list(entry.get('args') or []) == spec['args']
-            and dict(entry.get('env') or {}) == spec['env'])
+            and {str(k): str(v) for k, v in (entry.get('env') or {}).items()} == spec['env'])
 
 
 def _run(args, cwd=None):
@@ -53,6 +62,55 @@ def _run(args, cwd=None):
     return out.returncode, (out.stderr or out.stdout or '').strip()
 
 
+def _kill_tree(process):
+    """Stop a process and what it started: a venv's python.exe is a launcher that runs the real interpreter as a child."""
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/T', '/F', '/PID', str(process.pid)], capture_output=True, timeout=30, **hidden())
+    process.kill()
+    try:
+        process.communicate(timeout=10)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+
+
+def check_server(entry, timeout=CHECK_TIMEOUT):
+    """Start the server as an AI tool would (``entry``: command, args, env) and run the MCP handshake. Raises
+    ConnectError with the reason when it doesn't answer as Alfred."""
+    command = entry.get('command')
+    if not command or not Path(command).is_file():
+        raise ConnectError(f'The program it runs is missing: {command}')
+    env = dict(os.environ, **{str(k): str(v) for k, v in (entry.get('env') or {}).items()})
+    hello = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+             'params': {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'alfred-setup-check', 'version': '1'}}}
+    listing = {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}
+    # Not the install folder: tools start it from their own. A process left behind may still hold the folder, so its
+    # clean-up never fails the check.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        try:
+            process = subprocess.Popen([command] + [str(a) for a in entry.get('args') or []], cwd=folder, env=env, stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, **hidden())
+        except OSError as error:
+            raise ConnectError(f'The server did not start: {error}') from error
+        try:
+            out, err = process.communicate((json.dumps(hello) + '\n' + json.dumps(listing) + '\n').encode('utf-8'), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(process)
+            raise ConnectError(f'The server did not answer within {timeout} s') from None
+    replies = {}
+    for line in out.decode('utf-8', 'replace').splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(message, dict) and 'id' in message:
+            replies[message['id']] = message
+    info = ((replies.get(1) or {}).get('result') or {}).get('serverInfo') or {}
+    tools = [t.get('name') for t in ((replies.get(2) or {}).get('result') or {}).get('tools') or []]
+    if info.get('name') != NAME or 'search_files' not in tools:
+        reason = err.decode('utf-8', 'replace').strip().splitlines()
+        raise ConnectError('The server did not start: ' + (reason[-1] if reason else f'exit code {process.returncode}'))
+
+
 class Tool:
     id = name = ''
 
@@ -60,7 +118,7 @@ class Tool:
         raise NotImplementedError
 
     def entry(self):
-        """Alfred's current entry in this tool, or None."""
+        """Alfred's current entry in this tool ({command, args, env}), or None."""
         raise NotImplementedError
 
     def status(self):
@@ -71,8 +129,16 @@ class Tool:
             return {'state': 'connected', 'detail': 'Connected'}
         return {'state': 'outdated', 'detail': 'Added, but for another Alfred or an older setup: update it'}
 
-    def connect(self):
+    def add(self):
         raise NotImplementedError
+
+    def connect(self):
+        """Add (or replace) Alfred's entry, then check that the tool can start the server as it is now configured."""
+        self.add()
+        entry = self.entry()
+        if entry is None:
+            raise ConnectError(f'{self.name} did not keep the entry')
+        check_server(entry)
 
     def disconnect(self):
         raise NotImplementedError
@@ -80,8 +146,9 @@ class Tool:
 
 # ------------------------------------------------------------------ tools with an `mcp add` command
 class ClaudeCode(Tool):
+    """Claude Code keeps servers for every folder (user scope) in ~/.claude.json ($CLAUDE_CONFIG_DIR/.claude.json),
+    and per-folder (local scope) ones in the same file under "projects"; a per-folder entry wins in its folder."""
     id, name = 'claude_code', 'Claude Code'
-    config = Path.home() / '.claude.json'
 
     def exe(self):
         from .providers import find_claude
@@ -90,11 +157,16 @@ class ClaudeCode(Tool):
     def found(self):
         return bool(self.exe())
 
+    def config(self):
+        folder = os.environ.get('CLAUDE_CONFIG_DIR')
+        return Path(folder) / '.claude.json' if folder else Path.home() / '.claude.json'
+
     def _config(self):
         try:
-            return json.loads(self.config.read_text(encoding='utf-8'))
+            data = json.loads(self.config().read_text(encoding='utf-8'))
         except (OSError, ValueError):
             return {}
+        return data if isinstance(data, dict) else {}
 
     def entry(self):
         return (self._config().get('mcpServers') or {}).get(NAME)
@@ -118,7 +190,7 @@ class ClaudeCode(Tool):
             if Path(folder).is_dir():
                 _run([exe, 'mcp', 'remove', NAME, '-s', 'local'], cwd=folder)
 
-    def connect(self):
+    def add(self):
         exe = self.exe()
         if not exe:
             raise ConnectError('Claude Code wasn’t found')
@@ -136,8 +208,8 @@ class ClaudeCode(Tool):
 
 
 class Codex(Tool):
+    """Codex keeps servers in ~/.codex/config.toml ($CODEX_HOME/config.toml) under [mcp_servers.<name>]."""
     id, name = 'codex', 'Codex'
-    config = Path.home() / '.codex' / 'config.toml'
 
     def exe(self):
         from .providers import find_codex
@@ -146,14 +218,18 @@ class Codex(Tool):
     def found(self):
         return bool(self.exe())
 
+    def config(self):
+        folder = os.environ.get('CODEX_HOME')
+        return (Path(folder) if folder else Path.home() / '.codex') / 'config.toml'
+
     def entry(self):
         try:
-            with open(self.config, 'rb') as file:
+            with open(self.config(), 'rb') as file:
                 return (tomllib.load(file).get('mcp_servers') or {}).get(NAME)
         except (OSError, tomllib.TOMLDecodeError):
             return None
 
-    def connect(self):
+    def add(self):
         exe = self.exe()
         if not exe:
             raise ConnectError('Codex wasn’t found')
@@ -188,10 +264,14 @@ class JsonTool(Tool):
 
     def _load(self):
         path = self.path()
-        if not path.is_file() or not path.read_text(encoding='utf-8-sig').strip():
+        try:
+            text = path.read_text(encoding='utf-8-sig') if path.is_file() else ''
+        except OSError as error:
+            raise ConnectError(f'Couldn’t read {path.name}: {error}') from error
+        if not text.strip():
             return {}
         try:
-            data = json.loads(path.read_text(encoding='utf-8-sig'))
+            data = json.loads(text)
         except ValueError as error:
             raise ConnectError(f'{path.name} isn’t plain JSON (comments?), so Alfred leaves it alone. '
                                'Add the entry by hand: Copy, under Any other tool.') from error
@@ -201,14 +281,17 @@ class JsonTool(Tool):
 
     def _save(self, data):
         path = self.path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.is_file():
-            backup = path.with_name(path.name + '.before-alfred')
-            if not backup.exists():
-                backup.write_bytes(path.read_bytes())
-        temp = path.with_name(path.name + '.alfred-tmp')
-        temp.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
-        os.replace(temp, path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_file():
+                backup = path.with_name(path.name + '.before-alfred')
+                if not backup.exists():
+                    backup.write_bytes(path.read_bytes())
+            temp = path.with_name(path.name + '.alfred-tmp')
+            temp.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+            os.replace(temp, path)
+        except OSError as error:
+            raise ConnectError(f'Couldn’t write {path.name}: {error}') from error
 
     def entry(self):
         try:
@@ -217,7 +300,7 @@ class JsonTool(Tool):
             return None
         return servers.get(NAME) if isinstance(servers, dict) else None
 
-    def connect(self):
+    def add(self):
         data = self._load()
         servers = data.get(self.key)
         if not isinstance(servers, dict):
@@ -250,8 +333,8 @@ class ClaudeDesktop(JsonTool):
     def _folders(self):
         """Candidate data folders, most likely first; folders the app has moved out of are left out."""
         data = _localappdata() / 'Claude-Data'
-        moved = sorted((p for p in data.glob('*') if (p / self.FILE).is_file()), key=lambda p: (p / self.FILE).stat().st_mtime,
-                       reverse=True) if data.is_dir() else []
+        moved = [p for p in data.iterdir() if p.is_dir()] if data.is_dir() else []
+        moved.sort(key=lambda p: (p / self.FILE).stat().st_mtime if (p / self.FILE).is_file() else 0, reverse=True)
         packages = _localappdata() / 'Packages'
         packaged = [p / 'LocalCache' / 'Roaming' / 'Claude' for p in packages.glob('Claude_*')] if packages.is_dir() else []
         older = [folder for folder in packaged + [_appdata() / 'Claude'] if folder.is_dir() and not any(folder.glob('.user-data-left*'))]
@@ -276,11 +359,16 @@ class Cursor(JsonTool):
 
 
 class VSCode(JsonTool):
-    id, name = 'vscode', 'VS Code (Copilot)'
+    """VS Code's user-level MCP servers: <user folder>\\mcp.json, under "servers"."""
+    id, name, folder = 'vscode', 'VS Code (Copilot)', 'Code'
     key, extra = 'servers', {'type': 'stdio'}
 
     def path(self):
-        return _appdata() / 'Code' / 'User' / 'mcp.json'
+        return _appdata() / self.folder / 'User' / 'mcp.json'
+
+
+class VSCodeInsiders(VSCode):
+    id, name, folder = 'vscode_insiders', 'VS Code Insiders', 'Code - Insiders'
 
 
 class Windsurf(JsonTool):
@@ -296,11 +384,11 @@ class GeminiCLI(JsonTool):
     def path(self):
         return Path.home() / '.gemini' / 'settings.json'
 
-    def found(self):
-        return self.path().is_file()
+    def found(self):  # ~/.gemini alone is shared with other Google tools
+        return self.path().is_file() or bool(shutil.which('gemini')) or (_appdata() / 'npm' / 'gemini.cmd').is_file()
 
 
-TOOLS = [ClaudeCode(), Codex(), ClaudeDesktop(), Cursor(), VSCode(), Windsurf(), GeminiCLI()]
+TOOLS = [ClaudeCode(), Codex(), ClaudeDesktop(), Cursor(), VSCode(), VSCodeInsiders(), Windsurf(), GeminiCLI()]
 
 
 def found_tools():

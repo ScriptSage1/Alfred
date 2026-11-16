@@ -56,9 +56,10 @@ A folder build that needs no Python is made with `packaging\build.cmd` (see `pac
 ## Connect AI tools (MCP)
 
 Open **Settings → AI tools** and click **Connect** next to your tool. Alfred finds Claude Code, Codex, Claude Desktop,
-Cursor, VS Code (Copilot), Windsurf and Gemini CLI, and adds itself through the tool's own `mcp add` command or its MCP
-settings file (only Alfred's entry is changed; a file with comments is left alone). Restart the tool if it is open.
-For any other MCP tool, **Copy** gives the entry to paste:
+Cursor, VS Code / VS Code Insiders (Copilot), Windsurf and Gemini CLI, and adds itself through the tool's own `mcp add`
+command or its MCP settings file (only Alfred's entry is changed, the original file is kept as `*.before-alfred`, and a
+file with comments is left alone). It then starts the server exactly as the tool will and checks that it answers.
+Restart the tool if it is open. For any other MCP tool, **Copy** gives the entry to paste:
 
 ```json
 { "mcpServers": { "alfred": {

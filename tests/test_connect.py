@@ -1,11 +1,15 @@
 """Adding Alfred's MCP server to AI tools (alfred/connect.py), without touching any real tool's settings."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from alfred import connect
+
+REPO = str(Path(connect.__file__).resolve().parent.parent)
+CLEAN_ENV = {name: '' for name in connect.PASSED_ENV}
 
 
 class FakeJsonTool(connect.JsonTool):
@@ -20,20 +24,80 @@ class FakeJsonTool(connect.JsonTool):
 
 class ServerSpecTest(unittest.TestCase):
     def test_source_install_puts_its_folder_on_the_path(self):
-        spec = connect.server_spec()
-        repo = str(Path(connect.__file__).resolve().parent.parent)
+        with mock.patch.dict(os.environ, CLEAN_ENV):
+            spec = connect.server_spec()
         self.assertEqual(spec['args'], ['-m', 'alfred', '--mcp'])
-        self.assertEqual(spec['env'], {'PYTHONPATH': repo})  # tools start it from their own folder
+        self.assertEqual(spec['env'], {'PYTHONPATH': REPO})  # tools start it from their own folder
         self.assertTrue(Path(spec['command']).is_file())
-        self.assertEqual(json.loads(connect.other_tool_json())['mcpServers']['alfred'], spec)
+        self.assertEqual(Path(spec['command']).name.lower(), 'pythonw.exe')  # no console window
+        with mock.patch.dict(os.environ, CLEAN_ENV):
+            self.assertEqual(json.loads(connect.other_tool_json())['mcpServers']['alfred'], connect.server_spec())
+
+    def test_this_alfreds_data_and_model_folders_are_passed_on(self):
+        with mock.patch.dict(os.environ, dict(CLEAN_ENV, ALFRED_HOME=r'D:\AlfredData', ALFRED_MODELS_DIR=r'E:\models')):
+            env = connect.server_spec()['env']
+        self.assertEqual(env, {'ALFRED_HOME': r'D:\AlfredData', 'ALFRED_MODELS_DIR': r'E:\models', 'PYTHONPATH': REPO})
+
+    def test_packaged_build_runs_itself(self):
+        with mock.patch.object(connect.sys, 'frozen', True, create=True), \
+                mock.patch.object(connect.sys, 'executable', r'C:\Program Files\Alfred\Alfred.exe'), \
+                mock.patch.dict(os.environ, CLEAN_ENV):
+            self.assertEqual(connect.server_spec(), {'command': r'C:\Program Files\Alfred\Alfred.exe', 'args': ['--mcp'], 'env': {}})
+
+
+class CheckServerTest(unittest.TestCase):
+    """Starts the real server, from an unrelated folder, as an AI tool would."""
+
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, dict(CLEAN_ENV, ALFRED_HOME=self.home.name))
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.home.cleanup()
+
+    def test_the_entry_alfred_writes_starts(self):
+        connect.check_server(connect.server_spec())
+
+    def test_without_the_install_folder_it_fails_and_says_why(self):
+        spec = connect.server_spec()
+        spec['env'] = {k: v for k, v in spec['env'].items() if k != 'PYTHONPATH'}  # the old copied command
+        with self.assertRaisesRegex(connect.ConnectError, 'No module named alfred'):
+            connect.check_server(spec)
+
+    def test_a_server_that_never_answers_times_out_and_is_stopped(self):
+        import subprocess
+        import sys
+        marker = 'alfred-check-hang-' + str(os.getpid())
+        entry = {'command': sys.executable, 'args': ['-c', f'import time  # {marker}\ntime.sleep(120)'], 'env': {}}
+        with self.assertRaisesRegex(connect.ConnectError, 'did not answer'):
+            connect.check_server(entry, timeout=3)
+        left = subprocess.run(['powershell', '-NoProfile', '-Command',
+                               f"@(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{marker}*' -and "
+                               "$_.Name -notlike 'powershell*' }).Count"],  # not this query itself
+                              capture_output=True, text=True).stdout.strip()
+        self.assertEqual(left, '0')  # the launcher and the interpreter it started
+
+    def test_a_program_that_is_not_alfreds_server_is_rejected(self):
+        import sys
+        with self.assertRaisesRegex(connect.ConnectError, 'did not start'):
+            connect.check_server({'command': sys.executable, 'args': ['-c', 'print("hello")'], 'env': {}})
+
+    def test_a_missing_program_is_reported(self):
+        with self.assertRaisesRegex(connect.ConnectError, 'missing'):
+            connect.check_server({'command': r'C:\nowhere\python.exe', 'args': [], 'env': {}})
 
 
 class JsonToolTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.path = Path(self.dir.name) / 'mcp.json'
+        self.check = mock.patch.object(connect, 'check_server')
+        self.checked = self.check.start()
 
     def tearDown(self):
+        self.check.stop()
         self.dir.cleanup()
 
     def test_connect_keeps_other_servers_and_settings(self):
@@ -45,6 +109,7 @@ class JsonToolTest(unittest.TestCase):
         self.assertEqual(data['theme'], 'dark')
         self.assertEqual(data['mcpServers']['other'], {'command': 'x'})
         self.assertEqual(data['mcpServers']['alfred'], connect.server_spec())
+        self.checked.assert_called_once_with(data['mcpServers']['alfred'])  # what the tool will run is what gets checked
         self.assertEqual(tool.status()['state'], 'connected')
         self.assertTrue((Path(self.dir.name) / 'mcp.json.before-alfred').is_file())  # the original, once
         tool.disconnect()
@@ -59,6 +124,12 @@ class JsonToolTest(unittest.TestCase):
         self.assertEqual(entry['type'], 'stdio')
         self.assertEqual(tool.status()['state'], 'connected')
 
+    def test_a_file_with_a_bom_is_read(self):
+        self.path.write_bytes(b'\xef\xbb\xbf' + json.dumps({'mcpServers': {}}).encode('utf-8'))
+        tool = FakeJsonTool(self.path)
+        tool.connect()
+        self.assertEqual(tool.status()['state'], 'connected')
+
     def test_an_old_entry_is_offered_as_an_update(self):
         self.path.write_text(json.dumps({'mcpServers': {'alfred': {'command': 'old.exe', 'args': ['--mcp']}}}), encoding='utf-8')
         self.assertEqual(FakeJsonTool(self.path).status()['state'], 'outdated')
@@ -69,38 +140,68 @@ class JsonToolTest(unittest.TestCase):
         with self.assertRaises(connect.ConnectError):
             FakeJsonTool(self.path).connect()
         self.assertEqual(self.path.read_text(encoding='utf-8'), text)
+        self.checked.assert_not_called()
+
+    def test_a_failed_check_is_reported(self):
+        self.checked.side_effect = connect.ConnectError('The server did not start: boom')
+        with self.assertRaisesRegex(connect.ConnectError, 'boom'):
+            FakeJsonTool(self.path).connect()
 
 
-class ClaudeDesktopTest(unittest.TestCase):
-    def test_uses_the_folder_the_app_moved_to(self):
-        with tempfile.TemporaryDirectory() as root:
-            local, roaming = Path(root, 'Local'), Path(root, 'Roaming')
-            moved = local / 'Claude-Data' / 'claude_pkg'
-            moved.mkdir(parents=True)
-            (moved / 'claude_desktop_config.json').write_text('{"preferences": {"x": 1}}', encoding='utf-8')
-            (roaming / 'Claude').mkdir(parents=True)
-            (roaming / 'Claude' / '.user-data-left.claude_pkg').write_text('', encoding='utf-8')
-            with mock.patch.dict('os.environ', {'LOCALAPPDATA': str(local), 'APPDATA': str(roaming)}):
-                tool = connect.ClaudeDesktop()
-                self.assertTrue(tool.found())
-                self.assertEqual(tool.path(), moved / 'claude_desktop_config.json')
-                tool.connect()
-                data = json.loads((moved / 'claude_desktop_config.json').read_text(encoding='utf-8'))
-                self.assertEqual(data['preferences'], {'x': 1})
-                self.assertIn('alfred', data['mcpServers'])
-                self.assertFalse((roaming / 'Claude' / 'claude_desktop_config.json').exists())
+class ToolLocationTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.dir.name)
+        self.local, self.roaming = self.root / 'Local', self.root / 'Roaming'
+        self.env = mock.patch.dict(os.environ, {'LOCALAPPDATA': str(self.local), 'APPDATA': str(self.roaming)})
+        self.env.start()
 
-    def test_older_builds_use_appdata(self):
-        with tempfile.TemporaryDirectory() as root:
-            local, roaming = Path(root, 'Local'), Path(root, 'Roaming')
-            (roaming / 'Claude').mkdir(parents=True)
-            with mock.patch.dict('os.environ', {'LOCALAPPDATA': str(local), 'APPDATA': str(roaming)}):
-                self.assertEqual(connect.ClaudeDesktop().path(), roaming / 'Claude' / 'claude_desktop_config.json')
+    def tearDown(self):
+        self.env.stop()
+        self.dir.cleanup()
 
-    def test_not_installed(self):
-        with tempfile.TemporaryDirectory() as root:
-            with mock.patch.dict('os.environ', {'LOCALAPPDATA': str(Path(root, 'L')), 'APPDATA': str(Path(root, 'R'))}):
-                self.assertFalse(connect.ClaudeDesktop().found())
+    def test_claude_desktop_uses_the_folder_the_app_moved_to(self):
+        moved = self.local / 'Claude-Data' / 'claude_pkg'
+        moved.mkdir(parents=True)
+        (moved / 'claude_desktop_config.json').write_text('{"preferences": {"x": 1}}', encoding='utf-8')
+        (self.roaming / 'Claude').mkdir(parents=True)
+        (self.roaming / 'Claude' / '.user-data-left.claude_pkg').write_text('', encoding='utf-8')
+        tool = connect.ClaudeDesktop()
+        self.assertTrue(tool.found())
+        self.assertEqual(tool.path(), moved / 'claude_desktop_config.json')
+        with mock.patch.object(connect, 'check_server'):
+            tool.connect()
+        data = json.loads((moved / 'claude_desktop_config.json').read_text(encoding='utf-8'))
+        self.assertEqual(data['preferences'], {'x': 1})
+        self.assertIn('alfred', data['mcpServers'])
+        self.assertFalse((self.roaming / 'Claude' / 'claude_desktop_config.json').exists())
+
+    def test_claude_desktop_fresh_data_folder_without_a_config_yet(self):
+        (self.local / 'Claude-Data' / 'claude_pkg').mkdir(parents=True)
+        self.assertEqual(connect.ClaudeDesktop().path(), self.local / 'Claude-Data' / 'claude_pkg' / 'claude_desktop_config.json')
+
+    def test_claude_desktop_older_builds_use_appdata(self):
+        (self.roaming / 'Claude').mkdir(parents=True)
+        self.assertEqual(connect.ClaudeDesktop().path(), self.roaming / 'Claude' / 'claude_desktop_config.json')
+
+    def test_claude_desktop_not_installed(self):
+        self.assertFalse(connect.ClaudeDesktop().found())
+
+    def test_vscode_and_insiders(self):
+        (self.roaming / 'Code - Insiders' / 'User').mkdir(parents=True)
+        self.assertFalse(connect.VSCode().found())
+        self.assertTrue(connect.VSCodeInsiders().found())
+        self.assertEqual(connect.VSCodeInsiders().path(), self.roaming / 'Code - Insiders' / 'User' / 'mcp.json')
+
+    def test_claude_code_and_codex_follow_their_config_folder_settings(self):
+        claude_dir, codex_dir = self.root / 'cc', self.root / 'cx'
+        claude_dir.mkdir()
+        codex_dir.mkdir()
+        (claude_dir / '.claude.json').write_text(json.dumps({'mcpServers': {'alfred': {'command': 'a'}}}), encoding='utf-8')
+        (codex_dir / 'config.toml').write_text('[mcp_servers.alfred]\ncommand = "b"\nargs = []\n', encoding='utf-8')
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(claude_dir), 'CODEX_HOME': str(codex_dir)}):
+            self.assertEqual(connect.ClaudeCode().entry(), {'command': 'a'})
+            self.assertEqual(connect.Codex().entry()['command'], 'b')
 
 
 class CliToolTest(unittest.TestCase):
@@ -111,28 +212,33 @@ class CliToolTest(unittest.TestCase):
                 mock.patch.object(connect.ClaudeCode, 'exe', return_value='claude.exe'), \
                 mock.patch.object(connect.ClaudeCode, 'folder_entries', return_value=[folder]), \
                 mock.patch.object(connect, '_run', side_effect=lambda args, cwd=None: calls.append((args, cwd)) or (0, '')):
-            tool.connect()
+            tool.add()
         spec = connect.server_spec()
+        env = [part for key, value in spec['env'].items() for part in ('-e', f'{key}={value}')]
         self.assertEqual(calls[0][0], ['claude.exe', 'mcp', 'remove', 'alfred', '-s', 'user'])
         self.assertEqual(calls[1], (['claude.exe', 'mcp', 'remove', 'alfred', '-s', 'local'], folder))
-        self.assertEqual(calls[2][0], ['claude.exe', 'mcp', 'add', 'alfred', '-s', 'user', '-e', f"PYTHONPATH={spec['env']['PYTHONPATH']}",
-                                       '--', spec['command'], '-m', 'alfred', '--mcp'])
+        self.assertEqual(calls[2][0], ['claude.exe', 'mcp', 'add', 'alfred', '-s', 'user'] + env + ['--', spec['command'], '-m', 'alfred', '--mcp'])
 
     def test_codex_add(self):
         calls = []
         with mock.patch.object(connect.Codex, 'exe', return_value='codex.exe'), \
                 mock.patch.object(connect.Codex, 'entry', return_value=None), \
                 mock.patch.object(connect, '_run', side_effect=lambda args, cwd=None: calls.append(args) or (0, '')):
-            connect.Codex().connect()
+            connect.Codex().add()
         spec = connect.server_spec()
-        self.assertEqual(calls, [['codex.exe', 'mcp', 'add', 'alfred', '--env', f"PYTHONPATH={spec['env']['PYTHONPATH']}",
-                                  '--', spec['command'], '-m', 'alfred', '--mcp']])
+        env = [part for key, value in spec['env'].items() for part in ('--env', f'{key}={value}')]
+        self.assertEqual(calls, [['codex.exe', 'mcp', 'add', 'alfred'] + env + ['--', spec['command'], '-m', 'alfred', '--mcp']])
 
     def test_a_failed_add_is_reported(self):
         with mock.patch.object(connect.Codex, 'exe', return_value='codex.exe'), \
                 mock.patch.object(connect.Codex, 'entry', return_value=None), \
                 mock.patch.object(connect, '_run', return_value=(1, 'boom')):
             with self.assertRaisesRegex(connect.ConnectError, 'boom'):
+                connect.Codex().connect()
+
+    def test_connect_fails_when_the_tool_did_not_keep_the_entry(self):
+        with mock.patch.object(connect.Codex, 'add'), mock.patch.object(connect.Codex, 'entry', return_value=None):
+            with self.assertRaisesRegex(connect.ConnectError, 'did not keep'):
                 connect.Codex().connect()
 
 

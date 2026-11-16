@@ -1,4 +1,5 @@
 """UI smoke tests: the main window builds and searches run, headless (QT_QPA_PLATFORM=offscreen, temp folders only)."""
+import json
 import os
 import sys
 import tempfile
@@ -75,6 +76,29 @@ class SearchViewTests(unittest.TestCase):
         [remove] = [b for b in holder.findChildren(ui.QPushButton) if b.text() == 'Remove']
         remove.click()
         self.assertEqual(mcp_server.list_clients(home), [])
+
+    def test_connect_button_connects_and_removes_a_tool(self):
+        from alfred import connect
+        view = self.win.settings_view
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / '.cursor' / 'mcp.json'
+            path.parent.mkdir()
+            with mock.patch.object(connect.Cursor, 'path', lambda self: path), mock.patch.object(connect, 'check_server') as check:
+                view.show_other_tools()
+                row = view.mcp_tool_rows['cursor']
+                self.assertFalse(row.isHidden())
+                self.assertEqual((row.action.text(), row.caption.text()), ('Connect', 'Not connected'))
+                row.action.click()
+                QThreadPool.globalInstance().waitForDone(10000)
+                QApplication.processEvents()
+                self.assertEqual((row.action.text(), row.caption.text()), ('Remove', 'Connected'))
+                self.assertIn('alfred', json.loads(path.read_text(encoding='utf-8'))['mcpServers'])
+                check.assert_called_once()
+                row.action.click()
+                QThreadPool.globalInstance().waitForDone(10000)
+                QApplication.processEvents()
+                self.assertEqual(row.action.text(), 'Connect')
+                self.assertNotIn('alfred', json.loads(path.read_text(encoding='utf-8'))['mcpServers'])
 
     def test_window_builds_and_search_lists_results(self):
         self.search('harbour pilot')
