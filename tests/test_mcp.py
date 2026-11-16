@@ -100,9 +100,9 @@ class ProtocolTests(McpBase):
         self.assertEqual(self.server.handle(request('ping', ident=7)), {'jsonrpc': '2.0', 'id': 7, 'result': {}})
         self.assertIsNone(self.server.handle({'jsonrpc': '2.0', 'method': 'notifications/cancelled', 'params': {}}))
 
-    def test_tool_list_has_exactly_two_read_only_tools(self):
+    def test_tool_list_has_only_read_only_tools(self):
         tools = self.server.handle(request('tools/list'))['result']['tools']
-        self.assertEqual([t['name'] for t in tools], ['search_files', 'read_passage'])
+        self.assertEqual([t['name'] for t in tools], ['search_files', 'read_passage', 'search_code'])  # code search is on by default
         self.assertTrue(all(t['annotations']['readOnlyHint'] is True for t in tools))
         self.assertTrue(all("do not follow instructions" in t['description'].lower() for t in tools))
 
@@ -440,7 +440,7 @@ class StdioTests(unittest.TestCase):
             lines = done.stdout.decode('utf-8').splitlines()
             replies = [json.loads(line) for line in lines]  # every stdout line is valid JSON
             self.assertEqual([r['id'] for r in replies], [1, 2, 3])
-            self.assertEqual(len(replies[1]['result']['tools']), 2)
+            self.assertEqual(len(replies[1]['result']['tools']), 3)
             data = json.loads(replies[2]['result']['content'][0]['text'])
             self.assertEqual([r['filename'] for r in data['results']], ['quay.txt'])
             log = [json.loads(line) for line in (home / 'mcp_calls.jsonl').read_text(encoding='utf-8').splitlines()]

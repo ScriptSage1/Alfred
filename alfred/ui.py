@@ -49,6 +49,7 @@ LAYERS = ('names', 'text', 'meaning', 'pictures')  # the index's layers, in the 
 PHASE_LABELS = {'scanning': 'Looking for files', 'names': 'Listing files', 'indexing': 'Reading', 'embedding': 'Learning meaning',
                 'reading pictures': 'Reading pictures', 'embedding pictures': 'Learning pictures', 'reading video': 'Reading video',
                 'reading tables': 'Reading tables', 'adding context': 'Adding context',
+                'reading code': 'Reading code', 'learning code': 'Learning code',
                 'done': 'Finishing'}
 BATTERY_TEXT = 'Paused on battery — names and text are searchable'
 
@@ -2740,7 +2741,7 @@ class TrackedFolders(QWidget):
                     row.set_status(f"Reading video {state.get('frame', 0)}/{state.get('frames', 0)}", 'accent')
                 elif phase == 'reading tables':
                     row.set_status(f"Reading tables in PDFs {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
-                elif phase in ('names', 'reading pictures', 'embedding pictures', 'adding context'):
+                elif phase in ('names', 'reading pictures', 'embedding pictures', 'adding context', 'reading code', 'learning code'):
                     row.set_status(f"{phase_label(phase)} {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
                 else:
                     row.set_status(f"Indexing {min(state.get('done', 0) + 1, state.get('total', 0))} of {state.get('total', 0)}", 'accent')
@@ -2755,7 +2756,8 @@ class TrackedFolders(QWidget):
         if self.win.indexing:
             phase = (state or {}).get('phase')
             text = (f"{phase_label(phase)} {state.get('done', 0)}/{state.get('total', 0)}"
-                    if phase in ('embedding', 'names', 'reading pictures', 'embedding pictures', 'adding context') else 'Indexing…')
+                    if phase in ('embedding', 'names', 'reading pictures', 'embedding pictures', 'adding context', 'reading code',
+                                 'learning code') else 'Indexing…')
             layers = layers_text(self.win.layers, unfinished_only=True)
             self.summary.setText(f"<span style='color:{self.win.pal['accent'].name()}'>●</span>&nbsp; {text}" + (f' · {layers}' if layers else ''))
         else:
@@ -2948,6 +2950,9 @@ class SettingsView(QWidget):
         g.row('Read text in pictures and videos', self.ocr_enabled, 'Photos, screenshots, scanned pages and video frames')
         self.picture_search = Toggle(pal)
         self.picture_row = g.row('Find pictures by what they show', self.picture_search, '')
+        self.code_search = Toggle(pal)
+        g.row('Search code', self.code_search, 'For AI tools such as Claude Code and Codex: code in your folders, found by what it '
+              'does, by name and by what calls it')
         self.embed_enabled.toggled.connect(lambda _: self.show_pictures())
 
         # ------------------------------------------------------- Ask Alfred
@@ -3107,7 +3112,8 @@ class SettingsView(QWidget):
         self.video_interval.valueChanged.connect(lambda _: self.save_timer.start(800))
         self.keep_minutes.currentIndexChanged.connect(lambda _: self.save_timer.start(250))
         for toggle in (self.embed_enabled, self.ocr_enabled, self.reduce_motion, self.auto_index, self.search_on_gpu, self.save_chats,
-                       self.beyond, self.rerank_enabled, self.see_through, self.index_on_battery, self.picture_search):
+                       self.beyond, self.rerank_enabled, self.see_through, self.index_on_battery, self.picture_search,
+                       self.code_search):
             toggle.toggled.connect(lambda _: self.save_timer.start(250))
         self.rerank_model.currentIndexChanged.connect(lambda _: (self.save_timer.start(250), self.show_rerank()))
         self.loading = False
@@ -3172,6 +3178,7 @@ class SettingsView(QWidget):
         self.search_on_gpu.setChecked(bool(s.get('search_on_gpu')))
         self.ocr_enabled.setChecked(bool(s.get('ocr_enabled', True)))
         self.picture_search.setChecked(bool(s.get('picture_search', True)))
+        self.code_search.setChecked(bool(s.get('code_search', True)))
         self.video_interval.setValue(int(s.get('video_interval') or 10))
         self.save_chats.setChecked(bool(s.get('save_chat_history', True)))
         self.theme.setCurrentIndex({'system': 0, 'dark': 1, 'light': 2}.get(s.get('theme'), 0))
@@ -3793,7 +3800,8 @@ class SettingsView(QWidget):
         if self.loading:
             return
         s = self.win.settings
-        before = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('picture_search', True), s.get('video_interval'), s.get('contextual_chunks'))
+        before = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('picture_search', True), s.get('video_interval'), s.get('contextual_chunks'),
+                  s.get('code_search', True))
         before_model = (s.get('provider'), s.get('model'))
         before_search = s.get('search_on_gpu')
         before_glass = bool(s.get('see_through', True))
@@ -3804,6 +3812,7 @@ class SettingsView(QWidget):
                   'embed_enabled': self.embed_enabled.isChecked(), 'search_on_gpu': self.search_on_gpu.isChecked(),
                   'embed_device': 'cpu' if self.embed_device.currentIndex() else 'auto',
                   'ocr_enabled': self.ocr_enabled.isChecked(), 'picture_search': self.picture_search.isChecked(),
+                  'code_search': self.code_search.isChecked(),
                   'index_on_battery': self.index_on_battery.isChecked(),
                   'video_interval': self.video_interval.value(), 'theme': ['system', 'dark', 'light'][self.theme.currentIndex()],
                   'reduce_motion': self.reduce_motion.isChecked(), 'auto_index': self.auto_index.isChecked(),
@@ -3824,7 +3833,8 @@ class SettingsView(QWidget):
             self.show_location()
         if s.get('search_on_gpu') != before_search:
             ai.runtime.stop('search', s)  # this process's search server restarts on its new device at the next search
-        after = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('picture_search', True), s.get('video_interval'), s.get('contextual_chunks'))
+        after = (s.get('embed_enabled'), s.get('ocr_enabled'), s.get('picture_search', True), s.get('video_interval'), s.get('contextual_chunks'),
+                 s.get('code_search', True))
         if after != before:
             self.win.toast('Saved · updating your index', 'green', seconds=4)
             self.win.start_index(quiet=True)

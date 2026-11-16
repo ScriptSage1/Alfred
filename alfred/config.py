@@ -53,6 +53,8 @@ DEFAULTS = {
     'video_interval': 10,        # seconds between sampled video frames
     # Pictures, video keyframes and scanned PDF pages are found by what they show (the embedding model's picture vectors).
     'picture_search': True,
+    # Code search for AI tools (MCP search_code): code files in tracked folders, by meaning, name and callers (code.sqlite).
+    'code_search': True,
     # Indexing
     'index_threads': 0,          # CPU threads indexing may use; 0 = all but two (a quarter in the background)
     'index_on_battery': False,   # background indexing past the text layer also runs on battery
@@ -170,6 +172,10 @@ class Settings(dict):
     @property
     def db_path(self):
         return self.home / 'index.sqlite'
+
+    @property
+    def code_db_path(self):
+        return self.home / 'code.sqlite'
 
     @property
     def chats_folder(self):

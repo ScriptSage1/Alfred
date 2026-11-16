@@ -38,7 +38,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import ai, extract, ocr, paths, power
+from . import ai, code_search, extract, ocr, paths, power
 from .extract import IMAGE_SUFFIXES, KIND_SUFFIXES, VIDEO_SUFFIXES, location_label, video_frame_png  # noqa: F401 (re-exported for the UI)
 
 log = logging.getLogger('alfred')
@@ -756,7 +756,7 @@ class Index:
         summary = {'found': 0, 'changed': 0, 'unchanged': 0, 'skipped': 0, 'removed': 0, 'indexed': 0, 'errors': 0, 'unsupported': 0,
                    'embedded': 0, 'warnings': [], 'seconds_to_names': None, 'seconds_to_text': None,
                    'seconds_to_core': None, 'ocr_device': 'off', 'ocr_read': 0, 'pictures_embedded': 0, 'cache_hits': 0,
-                   'paused': None}
+                   'paused': None, 'code_files': 0, 'code_embedded': 0}
         run = _Run(self, con, progress, summary)
         tracked = self.roots()
         tracked_keys = {str(r) for r in tracked}
@@ -789,6 +789,8 @@ class Index:
 
         # Layer 1: names. Every new file is findable by its name, in one transaction per folder.
         todo = []
+        code_on = bool(self.settings.get('code_search', True))
+        code_files = {}  # root -> [(path, stat)] of its code files, for the code layer
         for root in roots:
             if self.cancel.is_set():
                 break
@@ -805,6 +807,8 @@ class Index:
             since, skip_all = self._skip_rule(con, root)
             skipped = {p for p, st in new if (skip_all or _file_time(st) < since) and extract.unsupported_reason(p) is None} if since is not None else set()
             self._add_names(con, root, new, summary, skipped)
+            if code_on:
+                code_files[str(root)] = [(p, st) for p, st in found if p not in skipped and code_search.is_code(p)]
             if since is not None:
                 with con:
                     con.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('since_baseline:' + str(root), repr(since)))
@@ -857,6 +861,11 @@ class Index:
                 self._core_layers(con, run, embedder, ocr_on)
             if not self._stopping():
                 summary['seconds_to_core'] = round(time.time() - started, 2)
+            # Layer: code, for AI tools (search_code). Its own database; off: the database is deleted.
+            if not code_on:
+                code_search.remove(self.settings.code_db_path)
+            elif not self._stopping():
+                self._update_code(code_files, tracked, embedder, run)
             # Layer 7: enrichment, timed separately.
             writer = ai.Contextualizer.from_settings(self.settings)
             if writer is not None and not self._stopping():
@@ -898,6 +907,32 @@ class Index:
         # PDFs are searchable by now (their text was read quickly); their tables are read row by row last.
         if not self._stopping() and self._read_pdf_tables(con, ocr_on, run.emit, summary) and embedder is not None:
             summary['embedded'] += self._embed_missing(con, embedder, run.quiet('reading tables'), summary)
+
+    def _update_code(self, files, tracked, embedder, run):
+        """The code layer: chunks and keyword rows for changed code files of the scanned folders, files of untracked
+        folders dropped, then vectors for new chunks. A failure here never stops the rest of indexing."""
+        summary = run.summary
+        index = None
+        try:
+            index = code_search.CodeIndex(self.settings.code_db_path)
+            index.keep_roots(str(r) for r in tracked)
+            total = sum(len(v) for v in files.values())
+            run.emit({'phase': 'reading code', 'done': 0, 'total': total})
+            for root, found in files.items():
+                if self._stopping():
+                    return
+                index.update_root(root, found, self._stopping)
+            summary['code_files'] = index.stats()['files']
+            run.emit({'phase': 'reading code', 'done': total, 'total': total})
+            if embedder is not None and not self._stopping():
+                summary['code_embedded'] = index.embed_missing(
+                    embedder, lambda done, count: run.emit({'phase': 'learning code', 'done': done, 'total': count}), self._stopping)
+        except Exception as error:  # the code layer is extra: file search must not suffer for it
+            log.warning('Code search index not updated: %s', error)
+            summary['warnings'].append(f'Code search could not be updated: {error}')
+        finally:
+            if index is not None:
+                index.close()
 
     @staticmethod
     def _needs_text(path, st, known, reread_documents):
@@ -1296,6 +1331,15 @@ class Index:
                     con.execute('DELETE FROM meta WHERE key=?', ('since_baseline:' + key,))
             finally:
                 con.close()
+            if self.settings.code_db_path.exists():
+                try:
+                    code = code_search.CodeIndex(self.settings.code_db_path)
+                    try:
+                        code.keep_roots(str(r) for r in self.roots() if str(r) != key)
+                    finally:
+                        code.close()
+                except sqlite3.Error as error:
+                    log.warning('Code search index: could not drop %s: %s', key, error)
 
     def _delete_files(self, con, files):
         if not files:

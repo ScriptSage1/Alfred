@@ -22,7 +22,8 @@
 - **Cites where.** Results point to the page, slide, sheet rows or video timestamp, and Enter opens it there when the app can.
 - **Says when it doesn't know.** Weak matches stay hidden behind "Show N weaker matches".
 - **Ask Alfred.** Answers from your documents, with citations, using a model on this PC or your Claude / ChatGPT plan.
-- **Works with AI tools.** Claude Code, Codex and other MCP clients can search your files through Alfred.
+- **Works with AI tools.** Claude Code, Codex and other MCP clients can search your files through Alfred, and the code
+  in your folders too: by what it does, by name, and by what calls it.
 
 ## Benchmark: Claude with and without Alfred
 
@@ -74,8 +75,11 @@ Restart the tool if it is open. For any other MCP tool, **Copy** gives the entry
   "env": { "PYTHONPATH": "C:\\path\\to\\Alfred" } } } }
 ```
 
-Two read-only tools: `search_files` and `read_passage` (tracked folders only). Alfred asks before a tool's first
-search, and logs every call to `mcp_calls.jsonl`.
+Read-only tools, for tracked folders only: `search_files` and `read_passage` for your files, and `search_code` for the
+code in them (Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, C# and more). `search_code` combines search by meaning,
+keywords and symbol names, and gives each match with its file, line range, snippet, and its callers and callees (Python).
+It is on by default; turn it off under Settings → Search → Search code. Alfred asks before a tool's first search, and logs
+every call to `mcp_calls.jsonl`.
 
 ## Command line
 
