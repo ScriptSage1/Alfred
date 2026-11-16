@@ -2,7 +2,7 @@
 
 Real Claude Code and Codex CLIs, pointed at empty config folders (CLAUDE_CONFIG_DIR, CODEX_HOME); JSON-config tools in
 a fake user profile (USERPROFILE, APPDATA, LOCALAPPDATA). Each connect also starts the server as the tool would.
-Run before a release: .venv\Scripts\python tests/live_connect.py   (needs Claude Code and Codex installed;
+Run before a release: .venv/Scripts/python tests/live_connect.py   (needs Claude Code and Codex installed;
 not part of the unit tests, which never start the real CLIs)
 """
 import json
