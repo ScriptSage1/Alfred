@@ -71,6 +71,38 @@ class JsonToolTest(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding='utf-8'), text)
 
 
+class ClaudeDesktopTest(unittest.TestCase):
+    def test_uses_the_folder_the_app_moved_to(self):
+        with tempfile.TemporaryDirectory() as root:
+            local, roaming = Path(root, 'Local'), Path(root, 'Roaming')
+            moved = local / 'Claude-Data' / 'claude_pkg'
+            moved.mkdir(parents=True)
+            (moved / 'claude_desktop_config.json').write_text('{"preferences": {"x": 1}}', encoding='utf-8')
+            (roaming / 'Claude').mkdir(parents=True)
+            (roaming / 'Claude' / '.user-data-left.claude_pkg').write_text('', encoding='utf-8')
+            with mock.patch.dict('os.environ', {'LOCALAPPDATA': str(local), 'APPDATA': str(roaming)}):
+                tool = connect.ClaudeDesktop()
+                self.assertTrue(tool.found())
+                self.assertEqual(tool.path(), moved / 'claude_desktop_config.json')
+                tool.connect()
+                data = json.loads((moved / 'claude_desktop_config.json').read_text(encoding='utf-8'))
+                self.assertEqual(data['preferences'], {'x': 1})
+                self.assertIn('alfred', data['mcpServers'])
+                self.assertFalse((roaming / 'Claude' / 'claude_desktop_config.json').exists())
+
+    def test_older_builds_use_appdata(self):
+        with tempfile.TemporaryDirectory() as root:
+            local, roaming = Path(root, 'Local'), Path(root, 'Roaming')
+            (roaming / 'Claude').mkdir(parents=True)
+            with mock.patch.dict('os.environ', {'LOCALAPPDATA': str(local), 'APPDATA': str(roaming)}):
+                self.assertEqual(connect.ClaudeDesktop().path(), roaming / 'Claude' / 'claude_desktop_config.json')
+
+    def test_not_installed(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.dict('os.environ', {'LOCALAPPDATA': str(Path(root, 'L')), 'APPDATA': str(Path(root, 'R'))}):
+                self.assertFalse(connect.ClaudeDesktop().found())
+
+
 class CliToolTest(unittest.TestCase):
     def test_claude_code_is_added_for_every_folder_and_old_folder_entries_go(self):
         tool = connect.ClaudeCode()

@@ -236,22 +236,36 @@ def _appdata():
     return Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
 
 
-class ClaudeDesktop(JsonTool):
-    id, name = 'claude_desktop', 'Claude Desktop'
+def _localappdata():
+    return Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local')
 
-    def _packaged(self):
-        """The Microsoft Store build keeps its own copy of %APPDATA% under its package folder."""
-        packages = Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local') / 'Packages'
-        return [p / 'LocalCache' / 'Roaming' / 'Claude' for p in packages.glob('Claude_*')] if packages.is_dir() else []
+
+class ClaudeDesktop(JsonTool):
+    """Claude Desktop reads claude_desktop_config.json from its data folder. Newer builds keep that in
+    %LOCALAPPDATA%\\Claude-Data\\<package>\\ and leave a ``.user-data-left.*`` marker in the folders they moved out of
+    (%APPDATA%\\Claude, the Store package's LocalCache copy); older ones use %APPDATA%\\Claude."""
+    id, name = 'claude_desktop', 'Claude Desktop'
+    FILE = 'claude_desktop_config.json'
+
+    def _folders(self):
+        """Candidate data folders, most likely first; folders the app has moved out of are left out."""
+        data = _localappdata() / 'Claude-Data'
+        moved = sorted((p for p in data.glob('*') if (p / self.FILE).is_file()), key=lambda p: (p / self.FILE).stat().st_mtime,
+                       reverse=True) if data.is_dir() else []
+        packages = _localappdata() / 'Packages'
+        packaged = [p / 'LocalCache' / 'Roaming' / 'Claude' for p in packages.glob('Claude_*')] if packages.is_dir() else []
+        older = [folder for folder in packaged + [_appdata() / 'Claude'] if folder.is_dir() and not any(folder.glob('.user-data-left*'))]
+        return moved + older
 
     def path(self):
-        for folder in self._packaged():
-            if (folder / 'claude_desktop_config.json').is_file():
-                return folder / 'claude_desktop_config.json'
-        return _appdata() / 'Claude' / 'claude_desktop_config.json'
+        folders = self._folders()
+        for folder in folders:
+            if (folder / self.FILE).is_file():
+                return folder / self.FILE
+        return (folders[0] if folders else _appdata() / 'Claude') / self.FILE
 
     def found(self):
-        return (_appdata() / 'Claude').is_dir() or any(folder.parent.parent.parent.is_dir() for folder in self._packaged())
+        return bool(self._folders())
 
 
 class Cursor(JsonTool):
