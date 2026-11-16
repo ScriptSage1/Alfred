@@ -28,10 +28,10 @@ Tell us what you tried, what you expected and what happened, and attach the log 
 Using Alfred from Claude Code and other AI tools (optional)
 Alfred can let an AI tool on this PC search your tracked folders and read the matching text, so you can ask it
 about your own files. It works with tools that support MCP servers (Claude Code, Codex, Claude Desktop and others).
-1. In Alfred, open Settings -> AI tools. It shows one command with a Copy button, like
-     claude mcp add alfred -- "C:\path\to\Alfred\Alfred.exe" --mcp
-2. Paste it into a terminal and run it (that line is for Claude Code). For another tool, add an MCP server in its
-   settings with the program  C:\path\to\Alfred\Alfred.exe  and the argument  --mcp
+1. In Alfred, open Settings -> AI tools. Each AI tool found on this PC (Claude Code, Codex, Claude Desktop, Cursor,
+   VS Code, Windsurf, Gemini CLI) has a Connect button. Click it, then restart that tool if it is open.
+2. For any other tool, click Copy next to "Any other tool" and paste the entry into its MCP settings (the program
+   C:\path\to\Alfred\Alfred.exe  with the argument  --mcp).
 3. The first time a tool asks, Windows shows "... wants to search your files through Alfred. Allow?" - nothing is
    shared until you click Yes. Settings -> AI tools lists the tools you allowed and what each one asked for.
 The tool only gets the passages it asks for; Alfred itself sends nothing anywhere. To disconnect a tool, remove it in

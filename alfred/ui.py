@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QKeySequenceEdit, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QRadioButton, QScrollArea, QSpinBox, QStackedWidget,
                                QSystemTrayIcon, QTextBrowser, QToolTip, QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, ai, chats, config, glass, keys, mcp_server, models, opener, paths, picker, power, providers, rag, render, rerank, startup
+from . import APP_NAME, __version__, ai, chats, config, connect, glass, keys, mcp_server, models, opener, paths, picker, power, providers, rag, render, rerank, startup
 from .index import IMAGE_SUFFIXES, VIDEO_SUFFIXES, Index, IndexBusy, discover, video_frame_png
 from .watcher import FolderWatcher
 from .ui_kit import (DRIVER, Loop, Motion, PALETTES, PANEL_SHADOW, Spring, Toggle, app_icon, brand_pixmap, dot_pixmap, icon,
@@ -2989,11 +2989,19 @@ class SettingsView(QWidget):
         page = self.page('AI tools')
         page.add(label('Claude Code, Codex and similar tools can search your tracked folders through Alfred: read-only, on this PC. '
                        'Each tool asks once before it may.', 'caption', wrap=True))
-        g = page.add(Group(win))
-        self.mcp_command = g.row('Add Alfred to a tool', button('Copy', self.copy_mcp_command, None, 'Copy the command'), '',
-                                 'Run it in a terminal (for Claude Code); other tools take the same program and arguments').caption
+        page.add(label('Your AI tools', 'section'))
+        self.mcp_tools = page.add(Group(win))  # one row per AI tool found on this PC, filled by show_other_tools
+        self.mcp_tool_rows = {}
+        self.mcp_busy = set()
+        for tool in connect.TOOLS:
+            action = button('Connect', lambda _=False, t=tool.id: self.connect_tool(t))
+            holder = self.mcp_tools.row(tool.name, action, '')
+            holder.action = action
+            self.mcp_tool_rows[tool.id] = holder
+        self.mcp_command = self.mcp_tools.row('Any other tool', button('Copy', self.copy_mcp_command, None, 'Copy the server entry as JSON'), '',
+                                              'Most MCP tools take this {"mcpServers": …} entry in their settings').caption
         self.mcp_command.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        page.add(label('Connected tools', 'section'))
+        page.add(label('Allowed tools', 'section'))
         g = page.add(Group(win))
         self.mcp_clients = QVBoxLayout()
         self.mcp_clients.setContentsMargins(0, 4, 0, 4)
@@ -3264,17 +3272,61 @@ class SettingsView(QWidget):
         self.show_gpu_check()
 
     def mcp_command_line(self):
-        exe = sys.executable
-        if getattr(sys, 'frozen', False):
-            return f'claude mcp add alfred -- "{exe}" --mcp'
-        return f'claude mcp add alfred -- "{exe}" -m alfred --mcp'
+        """What any other MCP tool runs, in one line: program, arguments and environment."""
+        spec = connect.server_spec()
+        env = ''.join(f'{key}={value}  ·  ' for key, value in spec['env'].items())
+        return f'{env}"{spec["command"]}" {" ".join(spec["args"])}'
 
     def copy_mcp_command(self):
-        QApplication.clipboard().setText(self.mcp_command_line())
+        QApplication.clipboard().setText(connect.other_tool_json())
+        self.win.toast('Copied the server entry for your AI tool’s MCP settings', 'green', seconds=3)
+
+    def show_tool_rows(self):
+        """Each AI tool found on this PC, with Connect / Update / Remove; tools that aren't installed stay hidden."""
+        for tool in connect.TOOLS:
+            holder = self.mcp_tool_rows[tool.id]
+            found = tool.found()
+            holder.setVisible(found)
+            if holder.hairline is not None:
+                holder.hairline.setVisible(found)
+            if not found:
+                continue
+            if tool.id in self.mcp_busy:
+                holder.caption.setText('Working…')
+                holder.action.setEnabled(False)
+                continue
+            try:
+                status = tool.status()
+            except Exception as error:  # a tool's settings we can't read must not break the page
+                status = {'state': 'outdated', 'detail': f'Couldn’t read its settings: {error}'}
+            holder.caption.setText(status['detail'])
+            holder.action.setEnabled(True)
+            holder.action.setText({'connected': 'Remove', 'outdated': 'Update'}.get(status['state'], 'Connect'))
+            holder.state = status['state']
+
+    def connect_tool(self, tool_id):
+        """Connect (or update, or remove) Alfred in one AI tool, in the background: the CLIs take a few seconds."""
+        tool = connect.tool(tool_id)
+        remove = getattr(self.mcp_tool_rows[tool_id], 'state', '') == 'connected'
+        self.mcp_busy.add(tool_id)
+        self.show_tool_rows()
+
+        def finish(_=None, error=None):
+            self.mcp_busy.discard(tool_id)
+            self.show_tool_rows()
+            if error:
+                self.win.toast(f'{tool.name}: {error}', 'red', seconds=8)
+            elif remove:
+                self.win.toast(f'Removed Alfred from {tool.name}', 'green', seconds=4)
+            else:
+                self.win.toast(f'Connected to {tool.name}. If it is open, restart it; it asks once before its first search', 'green', seconds=7)
+
+        run_job(lambda *_: tool.disconnect() if remove else tool.connect(), finish, lambda error: finish(error=error))
 
     def show_other_tools(self):
-        """The command, the known AI tools (Allowed / Remove) and the last 50 calls, read from the data folder."""
+        """The AI tools on this PC, the tools that asked (Allowed / Remove) and the last 50 calls, from the data folder."""
         home = self.win.settings.home
+        self.show_tool_rows()
         self.mcp_command.setText(self.mcp_command_line())
         while self.mcp_clients.count():
             item = self.mcp_clients.takeAt(0)

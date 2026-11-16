@@ -55,12 +55,20 @@ A folder build that needs no Python is made with `packaging\build.cmd` (see `pac
 
 ## Connect AI tools (MCP)
 
-```
-claude mcp add alfred -- "C:\path\to\Alfred\.venv\Scripts\python.exe" -m alfred --mcp
+Open **Settings → AI tools** and click **Connect** next to your tool. Alfred finds Claude Code, Codex, Claude Desktop,
+Cursor, VS Code (Copilot), Windsurf and Gemini CLI, and adds itself through the tool's own `mcp add` command or its MCP
+settings file (only Alfred's entry is changed; a file with comments is left alone). Restart the tool if it is open.
+For any other MCP tool, **Copy** gives the entry to paste:
+
+```json
+{ "mcpServers": { "alfred": {
+  "command": "C:\\path\\to\\Alfred\\.venv\\Scripts\\pythonw.exe",
+  "args": ["-m", "alfred", "--mcp"],
+  "env": { "PYTHONPATH": "C:\\path\\to\\Alfred" } } } }
 ```
 
-Settings → Other AI tools shows this line with your own path. Two read-only tools: `search_files` and `read_passage`
-(tracked folders only). Alfred asks before a tool's first search, and logs every call to `mcp_calls.jsonl`.
+Two read-only tools: `search_files` and `read_passage` (tracked folders only). Alfred asks before a tool's first
+search, and logs every call to `mcp_calls.jsonl`.
 
 ## Command line
 

@@ -64,7 +64,12 @@ class SearchViewTests(unittest.TestCase):
                                    'count': 2, 'outcome': 'ok'})
         view.show_other_tools()
         holder = view.mcp_clients.parentWidget()
-        self.assertIn('-m alfred --mcp', view.mcp_command.text())
+        command = view.mcp_command.text()
+        self.assertIn('-m alfred --mcp', command)
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(ui.__file__)))
+        self.assertIn(f'PYTHONPATH={repo}', command)  # AI tools start it outside the repo
+        for tool in ui.connect.TOOLS:  # one row per AI tool, shown only when it is installed
+            self.assertEqual(not view.mcp_tool_rows[tool.id].isHidden(), tool.found())
         self.assertIn('some-tool', [w.text() for w in holder.findChildren(ui.QLabel)])
         self.assertIn('tides', view.mcp_calls.text())
         [remove] = [b for b in holder.findChildren(ui.QPushButton) if b.text() == 'Remove']
