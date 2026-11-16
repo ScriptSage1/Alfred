@@ -35,6 +35,12 @@ Alfred's MCP tools and once using Claude Code's own Glob, Grep, Read and shell.
 
 ## Install
 
+The quickest way: download `Alfred-<version>-win64.zip` from [Releases](https://github.com/ScriptSage1/Alfred/releases),
+unzip it and run `Alfred.exe`. It needs no Python, and search by meaning works straight away (the engine and search
+model come in the zip).
+
+From source:
+
 1. Install Python 3.11 or newer.
 2. Double-click `Setup-Alfred.cmd`. It creates `.venv`, installs the requirements, adds Alfred to the Start menu and starts it.
 3. For search by meaning and on-PC answers, put [llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-server.exe`) in

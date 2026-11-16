@@ -81,7 +81,9 @@ class Base(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.stopped = []
         env = {'ALFRED_HOME': str(self.home), 'OLLAMA_MODELS': str(self.root / 'ollama'), 'USERPROFILE': str(self.root / 'user')}
+        self.install = self.root / 'install'  # the folder Alfred.exe runs from (a build ships the search model there)
         patches = [mock.patch.dict(os.environ, env), mock.patch.object(runtime, 'program_dir', lambda home=None: None),
+                   mock.patch.object(models, 'install_dir', lambda: self.install),
                    mock.patch.object(runtime, 'PROGRAM_OVERRIDE', None), mock.patch.object(models, 'BLOCK', 1024),
                    mock.patch.object(runtime, 'stop', lambda role, settings=None: self.stopped.append(role))]
         os.environ.pop('ALFRED_MODELS_DIR', None)
@@ -277,6 +279,42 @@ class EngineTests(Base):
         self.assertEqual(models.first_run_needs(self.home), [models.ENGINE])
         with mock.patch.object(runtime, 'program_dir', lambda home=None: self.root):
             self.assertEqual(models.first_run_needs(self.home), [])
+
+
+class IncludedModelTests(Base):
+    """A build ships the search model next to Alfred.exe (packaging/bundle_models.py), so nothing needs downloading."""
+
+    def ship(self, content=None):
+        path = models.included_path('embed-text')
+        path.parent.mkdir(parents=True)
+        path.write_bytes(self.content if content is None else content)
+        return path
+
+    def test_the_copy_that_came_with_alfred_is_used(self):
+        self.use()
+        shipped = self.ship()
+        self.assertEqual(shipped, self.install / 'models' / 'fake-model' / 'embed-text.gguf')
+        self.assertEqual(models.find('embed-text', self.home), shipped)
+        self.assertEqual(models.state('embed-text', self.home)['where'], 'included')
+        self.assertNotIn('embed-text', models.first_run_needs(self.home))
+        self.assertEqual(self.server.seen, [])  # nothing was downloaded
+
+    def test_a_shipped_file_of_the_wrong_size_is_not_used(self):
+        self.use()
+        self.ship(self.content[:-1])
+        self.assertIsNone(models.find('embed-text', self.home))
+        self.assertIn('embed-text', models.first_run_needs(self.home))
+
+    def test_alfreds_own_copy_comes_first_and_removing_it_keeps_the_shipped_one(self):
+        self.use()
+        shipped = self.ship()
+        own = models.download('embed-text', self.home)
+        self.assertEqual(models.find('embed-text', self.home), own)
+        self.assertTrue(models.remove('embed-text', self.home))
+        self.assertTrue(shipped.is_file())
+        self.assertEqual(models.find('embed-text', self.home), shipped)
+        self.assertFalse(models.remove('embed-text', self.home))  # the shipped copy is never deleted
+        self.assertTrue(shipped.is_file())
 
 
 class FirstRunTests(unittest.TestCase):

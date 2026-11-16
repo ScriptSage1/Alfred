@@ -15,3 +15,6 @@ Thumbs.db
 
 # The llama.cpp engine for a run from this folder (copied in, not part of the repository)
 /runtime/
+
+# Model files for a run from this folder (a build ships the search model in models\)
+/models/

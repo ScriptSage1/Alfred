@@ -204,9 +204,17 @@ def _data_files():
 
 
 def _engine(home):
-    from . import runtime
-    found = runtime.program_dir(home)  # looks only; nothing is started
-    return f'llama.cpp engine at {found}' if found else 'llama.cpp engine not installed (keyword search only)'
+    """Where search by meaning's engine and model are (looks only; nothing is started). A build ships both, so in a
+    frozen build a missing one is a packaging fault."""
+    from . import models, runtime
+    engine = runtime.program_dir(home)
+    model = models.find('embed-text', home)
+    if getattr(sys, 'frozen', False):
+        absent = [name for name, found in (('llama.cpp engine', engine), ('search model', model)) if found is None]
+        if absent:
+            raise RuntimeError(f'{" and ".join(absent)} missing from this build (packaging\\bundle_models.py)')
+    return (f'llama.cpp engine at {engine}' if engine else 'llama.cpp engine not installed') + ', ' + \
+        (f'search model at {model}' if model else 'search model not on this PC (keyword search only)')
 
 
 def _index(home, folder):
@@ -292,7 +300,7 @@ def run(argv):
         log.check('sqlite3 FTS5', _sqlite)
         log.check('Alfred modules import', _app_modules)
         log.check('app data files', _data_files)
-        log.check('engine lookup', lambda: _engine(home))
+        log.check('search by meaning files', lambda: _engine(home))
         made = log.check('sample files', lambda: (
             (files / 'notes.txt').write_text(f'Meeting notes: the {WORDS["text"]} arrives at noon.\n', encoding='utf-8'),
             _docx(files / 'report.docx', [WORDS['docx'], 'Second paragraph of the report.']),

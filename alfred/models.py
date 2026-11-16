@@ -2,9 +2,13 @@
 
 A file is found, in this order:
   1. Alfred's own copy: ALFRED_HOME\\models\\<folder>\\<name> (checked by SHA-256 when it was downloaded, so here by size).
-  2. A development folder, ALFRED_MODELS_DIR: the file under its release name or as a ``sha256-<hash>`` blob.
-  3. Ollama's copy: the blob ``sha256-<hash>`` under %OLLAMA_MODELS% or %USERPROFILE%\\.ollama\\models\\blobs.
-Copies found in 2 and 3 must have the same size; they are used where they are (never copied, changed or deleted). Their
+  2. The copy that came with Alfred: <install folder>\\models\\<folder>\\<name>, next to Alfred.exe (packaging checks it
+     by SHA-256 before zipping, so here by size). The release zip ships the search model this way, so search by meaning
+     works without a download.
+  3. A development folder, ALFRED_MODELS_DIR: the file under its release name or as a ``sha256-<hash>`` blob.
+  4. Ollama's copy: the blob ``sha256-<hash>`` under %OLLAMA_MODELS% or %USERPROFILE%\\.ollama\\models\\blobs.
+Copies found in 2 to 4 are used where they are (never copied, changed or deleted). Copies in 3 and 4 must have the same
+size; their
 hash is computed once and remembered by size and modification time in ALFRED_HOME\\models\\hashes.json.
 Otherwise the file is missing and the feature that needs it is off until it is downloaded.
 
@@ -16,6 +20,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import threading
 import types
 import urllib.error
@@ -90,6 +95,19 @@ def ollama_blob_dirs():
     return dirs
 
 
+def install_dir():
+    """The folder Alfred runs from: the one holding Alfred.exe in a build, the repository otherwise."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent.parent
+
+
+def included_path(key):
+    """Where a build ships model file ``key``: <install folder>\\models\\<folder>\\<name>."""
+    file = FILES[key]
+    return install_dir() / 'models' / file.folder / file.name
+
+
 def own_path(key, home=None):
     file = FILES[key]
     return Path(home or config.data_home()) / 'models' / file.folder / file.name
@@ -140,15 +158,16 @@ def models_dir():
 
 
 def find(key, home=None):
-    """Path of a model file (Alfred's own copy, else ALFRED_MODELS_DIR's, else Ollama's), or None when it is not on this PC."""
+    """Path of a model file (Alfred's own copy, else the one that came with Alfred, else ALFRED_MODELS_DIR's, else
+    Ollama's), or None when it is not on this PC."""
     file = FILES[key]
     home = Path(home or config.data_home())
-    own = own_path(key, home)
-    try:
-        if own.stat().st_size == file.size:
-            return own
-    except OSError:
-        pass
+    for path in (own_path(key, home), included_path(key)):
+        try:
+            if path.stat().st_size == file.size:
+                return path
+        except OSError:
+            pass
     folder = models_dir()
     if folder is not None:
         for candidate in (folder / file.name, folder / f'sha256-{file.sha256}'):
@@ -162,11 +181,13 @@ def find(key, home=None):
 
 
 def source(path, home=None):
-    """'alfred' for Alfred's own copy, 'external' for ALFRED_MODELS_DIR's, 'ollama' for Ollama's (Settings says "Using
-    Ollama's copy")."""
+    """'alfred' for Alfred's own copy, 'included' for the one that came with Alfred, 'external' for ALFRED_MODELS_DIR's,
+    'ollama' for Ollama's (Settings says "Using Ollama's copy")."""
     path = Path(path)
     if path.is_relative_to(Path(home or config.data_home()) / 'models'):
         return 'alfred'
+    if path.is_relative_to(install_dir() / 'models'):
+        return 'included'
     folder = models_dir()
     return 'external' if folder is not None and path.is_relative_to(folder) else 'ollama'
 
@@ -296,7 +317,7 @@ def _users(key):
 
 def remove(key, home=None):
     """Delete Alfred's own copy of ``key`` (and its part file), after stopping this process's servers that use it. A copy
-    found elsewhere (Ollama's, ALFRED_MODELS_DIR's) is never touched. Returns whether a file was deleted."""
+    found elsewhere (the one that came with Alfred, Ollama's, ALFRED_MODELS_DIR's) is never touched. Returns whether a file was deleted."""
     home = Path(home or config.data_home())
     own = own_path(key, home)
     if not own.exists() and not _part(own).exists():
@@ -398,7 +419,7 @@ def state(key, home=None):
     """Where a file is, for Settings: {'key', 'label', 'size', 'where', 'path', 'part', 'downloadable'}.
 
     where: 'alfred' (Alfred's own copy), 'ollama' (Ollama's), 'external' (ALFRED_MODELS_DIR; for the engine also
-    ALFRED_LLAMA_DIR), 'included' (the engine that came with Alfred), or 'missing'. part: bytes of an unfinished
+    ALFRED_LLAMA_DIR), 'included' (the engine or model file that came with Alfred), or 'missing'. part: bytes of an unfinished
     download (0 when none). downloadable: whether Alfred has an address (and, for the engine, a pinned checksum)."""
     home = Path(home or config.data_home())
     if key == ENGINE:

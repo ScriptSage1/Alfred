@@ -26,7 +26,6 @@ import re
 import secrets
 import socket
 import subprocess
-import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -90,10 +89,8 @@ def _dir(home, name):
 
 
 def install_dir():
-    """The folder Alfred runs from (M4's installer puts the engine in its runtime\\llama)."""
-    if getattr(sys, 'frozen', False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
+    """The folder Alfred runs from (a build ships the engine in its runtime\\llama and the search model in models\\)."""
+    return models.install_dir()
 
 
 def program_dir(home=None):

@@ -10,8 +10,9 @@ Start it
 2. Double-click Alfred.exe.
 3. Windows may say "Windows protected your PC" because this test build is not signed.
    Click "More info", then "Run anyway". This is asked once.
-4. Alfred asks which folders to track. Keyword search works straight away. Search by meaning needs the search
-   engine and model (about 340 MB together); Alfred offers to download them - that is your choice.
+4. Alfred asks which folders to track. Search by name, by text and by meaning all work straight away: the search
+   engine (llama.cpp) and the search model (EmbeddingGemma 2) come in this folder, so nothing is downloaded.
+   Finding pictures by what they show needs one more file (about 1 GB), offered in Settings -> Advanced -> Model files.
 
 Good to know
 - Alfred starts when you sign in (hidden in the tray) unless you switch that off in the last setup step, or later in
