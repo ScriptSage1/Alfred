@@ -1,102 +1,66 @@
-# Alfred
+<p align="center">
+  <img src="docs/alfred-logo.png" width="120" alt="Alfred logo">
+</p>
 
-A Spotlight-style search for Windows. Press **Ctrl+Alt+L** anywhere to open it; **Esc** hides it.
+<h1 align="center">Alfred</h1>
 
-Alfred searches the folders you track — documents, PDFs, slides, spreadsheets, text files, and the
-text inside images and videos — by keyword and by meaning. Everything runs on your PC.
+<p align="center">
+  Spotlight-style search for Windows that finds your files by what is <b>in</b> them.<br>
+  Press <b>Ctrl+Alt+L</b> anywhere. Everything is indexed and searched on your PC.
+</p>
 
-## Install (from a clone)
+<p align="center">
+  <a href="docs/ring_compare.mp4"><img src="docs/ring_compare.gif" width="880" alt="Searching 'ring counter circuit': Windows Search finds nothing, Alfred finds the photo of the whiteboard"></a>
+</p>
+
+<p align="center"><sub>Real recordings, same 1,081 files, same words. File Explorer matches the words against file names; Alfred also reads the text inside the photo.</sub></p>
+
+## What it does
+
+- **Keyword and meaning together.** `banker's algorithm` finds the slide; `kid on a bench in autumn` finds the photo.
+- **Reads inside files.** Word, PowerPoint, Excel, PDF (scans included, through OCR), text, photos and video frames.
+- **Cites where.** Results point to the page, slide, sheet rows or video timestamp, and Enter opens it there when the app can.
+- **Says when it doesn't know.** Weak matches stay hidden behind "Show N weaker matches".
+- **Ask Alfred.** Answers from your documents, with citations, using a model on this PC or your Claude / ChatGPT plan.
+- **Works with AI tools.** Claude Code, Codex and other MCP clients can search your files through Alfred.
+
+## Benchmark: Claude with and without Alfred
+
+Claude Sonnet 5.5 answered 109 questions about 1,080 synthetic personal, work and college files, once using
+Alfred's MCP tools and once using Claude Code's own Glob, Grep, Read and shell.
+
+<p align="center"><img src="docs/bench-accuracy.png" width="880" alt="Questions answered correctly: 97% with Alfred, 91% on its own"></p>
+<p align="center"><img src="docs/bench-tokens.png" width="880" alt="Tokens per question: 20k with Alfred, 58k on its own"></p>
+<p align="center"><img src="docs/bench-question-types.png" width="880" alt="Question types where the two differed"></p>
+
+## Install
 
 1. Install Python 3.11 or newer.
-2. Search by meaning and the answer model on this PC run on [llama.cpp](https://github.com/ggml-org/llama.cpp)
-   (`llama-server.exe`), which Alfred starts and stops itself; nothing else needs to be installed or kept running.
-   Alfred looks for the engine in `ALFRED_LLAMA_DIR`, then in the install folder's `runtime\llama\`, then in
-   `%LOCALAPPDATA%\Alfred\runtime\llama-b12318\`, and for the model files in `%LOCALAPPDATA%\Alfred\models\`
-   (a copy already on this PC from an earlier Ollama install is used where it is). Downloading them from Alfred
-   comes in a later version. Without them, keyword search still works.
-3. Double-click `Setup-Alfred.cmd`. It creates `.venv`, installs the requirements, adds Alfred to the Start menu
-   and starts it.
+2. Double-click `Setup-Alfred.cmd`. It creates `.venv`, installs the requirements, adds Alfred to the Start menu and starts it.
+3. For search by meaning and on-PC answers, put [llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-server.exe`) in
+   `runtime\llama\` (or `ALFRED_LLAMA_DIR`) and the model files in `%LOCALAPPDATA%\Alfred\models\`.
+   Alfred starts and stops the engine itself. Keyword search works without it.
 
-A ready-to-run folder build that needs no Python (`Alfred.exe`) is made with `packaging\build.cmd`; see
-`packaging\README.md`.
+No administrator rights needed. Alfred starts hidden in the tray when you sign in (turn this off in Settings).
+A folder build that needs no Python is made with `packaging\build.cmd` (see `packaging\README.md`).
 
-Setup (or Alfred's first launch) also adds Alfred to your Windows Startup folder, so from then on it starts
-hidden in the tray when you sign in (no model is loaded until it is needed). No administrator rights
-are needed. Turn this off or back on under **Settings → Start Alfred when you sign in**; once you
-turn it off, Alfred leaves it off.
+## Use
 
-Start Alfred by hand any time from the Start menu (or with `.venv\Scripts\pythonw.exe -m alfred`). Starting it again
-while it runs just opens the panel.
+- **Track folders:** Settings (Ctrl+4) → Tracked folders → Track folder…. New, changed and deleted files are picked up automatically.
+  For privacy Alfred won't track whole drives, your user folder, Windows, Program Files or AppData, and it skips hidden files and anything that looks like keys or passwords.
+- **Search:** type, then Enter to open. Alt+1…Alt+7 filter by kind, Alt+D by date. Esc hides the panel.
+- **Ask:** Ctrl+2 or Tab. Pick the model at the top right: on this PC, Claude (Pro/Max), ChatGPT (Plus/Pro), an API key, or any OpenAI-compatible server.
+  With a cloud model only your question and the passages found for it are sent, after you allow it once per provider.
+- **Shortcut:** Ctrl+Alt+L, falling back to Ctrl+Alt+K or Ctrl+Alt+A if taken. Change it in Settings.
 
-## Tracking folders
+## Connect AI tools (MCP)
 
-Open **Settings** (the gear, or Ctrl+4) → **Tracked folders** → **Track folder…**, or click one of the
-suggested folders (Downloads, Pictures, Documents, Desktop, Videos). A tracked folder is indexed right
-away and then watched: new, changed and deleted files are picked up automatically. Click the folder
-count to see each folder's status; the × stops tracking a folder (its files leave the index; nothing
-on disk is touched).
+```
+claude mcp add alfred -- "C:\path\to\Alfred\.venv\Scripts\python.exe" -m alfred --mcp
+```
 
-For privacy Alfred won't track a whole drive, your whole user folder, Windows, Program Files or
-AppData, and it skips hidden files, dot-folders, symlinks and files that look like keys or passwords.
-
-## What it reads
-
-| Files | How | Cited as |
-|---|---|---|
-| .txt .md .csv .json .yaml .html .log … | text | lines 12–40 |
-| .docx | paragraphs and tables | paragraphs 3–9 |
-| .pptx | each slide and its speaker notes | slide 4 |
-| .xlsx | each sheet, row by row | Budget, rows 1–30 |
-| .pdf | text per page; scanned pages through OCR | page 2 |
-| .png .jpg .webp .bmp .gif .tiff | OCR (RapidOCR, local) | image text |
-| .mp4 .mkv .mov .avi .webm … | OCR on a frame every 10 s (up to 120 frames) | at 01:23 |
-
-Pictures, up to 8 keyframes of each video and scanned PDF pages are also found by what they show:
-the search model (EmbeddingGemma 2) turns each into a picture vector that your words are compared
-with, so "kid on a bench in autumn" finds the photo. Old `.doc/.ppt/.xls` files are
-listed as unsupported; save them in the newer format to search them.
-
-Search combines SQLite FTS5 (BM25) keyword matches with EmbeddingGemma 2 vectors through
-reciprocal-rank fusion.
-
-- Only confident matches are listed. If there are none, Alfred says "No strong matches" and offers
-  "Show N weaker matches" instead of showing unrelated files.
-- Identifiers and dates (`INV-2026-04417`, `15 March 2024`) must match exactly, in any written form
-  (`INV 2026 04417`, `2024-03-15`); while you are still typing the last one, it matches as a prefix.
-- Open (Enter) jumps to the cited page or moment when the default app can: PDFs in Edge, Chrome,
-  Firefox, Brave, SumatraPDF or Acrobat, videos in VLC or mpv. Anything else opens normally.
-- Chips above the results narrow them by file kind and by modified date (Alt+1 to Alt+7, Alt+D).
-
-## Ask Alfred and chat history
-
-Ask Alfred (Ctrl+2 or Tab) can use any of these — pick one from the model button at the top right,
-or under **Settings → AI model**:
-
-| Provider | How it connects | Set up |
-|---|---|---|
-| On this PC | gemma3:4b on llama.cpp, started on the first question and stopped after **Keep models loaded** | the model file (see Install) |
-| Claude · your Pro/Max plan | the Claude Code CLI (bundled with the Claude desktop app, or `npm i -g @anthropic-ai/claude-code`) | Settings → Accounts → Sign in |
-| ChatGPT · your Plus/Pro plan | the Codex CLI (bundled with the Codex app, or `npm i -g @openai/codex`) | Settings → Accounts → Sign in |
-| Claude API / OpenAI API | the providers' APIs | Settings → Accounts → Add key |
-| Custom server | any OpenAI-compatible API (OpenRouter, Groq, LM Studio, llama.cpp …) | Settings → Accounts → address (+ key) |
-
-The CLIs are run locked down: print mode, every tool off, no MCP servers or project settings, an empty
-working folder. API keys are stored in Windows Credential Manager, never in Alfred's files. Indexing,
-OCR and search always stay on your PC; with a cloud model only your questions
-(and the passages found for them, when Alfred answers from your documents) are sent — Alfred asks
-once per provider before it does.
-
-Chats are saved as one JSON file each in `%LOCALAPPDATA%\Alfred\Chats` (change the folder, open it,
-or delete all chats under **Settings → Chats**). The history panel (Ctrl+H) lists them by day; hover a
-chat to rename or delete it (with Undo), and click one to reopen and continue it. Turning **Save chat
-history** off stops saving new chats; nothing already saved is deleted. The chats folder is never
-tracked or searched.
-
-## Shortcut
-
-The default is **Ctrl+Alt+L**. If another app already uses it, Alfred falls back to Ctrl+Alt+K, then
-Ctrl+Alt+A, and tells you which one it picked. Change it in **Settings**. Without a free shortcut
-Alfred still opens from its tray icon.
+Settings → Other AI tools shows this line with your own path. Two read-only tools: `search_files` and `read_passage`
+(tracked folders only). Alfred asks before a tool's first search, and logs every call to `mcp_calls.jsonl`.
 
 ## Command line
 
@@ -106,36 +70,11 @@ python -m alfred --search "budget approved"
 python -m alfred --status
 ```
 
-These talk to the running Alfred.
-
-## Use Alfred from Claude Code and similar tools
-
-Alfred can serve your files to other AI tools (Claude Code, Codex and others that speak MCP). Add it once:
-
-```
-claude mcp add alfred -- "C:\path\to\Alfred\.venv\Scripts\python.exe" -m alfred --mcp
-```
-
-(Settings → Other AI tools shows this line with your own Python path, and a Copy button.) The tool starts Alfred's
-small search server itself; Alfred does not need to be open. It has two tools, both read-only:
-
-- `search_files` finds passages in your tracked folders, by keyword and by meaning, in the same order as Alfred's own
-  results. Each result says whether Alfred is confident in it.
-- `read_passage` reads the indexed text of one file from a search result. Files outside your tracked folders cannot be read.
-
-The first time a tool searches, Alfred asks you in a Windows box whether to allow it. The answer is kept; change it,
-or remove the tool, under **Settings → Other AI tools**. Every call (when, which tool, what it asked for, which files
-it got) is listed there and written to `mcp_calls.jsonl` in Alfred's data folder, next to `mcp_clients.json`.
-Nothing is indexed, changed or opened by the server. Text from your files is handed over as data, with a note saying so.
-
 ## Development
 
 ```
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
 
-`alfred/rag.py` answers questions from your documents: it retrieves and reranks passages, then asks the model to cite them (the top of that file describes each step). More components to start at sign-in go in `TASKS` in `alfred/startup.py`.
-
-Settings, the index and logs live in `%LOCALAPPDATA%\Alfred` (override with `ALFRED_HOME`). The llama.cpp servers
-write their logs to `logs\llama-<role>.log` there. Tests use a small fake `llama-server` (`tests/fake_llama.py`); set
-`ALFRED_LLAMA_DIR` to a llama.cpp build to also run the opt-in test against the real server.
+Data, settings, index and logs live in `%LOCALAPPDATA%\Alfred` (override with `ALFRED_HOME`).
+Search is SQLite FTS5 (BM25) plus EmbeddingGemma 2 vectors, merged by reciprocal-rank fusion; `alfred/rag.py` describes how answers are built.
