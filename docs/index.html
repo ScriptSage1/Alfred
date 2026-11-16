@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Alfred: answers from your own files</title>
-<meta name="description" content="Alfred is search for Windows that reads inside your documents, slides, PDFs and photos, shows where each answer comes from, and says when it doesn't know.">
+<title>Alfred: fast file search for Windows</title>
+<meta name="description" content="Fast local file search for Windows. Find files by name, by the words inside them, or by meaning, including text in photos and video frames.">
 <meta name="color-scheme" content="dark light">
-<meta name="theme-color" content="#08070c" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#f4f3f8" media="(prefers-color-scheme: light)">
-<meta property="og:title" content="Alfred: answers from your own files">
-<meta property="og:description" content="Search for Windows that reads inside your files, shows where each answer comes from, and works with Claude Code and other AI tools.">
+<meta name="theme-color" content="#0a0a0c" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+<meta property="og:title" content="Alfred: fast file search for Windows">
+<meta property="og:description" content="Find files by name, by the words inside them, or by meaning. Runs on your PC and works with Claude Code and other AI tools.">
 <meta property="og:image" content="https://scriptsage1.github.io/Alfred/media/compare.jpg">
 <meta property="og:url" content="https://scriptsage1.github.io/Alfred/">
 <meta property="og:type" content="website">
@@ -23,7 +23,6 @@
 </script>
 </head>
 <body>
-<div class="backdrop" aria-hidden="true"><span class="orb orb-a"></span><span class="orb orb-b"></span><span class="orb orb-c"></span></div>
 
 <header class="nav-wrap">
   <nav class="nav glass" aria-label="Main">
@@ -32,7 +31,7 @@
       <span>Alfred</span>
     </a>
     <div class="nav-links">
-      <a href="#features">Features</a>
+      <a href="#features">Search</a>
       <a href="#ai-tools">AI tools</a>
       <a href="#benchmark">Benchmark</a>
     </div>
@@ -51,10 +50,9 @@
   <!-- Hero -->
   <section class="hero">
     <div class="hero-copy rise">
-      <p class="eyebrow"><span class="dot"></span> Free test build for Windows 10 and 11</p>
-      <h1>Answers from your own files.<br><span class="grad">With proof.</span></h1>
-      <p class="lede">Alfred is search for Windows that reads <em>inside</em> your documents, slides, PDFs and photos.
-        It shows the page, slide or line each answer comes from, and says when it doesn't know.</p>
+      <h1>Fast file search for Windows.</h1>
+      <p class="lede">Find files by name, by the words inside them, or by meaning. Even text in photos and video frames.
+        All on your PC.</p>
       <div class="cta-row">
         <a class="btn btn-primary btn-lg js-download" href="https://github.com/ScriptSage1/Alfred/releases/download/v0.1.0-test2/Alfred-0.1.0-win64.zip">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19.5h14"/></svg>
@@ -73,28 +71,20 @@
           <source data-src="media/compare.mp4" type="video/mp4">
         </video>
       </div>
-      <figcaption>Real recordings, same 1,081 files, same words. Windows Search matches file names; Alfred also reads the text in the photo.</figcaption>
+      <figcaption>Same 1,081 files, same words. Windows Search checks names; Alfred also reads the photo.</figcaption>
     </figure>
   </section>
 
-  <!-- Features -->
+  <!-- Search -->
   <section id="features" class="section">
     <header class="section-head reveal">
-      <p class="kicker">What it does</p>
-      <h2>Press <kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>L</kbd> and ask your files.</h2>
-      <p class="sub">Everything is indexed and searched on your PC. Your files never leave it.</p>
+      <h2>Press <kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>L</kbd> and type.</h2>
     </header>
 
     <article class="feature reveal">
       <div class="feature-copy">
         <h3>Finds the slide, not just the file</h3>
-        <p>Type <q>banker's algorithm</q> and Alfred opens the deadlocks lecture on slide 4, with the matching words highlighted.
-          Word, PowerPoint, Excel, PDF (scans too), text, photos and video frames.</p>
-        <ul class="ticks">
-          <li>Keyword and meaning search together</li>
-          <li>Points to the page, slide, sheet rows or video timestamp</li>
-          <li><kbd>Enter</kbd> opens it right there</li>
-        </ul>
+        <p><q>banker's algorithm</q> opens the deadlocks lecture on slide 4, with the words highlighted.</p>
       </div>
       <div class="feature-media frame glass">
         <video class="lazy-video" muted loop playsinline preload="none" poster="media/bankers.jpg" width="960" height="766"
@@ -107,14 +97,8 @@
 
     <article class="feature flip reveal">
       <div class="feature-copy">
-        <h3>Reads your photos and notes</h3>
-        <p>Ask <q>what's coming in the DBMS mid-sem</q> and Alfred finds the photo of a sticky note, because it reads the
-          handwriting inside it. The note never uses the word "coming".</p>
-        <ul class="ticks">
-          <li>Text in pictures and scans is read on your PC</li>
-          <li>Search by meaning, not only exact words</li>
-          <li>Weak matches stay behind "Show weaker matches"</li>
-        </ul>
+        <h3>Reads photos and handwriting</h3>
+        <p><q>what's coming in the DBMS mid-sem</q> finds a photo of a sticky note, by meaning. The note never says "coming".</p>
       </div>
       <div class="feature-media frame glass">
         <video class="lazy-video" muted loop playsinline preload="none" poster="media/midsem.jpg" width="960" height="766"
@@ -127,14 +111,8 @@
 
     <article class="feature reveal">
       <div class="feature-copy">
-        <h3>Shows you both versions</h3>
-        <p>Two fee sheets, two different prices. Alfred lists both files with their dates, so you can see which one is current
-          before you rely on a number.</p>
-        <ul class="ticks">
-          <li>Every result names its file and location</li>
-          <li>Ask Alfred answers with citations</li>
-          <li>Uses your Claude or ChatGPT plan, or an API key</li>
-        </ul>
+        <h3>Shows every version</h3>
+        <p>Two fee sheets, two prices. Alfred lists both with their dates, so you can see which is current.</p>
       </div>
       <div class="feature-media frame glass">
         <video class="lazy-video" muted loop playsinline preload="none" poster="media/versions.jpg" width="960" height="766"
@@ -149,10 +127,8 @@
   <!-- AI tools -->
   <section id="ai-tools" class="section">
     <header class="section-head reveal">
-      <p class="kicker">For AI tools</p>
-      <h2>Let Claude Code search your files too.</h2>
-      <p class="sub">Alfred has a built-in MCP server. Claude Code, Codex, Claude Desktop, Cursor, VS Code, Windsurf and Gemini CLI
-        connect with one click in <b>Settings → AI tools</b>.</p>
+      <h2>Works with your AI tools.</h2>
+      <p class="sub">Connect Claude Code, Codex, Cursor and more in one click.</p>
     </header>
 
     <figure class="wide-video reveal">
@@ -163,21 +139,21 @@
           <source data-src="media/claude.mp4" type="video/mp4">
         </video>
       </div>
-      <figcaption>A real Claude Code session (Claude Sonnet 5.5) using Alfred's MCP server on synthetic test files. The answer is shortened for the screen.</figcaption>
+      <figcaption>Claude Code (Sonnet 5.5) using Alfred's MCP server on test files.</figcaption>
     </figure>
 
     <div class="cards">
       <div class="card glass reveal">
-        <h4>Read-only</h4>
-        <p><code>search_files</code>, <code>read_passage</code> and <code>search_code</code> (code by meaning, name and callers), and only for folders you track.</p>
+        <h4>MCP server</h4>
+        <p>Read-only <code>search_files</code>, <code>read_passage</code> and <code>search_code</code>, in folders you track.</p>
       </div>
       <div class="card glass reveal">
-        <h4>You stay in charge</h4>
-        <p>Alfred asks you before each tool's first search, and logs every call.</p>
+        <h4>You approve it</h4>
+        <p>Asks before each tool's first search and logs every call.</p>
       </div>
       <div class="card glass reveal">
-        <h4>Checked before "Connected"</h4>
-        <p>Alfred starts the server the way your tool will and checks that it answers.</p>
+        <h4>Ask Alfred</h4>
+        <p>Optional answers with sources, using your Claude or ChatGPT plan or an API key.</p>
       </div>
     </div>
   </section>
@@ -185,8 +161,7 @@
   <!-- Benchmark -->
   <section id="benchmark" class="section">
     <header class="section-head reveal">
-      <p class="kicker">Benchmark</p>
-      <h2>Claude answers more questions correctly with Alfred.</h2>
+      <h2>Claude gets more right with Alfred.</h2>
     </header>
 
     <div class="bench glass reveal">
@@ -204,7 +179,7 @@
         </div>
       </div>
       <div class="bench-row">
-        <p class="bench-label">Tokens used per question, on average</p>
+        <p class="bench-label">Tokens per question, on average</p>
         <div class="bar-line">
           <span class="bar-name">With Alfred</span>
           <span class="bar"><span class="fill accent" style="--w:34.5%"></span></span>
@@ -216,17 +191,17 @@
           <span class="bar-val muted">58k</span>
         </div>
       </div>
-      <p class="footnote">Claude Sonnet 5.5, November 2026: 109 questions about 1,080 synthetic personal, work and college files.
+      <p class="footnote">Claude Sonnet 5.5, November 2026. 109 questions about 1,080 synthetic files.
         "On its own" means Claude Code's built-in Glob, Grep, Read and shell.</p>
     </div>
   </section>
 
   <!-- Download -->
   <section id="download" class="section">
-    <div class="download glass glow-rim reveal">
-      <img class="download-logo" src="media/logo-192.png" alt="" width="72" height="72" loading="lazy">
+    <div class="download glass reveal">
+      <img class="download-logo" src="media/logo-192.png" alt="" width="64" height="64" loading="lazy">
       <h2>Get Alfred</h2>
-      <p class="sub">A test build for Windows 10 and 11 (64-bit). No Python and no installer needed. Expect a few rough edges.</p>
+      <p class="sub">Free test build for Windows 10 and 11. Expect a few rough edges.</p>
       <a class="btn btn-primary btn-lg js-download" href="https://github.com/ScriptSage1/Alfred/releases/download/v0.1.0-test2/Alfred-0.1.0-win64.zip">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19.5h14"/></svg>
         Download for Windows
@@ -235,28 +210,11 @@
       <p class="fine"><a class="js-release-page" href="https://github.com/ScriptSage1/Alfred/releases">Release notes and all versions</a></p>
 
       <ol class="steps">
-        <li>
-          <span class="n">1</span>
-          <div><b>Unzip the whole folder</b> anywhere you like. Keep <code>Alfred.exe</code> next to its <code>_internal</code> folder.</div>
-        </li>
-        <li>
-          <span class="n">2</span>
-          <div><b>Double-click <code>Alfred.exe</code>.</b> This build isn't signed yet, so Windows may show
-            "Windows protected your PC". Click <b>More info</b>, then <b>Run anyway</b>.</div>
-        </li>
-        <li>
-          <span class="n">3</span>
-          <div><b>Follow the setup steps:</b> pick the folders to search, then try
-            <kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>L</kbd>.</div>
-        </li>
+        <li><span class="n">1</span><div><b>Unzip the whole folder.</b> Keep <code>Alfred.exe</code> next to <code>_internal</code>.</div></li>
+        <li><span class="n">2</span><div><b>Run <code>Alfred.exe</code>.</b> If Windows warns you, click <b>More info</b>, then <b>Run anyway</b> (the build isn't signed yet).</div></li>
+        <li><span class="n">3</span><div><b>Pick your folders</b>, then press <kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>L</kbd>.</div></li>
       </ol>
-
-      <div class="note">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.5M12 7.6v.2"/></svg>
-        <p><b>Search by meaning is included.</b> The zip comes with the EmbeddingGemma 2 search model and the llama.cpp
-          engine, so search by name, text and meaning all work the first time you open Alfred, with nothing else to download.
-          Finding photos by what they show needs one optional extra file (about 1 GB), which Alfred offers in Settings.</p>
-      </div>
+      <p class="fine">Search by meaning works out of the box. Finding photos by what they show is an optional 1 GB download in Settings.</p>
     </div>
   </section>
 </main>
