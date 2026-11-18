@@ -3334,10 +3334,19 @@ class SettingsView(QWidget):
                 self.win.toast(f'{tool.name}: {error}', 'red', seconds=8)
             elif remove:
                 self.win.toast(f'Removed Juno from {tool.name}', 'green', seconds=4)
+            elif open_now:
+                self.win.toast(f'Connected to {tool.name}. Quit it from its tray icon and reopen it: while it is open it can undo '
+                               'this', 'orange', seconds=12)
             else:
                 self.win.toast(f'Connected to {tool.name} and checked that it can start Juno. If it is open, restart it', 'green', seconds=7)
 
-        run_job(lambda *_: tool.disconnect() if remove else tool.connect(), finish, lambda error: finish(error=error))
+        def work(*_):
+            nonlocal open_now
+            tool.disconnect() if remove else tool.connect()
+            open_now = not remove and tool.running()
+
+        open_now = False
+        run_job(work, finish, lambda error: finish(error=error))
 
     def show_other_tools(self):
         """The AI tools on this PC, the tools that asked (Allowed / Remove) and the last 50 calls, from the data folder."""
@@ -5750,12 +5759,19 @@ def serve_command(socket, window):
 def move_from_alfred():
     """Juno was called Alfred until November 2026 (the data folder moves over in config.data_home, API keys in keys.get):
     swap Alfred's shortcuts and AI-tool entries for Juno's. Runs at every start, in the background; it changes nothing
-    once nothing of Alfred is left."""
+    once nothing of Alfred is left. Returns the AI tools that were open while their entry changed (see tell_to_reopen)."""
     try:
         startup.move_from_alfred()
-        connect.move_from_alfred()
+        return connect.open_tools(connect.move_from_alfred())
     except Exception:
         logging.getLogger('juno').exception('Moving from Alfred to Juno failed')
+        return []
+
+
+def tell_to_reopen(names):
+    """After the move: an AI tool that was open while its entry changed may write its old settings back over it."""
+    return (f"Juno replaced Alfred in {' and '.join(names)}. Quit {'them' if len(names) > 1 else 'it'} from the tray icon "
+            'and reopen, or the change may be undone.') if names else ''
 
 
 def run():
@@ -5786,7 +5802,6 @@ def run():
     QLocalServer.removeServer(INSTANCE)
     server = QLocalServer()
     server.listen(INSTANCE)
-    threading.Thread(target=move_from_alfred, daemon=True).start()
     window = JunoWindow()
     window.start_setup_if_needed()  # a first run opens in setup; existing users are marked as set up
     # On quit, stop indexing at the next file and let background work finish before Python shuts down.
@@ -5830,6 +5845,8 @@ def run():
     tray.activated.connect(lambda reason: window.toggle_panel() if reason == QSystemTrayIcon.Trigger else None)
     tray.show()
     window.tray = tray
+    # After the tray exists, so a Juno started hidden at sign-in can still say an AI tool must be reopened.
+    run_job(lambda *_: move_from_alfred(), lambda names: tell_to_reopen(names) and window.notify(tell_to_reopen(names), 'orange'))
     at_sign_in = '--startup' in sys.argv
     if at_sign_in:
         # Started with Windows: stay hidden in the tray. Give Windows and the GPU driver a moment,

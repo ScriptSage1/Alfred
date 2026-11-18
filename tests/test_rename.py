@@ -163,6 +163,29 @@ class ToolsTest(unittest.TestCase):
         self.assertTrue(any(args[:4] == ['claude', 'mcp', 'add', 'juno'] for args, _ in calls))
 
 
+class ReopenTest(unittest.TestCase):
+    """An AI tool open while its entry moves over may write its old settings back: Juno tells the user to reopen it."""
+    STORE = r'c:\program files\windowsapps\claude_5.0.0.0_x64__pzs8sxrjxfjjc\app\claude.exe'
+
+    def test_the_message_names_the_tools(self):
+        from juno import ui
+        self.assertEqual(ui.tell_to_reopen([]), '')
+        self.assertIn('Quit it', ui.tell_to_reopen(['Claude Desktop']))
+        both = ui.tell_to_reopen(['Claude Desktop', 'Cursor'])
+        self.assertIn('Claude Desktop and Cursor', both)
+        self.assertIn('Quit them', both)
+
+    def test_the_move_returns_only_the_tools_that_are_open(self):
+        from juno import ui
+        with mock.patch.object(ui.startup, 'move_from_alfred'), \
+                mock.patch.object(ui.connect, 'move_from_alfred', return_value=['Claude Desktop', 'Claude Code']), \
+                mock.patch.object(ui.connect, 'running_programs', return_value=[self.STORE]):
+            self.assertEqual(ui.move_from_alfred(), ['Claude Desktop'])
+        with mock.patch.object(ui.startup, 'move_from_alfred'), \
+                mock.patch.object(ui.connect, 'move_from_alfred', return_value=[]):
+            self.assertEqual(ui.move_from_alfred(), [])
+
+
 @unittest.skipUnless(os.name == 'nt', 'Windows shortcuts')
 class ShortcutsTest(unittest.TestCase):
     def setUp(self):

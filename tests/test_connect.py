@@ -204,6 +204,35 @@ class ToolLocationTest(unittest.TestCase):
             self.assertEqual(connect.Codex().entry()['command'], 'b')
 
 
+class OpenToolTest(unittest.TestCase):
+    """Claude Desktop writes its settings back whole while it runs, so it has to be reopened after a change."""
+    STORE = r'c:\program files\windowsapps\claude_5.11492.5.0_x64__pzs8sxrjxfjjc\app\claude.exe'
+    OLDER = r'c:\users\me\appdata\local\anthropicclaude\app-0.9.0\claude.exe'
+    CLAUDE_CODE = [r'c:\users\me\appdata\local\claude-data\claude_pzs8sxrjxfjjc\claude-code\2.1.325\x\claude.exe',
+                   r'c:\users\me\.local\bin\claude.exe']
+
+    def test_claude_desktop_is_seen_open_wherever_it_is_installed(self):
+        for path in (self.STORE, self.OLDER):
+            self.assertTrue(connect.ClaudeDesktop().running([path]), path)
+
+    def test_claude_codes_program_of_the_same_name_does_not_count(self):
+        self.assertFalse(connect.ClaudeDesktop().running(self.CLAUDE_CODE))
+
+    def test_other_tools_never_ask_to_be_reopened(self):
+        self.assertFalse(connect.Cursor().running([self.STORE]))
+
+    def test_open_tools_names_only_the_open_ones_among_those_changed(self):
+        programs = self.CLAUDE_CODE + [self.STORE]
+        self.assertEqual(connect.open_tools(['Claude Desktop', 'Claude Code'], programs), ['Claude Desktop'])
+        self.assertEqual(connect.open_tools(['Claude Code'], programs), [])
+        self.assertEqual(connect.open_tools(['Claude Desktop'], self.CLAUDE_CODE), [])
+
+    def test_running_programs_reads_this_pc(self):
+        programs = connect.running_programs()
+        if os.name == 'nt':
+            self.assertTrue(any(path.endswith('python.exe') or path.endswith('pythonw.exe') for path in programs))
+
+
 class CliToolTest(unittest.TestCase):
     def test_claude_code_is_added_for_every_folder_and_old_folder_entries_go(self):
         tool = connect.ClaudeCode()

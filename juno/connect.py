@@ -31,6 +31,36 @@ class ConnectError(Exception):
     pass
 
 
+def running_programs():
+    """Full paths (lower case) of the programs running on this PC that this user can see; empty when it can't be read
+    (another OS, or Windows refused)."""
+    if os.name != 'nt':
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        ids = (wintypes.DWORD * 4096)()
+        used = wintypes.DWORD()
+        if not kernel.K32EnumProcesses(ids, ctypes.sizeof(ids), ctypes.byref(used)):
+            return []
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        paths = []
+        for pid in ids[:used.value // ctypes.sizeof(wintypes.DWORD)]:
+            handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                continue
+            try:
+                buffer, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+                if kernel.QueryFullProcessImageNameW(wintypes.HANDLE(handle), 0, buffer, ctypes.byref(size)):
+                    paths.append(buffer.value.lower())
+            finally:
+                kernel.CloseHandle(wintypes.HANDLE(handle))
+        return paths
+    except Exception:
+        return []
+
+
 def server_spec():
     """What every AI tool runs: the packaged Juno.exe, or this install's Python with the install folder on its path
     (Juno isn't installed into its .venv, and the tools start the server from their own working folder). Data and
@@ -117,6 +147,11 @@ class Tool:
 
     def found(self):
         raise NotImplementedError
+
+    def running(self, programs=None):
+        """True when the tool is open and could write back its own copy of its settings over Juno's change, so it has to
+        be quit and reopened. Only tools known to do that say so. ``programs``: running_programs(), read once."""
+        return False
 
     def entry(self, name=NAME):
         """Juno's current entry in this tool ({command, args, env}), or None. ``name``: OLD_NAME for Alfred's."""
@@ -353,6 +388,15 @@ class ClaudeDesktop(JsonTool):
     def found(self):
         return bool(self._folders())
 
+    def running(self, programs=None):
+        """Claude Desktop keeps its settings in memory while it runs and saves them back whole (it did, over a fresh
+        juno entry, after the rename), so a change made while it is open can vanish. Its program is claude.exe, the
+        same name as Claude Code's, so it is told apart by where it is installed: the Store package or the older
+        AnthropicClaude folder."""
+        homes = ('\\windowsapps\\claude_', '\\anthropicclaude\\')
+        return any(path.endswith('\\claude.exe') and any(home in path for home in homes)
+                   for path in (running_programs() if programs is None else programs))
+
 
 class Cursor(JsonTool):
     id, name = 'cursor', 'Cursor'
@@ -400,6 +444,12 @@ def found_tools():
 
 def tool(tool_id):
     return next(t for t in TOOLS if t.id == tool_id)
+
+
+def open_tools(names, programs=None):
+    """Of the tools named, those open right now that must be quit and reopened to keep Juno's change."""
+    programs = running_programs() if programs is None else programs
+    return [tool.name for tool in TOOLS if tool.name in names and tool.running(programs)]
 
 
 def move_from_alfred(tools=None):
