@@ -49,9 +49,6 @@ From source:
    model, each checked by SHA-256. Search by name and text works while it downloads. The same downloads, and the optional
    picture model (about 1 GB), are in Settings → Advanced → Model files. Juno starts and stops the engine itself.
 
-On-PC answers (Ask Juno without a cloud account) use gemma3:4b, which Juno can't download yet. If Ollama has it
-(`ollama pull gemma3:4b`), Juno uses Ollama's copy; otherwise put `gemma3-4b-q4_k_m.gguf` in
-`%LOCALAPPDATA%\Juno\models\gemma3-4b\`. Without it, Ask works with your Claude or ChatGPT plan or an API key.
 To use your own llama.cpp build, set `JUNO_LLAMA_DIR` to its folder.
 
 No administrator rights needed. Juno starts hidden in the tray when you sign in (turn this off in Settings).
