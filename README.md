@@ -44,9 +44,15 @@ From source:
 
 1. Install Python 3.11 or newer.
 2. Double-click `Setup-Juno.cmd`. It creates `.venv`, installs the requirements, adds Juno to the Start menu and starts it.
-3. For search by meaning and on-PC answers, put [llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-server.exe`) in
-   `runtime\llama\` (or `JUNO_LLAMA_DIR`) and the model files in `%LOCALAPPDATA%\Juno\models\`.
-   Juno starts and stops the engine itself. Keyword search works without it.
+3. In the first-run setup, leave **Download the search model (once)** on. Juno downloads what search by meaning needs
+   (about 340 MB): the pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) engine and the EmbeddingGemma 2 search
+   model, each checked by SHA-256. Search by name and text works while it downloads. The same downloads, and the optional
+   picture model (about 1 GB), are in Settings → Advanced → Model files. Juno starts and stops the engine itself.
+
+On-PC answers (Ask Juno without a cloud account) use gemma3:4b, which Juno can't download yet. If Ollama has it
+(`ollama pull gemma3:4b`), Juno uses Ollama's copy; otherwise put `gemma3-4b-q4_k_m.gguf` in
+`%LOCALAPPDATA%\Juno\models\gemma3-4b\`. Without it, Ask works with your Claude or ChatGPT plan or an API key.
+To use your own llama.cpp build, set `JUNO_LLAMA_DIR` to its folder.
 
 No administrator rights needed. Juno starts hidden in the tray when you sign in (turn this off in Settings).
 A folder build that needs no Python is made with `packaging\build.cmd` (see `packaging\README.md`).
