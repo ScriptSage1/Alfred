@@ -103,7 +103,7 @@
      The links in the HTML already work without this. GitHub's "latest" release can be a non-app release (the model
      files), so instead of /releases/latest this looks through recent releases for the newest Juno-*-win64.zip. */
   var REPO = 'ScriptSage1/Juno';
-  var ASSET = /^(?:Juno|Alfred)-(\d+(?:\.\d+)*)-win64\.zip$/;
+  var ASSET = /^Juno-(\d+(?:\.\d+)*)-win64\.zip$/;
   function applyRelease(info) {
     document.querySelectorAll('.js-download').forEach(function (a) { a.href = info.url; });
     document.querySelectorAll('.js-release-page').forEach(function (a) { a.href = info.page; });
