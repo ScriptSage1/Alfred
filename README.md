@@ -10,10 +10,10 @@
 </p>
 
 <p align="center">
-  <a href="docs/ring_compare.mp4"><img src="docs/ring_compare.gif" width="880" alt="Searching 'ring counter circuit': Windows Search finds nothing, Juno finds the photo of the whiteboard"></a>
+  <a href="docs/ring_compare.mp4"><img src="docs/ring_compare.gif" width="880" alt="Searching 'ring counter': Windows search offers only web results, Juno finds the photo of the whiteboard by the text in it"></a>
 </p>
 
-<p align="center"><sub>Real recordings, same 1,081 files, same words. File Explorer matches the words against file names; Juno also reads the text inside the photo.</sub></p>
+<p align="center"><sub>Real recordings on the same PC. The whiteboard photo is saved as IMG_20261014_1612.jpg: Windows search offers only web results for "ring counter"; Juno reads the text inside the photo.</sub></p>
 
 ## What it does
 
@@ -50,11 +50,6 @@ From source:
 
 No administrator rights needed. Juno starts hidden in the tray when you sign in (turn this off in Settings).
 A folder build that needs no Python is made with `packaging\build.cmd` (see `packaging\README.md`).
-
-**Coming from Alfred?** Juno was called Alfred until November 2026. Quit Alfred, then start Juno: it moves your
-settings, index, chats and models from `%LOCALAPPDATA%\Alfred` to `%LOCALAPPDATA%\Juno`, takes over saved API keys,
-replaces the Alfred shortcuts, and swaps the `alfred` MCP entry in your AI tools for `juno` (restart the AI tool after).
-If Alfred or one of its MCP servers is still running, the data stays where it is and moves at the next start.
 
 ## Use
 
