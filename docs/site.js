@@ -12,7 +12,7 @@
   if (toggle) toggle.addEventListener('click', function () {
     var next = effectiveTheme() === 'dark' ? 'light' : 'dark';
     root.dataset.theme = next;
-    try { localStorage.setItem('alfred-theme', next); } catch (e) {}
+    try { localStorage.setItem('juno-theme', next); } catch (e) {}
   });
 
   /* ---------- Nav gets more solid once the page scrolls ---------- */
@@ -101,14 +101,14 @@
 
   /* ---------- Download: point at the newest Windows zip on GitHub Releases ----------
      The links in the HTML already work without this. GitHub's "latest" release can be a non-app release (the model
-     files), so instead of /releases/latest this looks through recent releases for the newest Alfred-*-win64.zip. */
-  var REPO = 'ScriptSage1/Alfred';
-  var ASSET = /^Alfred-(\d+(?:\.\d+)*)-win64\.zip$/;
+     files), so instead of /releases/latest this looks through recent releases for the newest Juno-*-win64.zip. */
+  var REPO = 'ScriptSage1/Juno';
+  var ASSET = /^(?:Juno|Alfred)-(\d+(?:\.\d+)*)-win64\.zip$/;
   function applyRelease(info) {
     document.querySelectorAll('.js-download').forEach(function (a) { a.href = info.url; });
     document.querySelectorAll('.js-release-page').forEach(function (a) { a.href = info.page; });
     var mb = Math.round(info.size / 1e6);
-    var label = 'Alfred ' + info.version + (info.prerelease ? ' test build' : '') + ' · 64-bit zip, about ' + mb + ' MB';
+    var label = 'Juno ' + info.version + (info.prerelease ? ' test build' : '') + ' · 64-bit zip, about ' + mb + ' MB';
     document.querySelectorAll('.js-download-meta').forEach(function (p, i) {
       p.textContent = i === 0 ? label + ' · no install or admin rights' : label;
     });
@@ -125,7 +125,7 @@
     return null;
   }
   try {
-    var cached = sessionStorage.getItem('alfred-release');
+    var cached = sessionStorage.getItem('juno-release');
     if (cached) { applyRelease(JSON.parse(cached)); return; }
   } catch (e) {}
   if (!window.fetch) return;
@@ -135,7 +135,7 @@
       var info = pick(list);
       if (!info) return;
       applyRelease(info);
-      try { sessionStorage.setItem('alfred-release', JSON.stringify(info)); } catch (e) {}
+      try { sessionStorage.setItem('juno-release', JSON.stringify(info)); } catch (e) {}
     })
     .catch(function () { /* keep the links written in the HTML */ });
 })();

@@ -1,8 +1,8 @@
-"""The llama.cpp runtime (alfred.runtime, alfred.models) and the Embedder on top of it.
+"""The llama.cpp runtime (juno.runtime, juno.models) and the Embedder on top of it.
 
 Every test but the last runs against tests/fake_llama.py, a small stand-in for llama-server.exe: no model, no GPU.
-The last test is opt-in: set ALFRED_LLAMA_DIR to a llama.cpp build to run the real server with the real text model
-(Ollama's copy of it) on the CPU. Every ALFRED_HOME is a temporary folder.
+The last test is opt-in: set JUNO_LLAMA_DIR to a llama.cpp build to run the real server with the real text model
+(Ollama's copy of it) on the CPU. Every JUNO_HOME is a temporary folder.
 """
 import json
 import math
@@ -19,8 +19,8 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from alfred import ai, config, models, runtime  # noqa: E402
-from alfred.index import PICTURE_VERSION, Index  # noqa: E402
+from juno import ai, config, models, runtime  # noqa: E402
+from juno.index import PICTURE_VERSION, Index  # noqa: E402
 
 FAKE = [sys.executable, str(HERE / 'fake_llama.py')]
 GPU = 'Vulkan0: Fake GPU (8192 MiB, 8000 MiB free)'
@@ -45,7 +45,7 @@ class FakeBase(unittest.TestCase):
         self.dir = Path(os.path.realpath(self.tmp.name))
         self.home = self.dir / 'home'
         self.home.mkdir()
-        patches = [mock.patch.dict(os.environ, {'ALFRED_HOME': str(self.home)}), mock.patch.object(runtime, 'PROGRAM_OVERRIDE', FAKE),
+        patches = [mock.patch.dict(os.environ, {'JUNO_HOME': str(self.home)}), mock.patch.object(runtime, 'PROGRAM_OVERRIDE', FAKE),
                    mock.patch.object(models, 'find', lambda key, home=None: self.home / f'{key}.gguf')]
         os.environ.pop('FAKE_LLAMA_DEVICES', None)
         for patch in patches:
@@ -209,7 +209,7 @@ class LifeTests(FakeBase):
         self.assertEqual(len(self.starts()), 1)
 
     def child(self, seconds):
-        env = dict(os.environ, ALFRED_HOME=str(self.home), FAKE_LLAMA_LOAD_SECONDS='1')
+        env = dict(os.environ, JUNO_HOME=str(self.home), FAKE_LLAMA_LOAD_SECONDS='1')
         return subprocess.Popen([sys.executable, str(HERE / 'runtime_child.py'), str(seconds)], stdout=subprocess.PIPE, text=True, env=env,
                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
@@ -311,7 +311,7 @@ class GpuTests(FakeBase):
 class AnswerTests(FakeBase):
     def setUp(self):
         super().setUp()
-        from alfred import providers
+        from juno import providers
         self.settings.update(provider='local', model='gemma3:4b')
         self.local = providers.for_settings(self.settings)
 
@@ -348,7 +348,7 @@ class AnswerTests(FakeBase):
         self.assertEqual(len(self.starts()), 2)
 
     def test_passage_contexts_and_query_rewrites_use_the_answer_server(self):
-        from alfred import rag
+        from juno import rag
         self.settings['contextual_chunks'] = True
         writer = ai.Contextualizer.from_settings(self.settings)
         self.assertEqual(writer.situate('report.txt', 'A long document.', 'A passage.'), 'A fake answer.')
@@ -429,7 +429,7 @@ class MigrationTests(unittest.TestCase):
         settings = self.load({'provider': 'ollama', 'model': 'qwen3:8b', 'ollama_context': 16384, 'ollama_autostart': False,
                               'base_url': 'http://127.0.0.1:11434', 'context_model': 'gemma3:4b', 'keep_alive_minutes': 30})
         self.assertEqual((settings['provider'], settings['model'], settings['answer_context']), ('local', '', 16384))
-        self.assertFalse(__import__('alfred.providers', fromlist=['x']).for_settings(settings).configured)
+        self.assertFalse(__import__('juno.providers', fromlist=['x']).for_settings(settings).configured)
         self.assertEqual(settings['keep_alive_minutes'], 30)
         settings.save()
         stored = json.loads((settings.home / 'settings.json').read_text(encoding='utf-8'))
@@ -480,13 +480,13 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(len(file.sha256), 64)
 
 
-@unittest.skipUnless(os.environ.get('ALFRED_LLAMA_DIR'), 'set ALFRED_LLAMA_DIR to a llama.cpp build to run the real server')
+@unittest.skipUnless(os.environ.get('JUNO_LLAMA_DIR'), 'set JUNO_LLAMA_DIR to a llama.cpp build to run the real server')
 class RealServerTests(unittest.TestCase):
     """Opt-in: the real llama-server with the real text model (Ollama's copy), on the CPU, for a few seconds."""
 
     def test_real_text_embedding(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
-            with mock.patch.dict(os.environ, {'ALFRED_HOME': folder}):
+            with mock.patch.dict(os.environ, {'JUNO_HOME': folder}):
                 settings = config.load(folder)
                 embedder = ai.Embedder(settings)
                 if not embedder.available():
@@ -500,15 +500,15 @@ class RealServerTests(unittest.TestCase):
                     reset_runtime()
 
 
-@unittest.skipUnless(os.environ.get('ALFRED_LLAMA_DIR') and os.environ.get('ALFRED_REAL_ANSWER'),
-                     'set ALFRED_LLAMA_DIR and ALFRED_REAL_ANSWER=1 to start the real answer model (2.5 GB, on the GPU)')
+@unittest.skipUnless(os.environ.get('JUNO_LLAMA_DIR') and os.environ.get('JUNO_REAL_ANSWER'),
+                     'set JUNO_LLAMA_DIR and JUNO_REAL_ANSWER=1 to start the real answer model (2.5 GB, on the GPU)')
 class RealAnswerTests(unittest.TestCase):
     """Opt-in: the real answer server with gemma3:4b (Ollama's copy) answers one short question, then stops."""
 
     def test_real_answer(self):
-        from alfred import providers
+        from juno import providers
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
-            with mock.patch.dict(os.environ, {'ALFRED_HOME': folder}):
+            with mock.patch.dict(os.environ, {'JUNO_HOME': folder}):
                 settings = config.load(folder)
                 settings.update(provider='local', model='gemma3:4b')
                 local = providers.for_settings(settings)

@@ -1,4 +1,4 @@
-"""Adding Alfred's MCP server to AI tools (alfred/connect.py), without touching any real tool's settings."""
+"""Adding Juno's MCP server to AI tools (juno/connect.py), without touching any real tool's settings."""
 import json
 import os
 import tempfile
@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from alfred import connect
+from juno import connect
 
 REPO = str(Path(connect.__file__).resolve().parent.parent)
 CLEAN_ENV = {name: '' for name in connect.PASSED_ENV}
@@ -26,23 +26,23 @@ class ServerSpecTest(unittest.TestCase):
     def test_source_install_puts_its_folder_on_the_path(self):
         with mock.patch.dict(os.environ, CLEAN_ENV):
             spec = connect.server_spec()
-        self.assertEqual(spec['args'], ['-m', 'alfred', '--mcp'])
+        self.assertEqual(spec['args'], ['-m', 'juno', '--mcp'])
         self.assertEqual(spec['env'], {'PYTHONPATH': REPO})  # tools start it from their own folder
         self.assertTrue(Path(spec['command']).is_file())
         self.assertEqual(Path(spec['command']).name.lower(), 'pythonw.exe')  # no console window
         with mock.patch.dict(os.environ, CLEAN_ENV):
-            self.assertEqual(json.loads(connect.other_tool_json())['mcpServers']['alfred'], connect.server_spec())
+            self.assertEqual(json.loads(connect.other_tool_json())['mcpServers']['juno'], connect.server_spec())
 
-    def test_this_alfreds_data_and_model_folders_are_passed_on(self):
-        with mock.patch.dict(os.environ, dict(CLEAN_ENV, ALFRED_HOME=r'D:\AlfredData', ALFRED_MODELS_DIR=r'E:\models')):
+    def test_this_junos_data_and_model_folders_are_passed_on(self):
+        with mock.patch.dict(os.environ, dict(CLEAN_ENV, JUNO_HOME=r'D:\JunoData', JUNO_MODELS_DIR=r'E:\models')):
             env = connect.server_spec()['env']
-        self.assertEqual(env, {'ALFRED_HOME': r'D:\AlfredData', 'ALFRED_MODELS_DIR': r'E:\models', 'PYTHONPATH': REPO})
+        self.assertEqual(env, {'JUNO_HOME': r'D:\JunoData', 'JUNO_MODELS_DIR': r'E:\models', 'PYTHONPATH': REPO})
 
     def test_packaged_build_runs_itself(self):
         with mock.patch.object(connect.sys, 'frozen', True, create=True), \
-                mock.patch.object(connect.sys, 'executable', r'C:\Program Files\Alfred\Alfred.exe'), \
+                mock.patch.object(connect.sys, 'executable', r'C:\Program Files\Juno\Juno.exe'), \
                 mock.patch.dict(os.environ, CLEAN_ENV):
-            self.assertEqual(connect.server_spec(), {'command': r'C:\Program Files\Alfred\Alfred.exe', 'args': ['--mcp'], 'env': {}})
+            self.assertEqual(connect.server_spec(), {'command': r'C:\Program Files\Juno\Juno.exe', 'args': ['--mcp'], 'env': {}})
 
 
 class CheckServerTest(unittest.TestCase):
@@ -50,26 +50,26 @@ class CheckServerTest(unittest.TestCase):
 
     def setUp(self):
         self.home = tempfile.TemporaryDirectory()
-        self.env = mock.patch.dict(os.environ, dict(CLEAN_ENV, ALFRED_HOME=self.home.name))
+        self.env = mock.patch.dict(os.environ, dict(CLEAN_ENV, JUNO_HOME=self.home.name))
         self.env.start()
 
     def tearDown(self):
         self.env.stop()
         self.home.cleanup()
 
-    def test_the_entry_alfred_writes_starts(self):
+    def test_the_entry_juno_writes_starts(self):
         connect.check_server(connect.server_spec())
 
     def test_without_the_install_folder_it_fails_and_says_why(self):
         spec = connect.server_spec()
         spec['env'] = {k: v for k, v in spec['env'].items() if k != 'PYTHONPATH'}  # the old copied command
-        with self.assertRaisesRegex(connect.ConnectError, 'No module named alfred'):
+        with self.assertRaisesRegex(connect.ConnectError, 'No module named juno'):
             connect.check_server(spec)
 
     def test_a_server_that_never_answers_times_out_and_is_stopped(self):
         import subprocess
         import sys
-        marker = 'alfred-check-hang-' + str(os.getpid())
+        marker = 'juno-check-hang-' + str(os.getpid())
         entry = {'command': sys.executable, 'args': ['-c', f'import time  # {marker}\ntime.sleep(120)'], 'env': {}}
         with self.assertRaisesRegex(connect.ConnectError, 'did not answer'):
             connect.check_server(entry, timeout=3)
@@ -79,7 +79,7 @@ class CheckServerTest(unittest.TestCase):
                               capture_output=True, text=True).stdout.strip()
         self.assertEqual(left, '0')  # the launcher and the interpreter it started
 
-    def test_a_program_that_is_not_alfreds_server_is_rejected(self):
+    def test_a_program_that_is_not_junos_server_is_rejected(self):
         import sys
         with self.assertRaisesRegex(connect.ConnectError, 'did not start'):
             connect.check_server({'command': sys.executable, 'args': ['-c', 'print("hello")'], 'env': {}})
@@ -108,19 +108,19 @@ class JsonToolTest(unittest.TestCase):
         data = json.loads(self.path.read_text(encoding='utf-8'))
         self.assertEqual(data['theme'], 'dark')
         self.assertEqual(data['mcpServers']['other'], {'command': 'x'})
-        self.assertEqual(data['mcpServers']['alfred'], connect.server_spec())
-        self.checked.assert_called_once_with(data['mcpServers']['alfred'])  # what the tool will run is what gets checked
+        self.assertEqual(data['mcpServers']['juno'], connect.server_spec())
+        self.checked.assert_called_once_with(data['mcpServers']['juno'])  # what the tool will run is what gets checked
         self.assertEqual(tool.status()['state'], 'connected')
-        self.assertTrue((Path(self.dir.name) / 'mcp.json.before-alfred').is_file())  # the original, once
+        self.assertTrue((Path(self.dir.name) / 'mcp.json.before-juno').is_file())  # the original, once
         tool.disconnect()
         data = json.loads(self.path.read_text(encoding='utf-8'))
-        self.assertNotIn('alfred', data['mcpServers'])
+        self.assertNotIn('juno', data['mcpServers'])
         self.assertIn('other', data['mcpServers'])
 
     def test_creates_the_file_and_uses_the_tools_own_key(self):
         tool = FakeJsonTool(Path(self.dir.name) / 'new' / 'mcp.json', key='servers', extra={'type': 'stdio'})
         tool.connect()
-        entry = json.loads(tool.path().read_text(encoding='utf-8'))['servers']['alfred']
+        entry = json.loads(tool.path().read_text(encoding='utf-8'))['servers']['juno']
         self.assertEqual(entry['type'], 'stdio')
         self.assertEqual(tool.status()['state'], 'connected')
 
@@ -131,7 +131,7 @@ class JsonToolTest(unittest.TestCase):
         self.assertEqual(tool.status()['state'], 'connected')
 
     def test_an_old_entry_is_offered_as_an_update(self):
-        self.path.write_text(json.dumps({'mcpServers': {'alfred': {'command': 'old.exe', 'args': ['--mcp']}}}), encoding='utf-8')
+        self.path.write_text(json.dumps({'mcpServers': {'juno': {'command': 'old.exe', 'args': ['--mcp']}}}), encoding='utf-8')
         self.assertEqual(FakeJsonTool(self.path).status()['state'], 'outdated')
 
     def test_json_with_comments_is_left_alone(self):
@@ -173,7 +173,7 @@ class ToolLocationTest(unittest.TestCase):
             tool.connect()
         data = json.loads((moved / 'claude_desktop_config.json').read_text(encoding='utf-8'))
         self.assertEqual(data['preferences'], {'x': 1})
-        self.assertIn('alfred', data['mcpServers'])
+        self.assertIn('juno', data['mcpServers'])
         self.assertFalse((self.roaming / 'Claude' / 'claude_desktop_config.json').exists())
 
     def test_claude_desktop_fresh_data_folder_without_a_config_yet(self):
@@ -197,8 +197,8 @@ class ToolLocationTest(unittest.TestCase):
         claude_dir, codex_dir = self.root / 'cc', self.root / 'cx'
         claude_dir.mkdir()
         codex_dir.mkdir()
-        (claude_dir / '.claude.json').write_text(json.dumps({'mcpServers': {'alfred': {'command': 'a'}}}), encoding='utf-8')
-        (codex_dir / 'config.toml').write_text('[mcp_servers.alfred]\ncommand = "b"\nargs = []\n', encoding='utf-8')
+        (claude_dir / '.claude.json').write_text(json.dumps({'mcpServers': {'juno': {'command': 'a'}}}), encoding='utf-8')
+        (codex_dir / 'config.toml').write_text('[mcp_servers.juno]\ncommand = "b"\nargs = []\n', encoding='utf-8')
         with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(claude_dir), 'CODEX_HOME': str(codex_dir)}):
             self.assertEqual(connect.ClaudeCode().entry(), {'command': 'a'})
             self.assertEqual(connect.Codex().entry()['command'], 'b')
@@ -215,9 +215,9 @@ class CliToolTest(unittest.TestCase):
             tool.add()
         spec = connect.server_spec()
         env = [part for key, value in spec['env'].items() for part in ('-e', f'{key}={value}')]
-        self.assertEqual(calls[0][0], ['claude.exe', 'mcp', 'remove', 'alfred', '-s', 'user'])
-        self.assertEqual(calls[1], (['claude.exe', 'mcp', 'remove', 'alfred', '-s', 'local'], folder))
-        self.assertEqual(calls[2][0], ['claude.exe', 'mcp', 'add', 'alfred', '-s', 'user'] + env + ['--', spec['command'], '-m', 'alfred', '--mcp'])
+        self.assertEqual(calls[0][0], ['claude.exe', 'mcp', 'remove', 'juno', '-s', 'user'])
+        self.assertEqual(calls[1], (['claude.exe', 'mcp', 'remove', 'juno', '-s', 'local'], folder))
+        self.assertEqual(calls[2][0], ['claude.exe', 'mcp', 'add', 'juno', '-s', 'user'] + env + ['--', spec['command'], '-m', 'juno', '--mcp'])
 
     def test_codex_add(self):
         calls = []
@@ -227,7 +227,7 @@ class CliToolTest(unittest.TestCase):
             connect.Codex().add()
         spec = connect.server_spec()
         env = [part for key, value in spec['env'].items() for part in ('--env', f'{key}={value}')]
-        self.assertEqual(calls, [['codex.exe', 'mcp', 'add', 'alfred'] + env + ['--', spec['command'], '-m', 'alfred', '--mcp']])
+        self.assertEqual(calls, [['codex.exe', 'mcp', 'add', 'juno'] + env + ['--', spec['command'], '-m', 'juno', '--mcp']])
 
     def test_a_failed_add_is_reported(self):
         with mock.patch.object(connect.Codex, 'exe', return_value='codex.exe'), \

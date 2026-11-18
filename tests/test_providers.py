@@ -18,7 +18,7 @@ from keyring.backend import KeyringBackend
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alfred import ai, keys, providers  # noqa: E402
+from juno import ai, keys, providers  # noqa: E402
 
 
 class MemoryKeyring(KeyringBackend):
@@ -241,7 +241,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(text, 'Blue')
 
     def test_catalog_lists_every_provider_in_order(self):
-        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {'ALFRED_HOME': home}), \
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {'JUNO_HOME': home}), \
                 mock.patch.object(providers.runtime.models, 'find', lambda key, home=None: None):
             entries = providers.catalog({'provider': 'local'})
         self.assertEqual([e['kind'] for e in entries], providers.ORDER)

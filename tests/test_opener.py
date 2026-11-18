@@ -6,7 +6,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alfred import opener  # noqa: E402
+from juno import opener  # noqa: E402
 
 PDF = r'C:\Users\Me\Docs\Annual report #2.pdf'
 VIDEO = r'C:\Users\Me\Videos\Trip 2024.mp4'

@@ -1,4 +1,4 @@
-"""Live glass backdrop (alfred/glass.py): pure functions on plain arrays and numbers, and the Backdrop engine driven with
+"""Live glass backdrop (juno/glass.py): pure functions on plain arrays and numbers, and the Backdrop engine driven with
 a fake grabber, fake display affinity, fake clock, a schedule callable and a fake frame clock. No screen, no window
 handles, no hooks. Only the worker-thread regression test waits on real time (a few tenths of a second at most)."""
 import os
@@ -21,8 +21,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 _APP = QApplication.instance() or QApplication([])
 
-with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as _scratch, mock.patch.dict(os.environ, {'ALFRED_HOME': _scratch}):
-    from alfred import glass  # noqa: E402
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as _scratch, mock.patch.dict(os.environ, {'JUNO_HOME': _scratch}):
+    from juno import glass  # noqa: E402
 
 # A small window keeps every job fast: the panel sits 8 px inside a 136 x 200 window and is 120 px wide.
 M, PW, FULL = 8, 120, 120
@@ -601,7 +601,7 @@ class OpenAndCaptureTests(unittest.TestCase):
         self.assertEqual(r.aff.history, [(1, glass.WDA_EXCLUDE), (1, glass.WDA_NONE)])
         self.assertEqual(r.aff.get(1), glass.WDA_NONE)
 
-    def test_other_alfred_windows_are_excluded_too(self):
+    def test_other_juno_windows_are_excluded_too(self):
         r = opened(others=lambda: [1, 2, 0])
         run(r, 0.3)
         flags = [e for e in r.aff.history if e[1] == glass.WDA_EXCLUDE]
@@ -804,7 +804,7 @@ class StateMachineTests(unittest.TestCase):
         r = opened()
         settle(r)
         run(r, 1.5)                                     # baseline taken, compares are clean
-        # Alfred repaints the whole panel: logical block size is 4 * 16 / scale = 64
+        # Juno repaints the whole panel: logical block size is 4 * 16 / scale = 64
         r.eng.mark_dirty(0, 0, 136, 200)
         r.grab.value = lambda n: 250 if n % 2 else 120   # would read as a change
         before = r.eng.state
@@ -1009,7 +1009,7 @@ class WorkerThreadTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNotNone(eng.picture())
         self.assertEqual(eng.counters['arrivals'], 1)
-        self.assertIn('alfred-glass', [t.name for t in threading.enumerate()])
+        self.assertIn('juno-glass', [t.name for t in threading.enumerate()])
         deadline = time.perf_counter() + 5.0
         while eng.consumed and time.perf_counter() < deadline:
             _APP.processEvents()

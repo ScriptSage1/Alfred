@@ -21,11 +21,11 @@ from PySide6.QtCore import QEvent, QThreadPool, Qt  # noqa: E402
 from PySide6.QtGui import QKeyEvent  # noqa: E402
 from PySide6.QtWidgets import QAbstractButton, QApplication, QComboBox, QLabel, QLineEdit, QWidget  # noqa: E402
 
-from alfred import config, models, runtime  # noqa: E402
-from alfred.ui_kit import DRIVER  # noqa: E402
+from juno import config, models, runtime  # noqa: E402
+from juno.ui_kit import DRIVER  # noqa: E402
 
 _APP = QApplication.instance() or QApplication([])
-BANNED = re.compile(r'(?i:embeddings|inference|passages|nvidia-smi|llama\.cpp|ALFRED_MODELS_DIR|picture part)|\bGPU')
+BANNED = re.compile(r'(?i:embeddings|inference|passages|nvidia-smi|llama\.cpp|JUNO_MODELS_DIR|picture part)|\bGPU')
 
 
 def settle():
@@ -38,9 +38,9 @@ class SettingsBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.base = Path(os.path.realpath(self.tmp.name))
-        from alfred import ai, startup, ui
+        from juno import ai, startup, ui
         self.ui = ui
-        patches = [mock.patch.dict(os.environ, {'ALFRED_HOME': str(self.base / 'home'), 'USERPROFILE': str(self.base / 'user'),
+        patches = [mock.patch.dict(os.environ, {'JUNO_HOME': str(self.base / 'home'), 'USERPROFILE': str(self.base / 'user'),
                                                 'OLLAMA_MODELS': str(self.base / 'ollama')}),
                    mock.patch.object(runtime, 'program_dir', lambda home=None: None),
                    mock.patch.object(runtime, 'PROGRAM_OVERRIDE', None),
@@ -57,7 +57,7 @@ class SettingsBase(unittest.TestCase):
         home.mkdir()
         (home / 'settings.json').write_text(json.dumps({'start_with_windows_configured': True, 'setup_done': True, 'ocr_enabled': False}),
                                             encoding='utf-8')
-        self.win = ui.AlfredWindow()
+        self.win = ui.JunoWindow()
         self.view = self.win.settings_view
 
     def tearDown(self):
@@ -81,7 +81,7 @@ class SettingsBase(unittest.TestCase):
 
 class PageTests(SettingsBase):
     def test_six_pages_in_order(self):
-        self.assertEqual(self.ui.SETTINGS_PAGES, ('General', 'Folders', 'Search', 'Ask Alfred', 'AI tools', 'Advanced'))
+        self.assertEqual(self.ui.SETTINGS_PAGES, ('General', 'Folders', 'Search', 'Ask Juno', 'AI tools', 'Advanced'))
         self.assertEqual([self.view.stack.widget(i).name for i in range(self.view.stack.count())], list(self.ui.SETTINGS_PAGES))
         self.assertEqual(self.view.pages_list.names, list(self.ui.SETTINGS_PAGES))
 
@@ -103,9 +103,9 @@ class PageTests(SettingsBase):
         self.assertTrue(self.view.sections['API keys'].open)
         self.win.ask_view.picked({'action': 'settings'})  # the model picker's "Accounts and models…"
         settle()
-        self.assertEqual(self.view.current_page(), 'Ask Alfred')
+        self.assertEqual(self.view.current_page(), 'Ask Juno')
         self.win.open_settings()  # the tray: the last page
-        self.assertEqual(self.view.current_page(), 'Ask Alfred')
+        self.assertEqual(self.view.current_page(), 'Ask Juno')
         with self.assertRaises(ValueError):
             self.view.show_page('Nowhere')
 
@@ -123,7 +123,7 @@ class PageTests(SettingsBase):
         self.assertEqual(self.view.current_page(), 'Advanced')
         self.key(Qt.Key_Up, self.view.pages_list)
         self.assertEqual(self.view.current_page(), 'AI tools')
-        self.assertEqual(self.win.mode, self.ui.SETTINGS)  # Tab no longer switches to Ask Alfred in Settings
+        self.assertEqual(self.win.mode, self.ui.SETTINGS)  # Tab no longer switches to Ask Juno in Settings
         self.view.show_page('General')
         self.assertTrue(self.view.enter_page())
         with mock.patch.object(self.win, 'set_mode') as set_mode:
@@ -197,7 +197,7 @@ class RoundTripTests(SettingsBase):
         combo.setCurrentIndex(combo.findData(data) if index is None else index)
 
     def test_every_key_round_trips(self):
-        from alfred import rerank
+        from juno import rerank
         v = self.view
         other_model = [name for name in rerank.MODELS if name != rerank.DEFAULT][0]
         cases = [  # key, value loaded first, change made in the control, value saved

@@ -15,8 +15,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from alfred import ai, config, extract  # noqa: E402
-from alfred.index import Index, connect  # noqa: E402
+from juno import ai, config, extract  # noqa: E402
+from juno.index import Index, connect  # noqa: E402
 from test_layers import FakeOcr, PictureEmbedder, picture  # noqa: E402
 from test_pipeline import Base  # noqa: E402
 

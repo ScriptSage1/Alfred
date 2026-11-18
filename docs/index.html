@@ -3,15 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Alfred: fast file search for Windows</title>
+<title>Juno: fast file search for Windows</title>
 <meta name="description" content="Fast local file search for Windows. Find files by name, by the words inside them, or by meaning, including text in photos and video frames.">
 <meta name="color-scheme" content="dark light">
-<meta name="theme-color" content="#0a0a0c" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
-<meta property="og:title" content="Alfred: fast file search for Windows">
+<meta name="theme-color" content="#0e0a10" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#fbf6f2" media="(prefers-color-scheme: light)">
+<meta property="og:title" content="Juno: fast file search for Windows">
 <meta property="og:description" content="Find files by name, by the words inside them, or by meaning. Runs on your PC and works with Claude Code and other AI tools.">
-<meta property="og:image" content="https://scriptsage1.github.io/Alfred/media/compare.jpg">
-<meta property="og:url" content="https://scriptsage1.github.io/Alfred/">
+<meta property="og:image" content="https://scriptsage1.github.io/Juno/media/compare.jpg">
+<meta property="og:url" content="https://scriptsage1.github.io/Juno/">
 <meta property="og:type" content="website">
 <link rel="icon" type="image/png" href="media/favicon-48.png">
 <link rel="apple-touch-icon" href="media/logo-192.png">
@@ -19,16 +19,16 @@
 <script>
   document.documentElement.classList.remove("no-js");
   // Apply a saved theme before first paint, so the page never flashes the wrong one.
-  try { var t = localStorage.getItem('alfred-theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
+  try { var t = localStorage.getItem('juno-theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
 </script>
 </head>
 <body>
 
 <header class="nav-wrap">
   <nav class="nav glass" aria-label="Main">
-    <a class="brand" href="#top" aria-label="Alfred, back to top">
+    <a class="brand" href="#top" aria-label="Juno, back to top">
       <img src="media/logo-192.png" alt="" width="28" height="28">
-      <span>Alfred</span>
+      <span>Juno</span>
     </a>
     <div class="nav-links">
       <a href="#features">Search</a>
@@ -54,24 +54,24 @@
       <p class="lede">Find files by name, by the words inside them, or by meaning. Even text in photos and video frames.
         All on your PC.</p>
       <div class="cta-row">
-        <a class="btn btn-primary btn-lg js-download" href="https://github.com/ScriptSage1/Alfred/releases/download/v0.1.0-test2/Alfred-0.1.0-win64.zip">
+        <a class="btn btn-primary btn-lg js-download" href="https://github.com/ScriptSage1/Juno/releases/download/v0.1.0-test2/Alfred-0.1.0-win64.zip">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19.5h14"/></svg>
           Download for Windows
         </a>
         <a class="btn btn-glass btn-lg" href="#features">See it work</a>
       </div>
-      <p class="fine js-download-meta">Alfred 0.1.0 test build · 64-bit zip, about 544 MB · no install or admin rights</p>
+      <p class="fine js-download-meta">Juno 0.1.0 test build · 64-bit zip, about 544 MB · no install or admin rights</p>
     </div>
 
     <figure class="hero-video rise rise-2">
       <div class="frame glass">
         <video class="lazy-video" muted loop playsinline preload="none" poster="media/compare.jpg" width="1280" height="720"
-               aria-label="Same files, same words: Windows Search finds nothing for 'ring counter circuit'; Alfred finds the photo of the whiteboard">
+               aria-label="Same files, same words: Windows Search finds nothing for 'ring counter circuit'; Juno finds the photo of the whiteboard">
           <source data-src="media/compare.webm" type="video/webm">
           <source data-src="media/compare.mp4" type="video/mp4">
         </video>
       </div>
-      <figcaption>Same 1,081 files, same words. Windows Search checks names; Alfred also reads the photo.</figcaption>
+      <figcaption>Same 1,081 files, same words. Windows Search checks names; Juno also reads the photo.</figcaption>
     </figure>
   </section>
 
@@ -112,7 +112,7 @@
     <article class="feature reveal">
       <div class="feature-copy">
         <h3>Shows every version</h3>
-        <p>Two fee sheets, two prices. Alfred lists both with their dates, so you can see which is current.</p>
+        <p>Two fee sheets, two prices. Juno lists both with their dates, so you can see which is current.</p>
       </div>
       <div class="feature-media frame glass">
         <video class="lazy-video" muted loop playsinline preload="none" poster="media/versions.jpg" width="960" height="766"
@@ -134,12 +134,12 @@
     <figure class="wide-video reveal">
       <div class="frame glass">
         <video class="lazy-video" muted loop playsinline preload="none" poster="media/claude.jpg" width="1280" height="520"
-               aria-label="Claude Code asks Alfred which lecture covered the TCP three-way handshake and gets slide 5 of Lecture 7">
+               aria-label="Claude Code asks Juno which lecture covered the TCP three-way handshake and gets slide 5 of Lecture 7">
           <source data-src="media/claude.webm" type="video/webm">
           <source data-src="media/claude.mp4" type="video/mp4">
         </video>
       </div>
-      <figcaption>Claude Code (Sonnet 5.5) using Alfred's MCP server on test files.</figcaption>
+      <figcaption>Claude Code (Sonnet 5.5) using Juno's MCP server on test files.</figcaption>
     </figure>
 
     <div class="cards">
@@ -152,7 +152,7 @@
         <p>Asks before each tool's first search and logs every call.</p>
       </div>
       <div class="card glass reveal">
-        <h4>Ask Alfred</h4>
+        <h4>Ask Juno</h4>
         <p>Optional answers with sources, using your Claude or ChatGPT plan or an API key.</p>
       </div>
     </div>
@@ -161,14 +161,14 @@
   <!-- Benchmark -->
   <section id="benchmark" class="section">
     <header class="section-head reveal">
-      <h2>Claude gets more right with Alfred.</h2>
+      <h2>Claude gets more right with Juno.</h2>
     </header>
 
     <div class="bench glass reveal">
       <div class="bench-row">
         <p class="bench-label">Questions answered correctly</p>
         <div class="bar-line">
-          <span class="bar-name">With Alfred</span>
+          <span class="bar-name">With Juno</span>
           <span class="bar"><span class="fill accent" style="--w:97%"></span></span>
           <span class="bar-val">97%</span>
         </div>
@@ -181,7 +181,7 @@
       <div class="bench-row">
         <p class="bench-label">Tokens per question, on average</p>
         <div class="bar-line">
-          <span class="bar-name">With Alfred</span>
+          <span class="bar-name">With Juno</span>
           <span class="bar"><span class="fill accent" style="--w:34.5%"></span></span>
           <span class="bar-val">20k</span>
         </div>
@@ -200,34 +200,35 @@
   <section id="download" class="section">
     <div class="download glass reveal">
       <img class="download-logo" src="media/logo-192.png" alt="" width="64" height="64" loading="lazy">
-      <h2>Get Alfred</h2>
+      <h2>Get Juno</h2>
       <p class="sub">Free test build for Windows 10 and 11. Expect a few rough edges.</p>
-      <a class="btn btn-primary btn-lg js-download" href="https://github.com/ScriptSage1/Alfred/releases/download/v0.1.0-test2/Alfred-0.1.0-win64.zip">
+      <a class="btn btn-primary btn-lg js-download" href="https://github.com/ScriptSage1/Juno/releases/download/v0.1.0-test2/Alfred-0.1.0-win64.zip">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19.5h14"/></svg>
         Download for Windows
       </a>
-      <p class="fine js-download-meta">Alfred 0.1.0 test build · 64-bit zip, about 544 MB</p>
-      <p class="fine"><a class="js-release-page" href="https://github.com/ScriptSage1/Alfred/releases">Release notes and all versions</a></p>
+      <p class="fine js-download-meta">Juno 0.1.0 test build · 64-bit zip, about 544 MB</p>
+      <p class="fine"><a class="js-release-page" href="https://github.com/ScriptSage1/Juno/releases">Release notes and all versions</a></p>
 
       <ol class="steps">
-        <li><span class="n">1</span><div><b>Unzip the whole folder.</b> Keep <code>Alfred.exe</code> next to <code>_internal</code>.</div></li>
-        <li><span class="n">2</span><div><b>Run <code>Alfred.exe</code>.</b> If Windows warns you, click <b>More info</b>, then <b>Run anyway</b> (the build isn't signed yet).</div></li>
+        <li><span class="n">1</span><div><b>Unzip the whole folder.</b> Keep <code>Juno.exe</code> next to <code>_internal</code>.</div></li>
+        <li><span class="n">2</span><div><b>Run <code>Juno.exe</code>.</b> If Windows warns you, click <b>More info</b>, then <b>Run anyway</b> (the build isn't signed yet).</div></li>
         <li><span class="n">3</span><div><b>Pick your folders</b>, then press <kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>L</kbd>.</div></li>
       </ol>
       <p class="fine">Search by meaning works out of the box. Finding photos by what they show is an optional 1 GB download in Settings.</p>
+      <p class="fine">Juno was called Alfred until November 2026. The 0.1.0 test build was made before the rename, so the program in it is still <code>Alfred.exe</code>.</p>
     </div>
   </section>
 </main>
 
 <footer class="footer">
   <div class="footer-inner">
-    <a class="brand" href="#top"><img src="media/logo-192.png" alt="" width="22" height="22" loading="lazy"><span>Alfred</span></a>
+    <a class="brand" href="#top"><img src="media/logo-192.png" alt="" width="22" height="22" loading="lazy"><span>Juno</span></a>
     <nav aria-label="Footer">
-      <a href="https://github.com/ScriptSage1/Alfred">Source on GitHub</a>
-      <a href="https://github.com/ScriptSage1/Alfred/releases">Releases</a>
-      <a href="https://github.com/ScriptSage1/Alfred/blob/main/THIRD-PARTY-NOTICES.md">Third-party notices</a>
+      <a href="https://github.com/ScriptSage1/Juno">Source on GitHub</a>
+      <a href="https://github.com/ScriptSage1/Juno/releases">Releases</a>
+      <a href="https://github.com/ScriptSage1/Juno/blob/main/THIRD-PARTY-NOTICES.md">Third-party notices</a>
     </nav>
-    <p class="fine">Search by meaning uses EmbeddingGemma 2 by Google DeepMind (Apache 2.0). Alfred is not affiliated with Google, Anthropic or OpenAI.</p>
+    <p class="fine">Search by meaning uses EmbeddingGemma 2 by Google DeepMind (Apache 2.0). Juno is not affiliated with Google, Anthropic or OpenAI.</p>
   </div>
 </footer>
 

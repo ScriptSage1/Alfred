@@ -1,4 +1,4 @@
-# Alfred runtime (Python 3.11+).
+# Juno runtime (Python 3.11+).
 PySide6-Essentials>=6.10,<7   # the UI
 Pillow>=12,<13                # images
 numpy>=2,<3                   # vector search

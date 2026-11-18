@@ -7,7 +7,7 @@ __pycache__/
 build/
 dist/
 *.spec
-!packaging/alfred.spec
+!packaging/juno.spec
 
 # OS clutter
 Thumbs.db

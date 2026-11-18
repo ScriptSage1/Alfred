@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alfred.picker import SHADOW, place  # noqa: E402
+from juno.picker import SHADOW, place  # noqa: E402
 
 # This PC: a 150% laptop as the primary screen, and a 100% monitor to its left (negative coordinates).
 LAPTOP = (0, 0, 1706, 911)            # available geometry as (left, top, right, bottom)

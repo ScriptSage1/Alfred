@@ -14,8 +14,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 _APP = QApplication.instance() or QApplication([])
 
-with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as _scratch, mock.patch.dict(os.environ, {'ALFRED_HOME': _scratch}):
-    from alfred import ui  # noqa: E402
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as _scratch, mock.patch.dict(os.environ, {'JUNO_HOME': _scratch}):
+    from juno import ui  # noqa: E402
 
 COMPLETE = {'names': [10, 10], 'text': [10, 10], 'meaning': [20, 20], 'pictures': [3, 3]}
 
@@ -85,8 +85,8 @@ class FakeWindow:
     def start_index(self, **kwargs):
         self.started.append(kwargs)
 
-    sync_priority = ui.AlfredWindow.sync_priority
-    battery_tick = ui.AlfredWindow.battery_tick
+    sync_priority = ui.JunoWindow.sync_priority
+    battery_tick = ui.JunoWindow.battery_tick
 
 
 class PriorityTests(unittest.TestCase):
@@ -141,9 +141,9 @@ class ForegroundBackgroundTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         base = Path(os.path.realpath(self.tmp.name))
         (base / 'Tracked').mkdir()
-        self.patch = mock.patch.dict(os.environ, {'ALFRED_HOME': str(base / 'home')})
+        self.patch = mock.patch.dict(os.environ, {'JUNO_HOME': str(base / 'home')})
         self.patch.start()
-        self.win = ui.AlfredWindow()
+        self.win = ui.JunoWindow()
         self.win.settings['tracked_folders'] = [str(base / 'Tracked')]
 
     def tearDown(self):

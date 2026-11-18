@@ -1,6 +1,6 @@
 # Third-party notices
 
-`alfred/hotkey.py` is adapted from code published under the MIT License.
+`juno/hotkey.py` is adapted from code published under the MIT License.
 
 ```
 MIT License
@@ -29,7 +29,7 @@ SOFTWARE.
 
 ## llama.cpp
 
-Alfred runs search by meaning and the answer model on this PC with `llama-server.exe` from
+Juno runs search by meaning and the answer model on this PC with `llama-server.exe` from
 [llama.cpp](https://github.com/ggml-org/llama.cpp) (build b12318), which is published under the MIT License. The engine
 is not part of this repository; the release zip ships it in `runtime\llama\`, with the `LICENSE-LLVM-OpenMP` file that
 comes with the Windows build (for `libomp.dll`). The Windows build has no copy of llama.cpp's own licence, so it is
@@ -68,11 +68,11 @@ each model card before the files are offered for download.
 The release zip ships the EmbeddingGemma 2 text model (`models\embeddinggemma-2\embeddinggemma-2-text-q8_0.gguf`, an
 8-bit GGUF conversion of [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) by Google DeepMind) with
 its licence, `LICENSE-Apache-2.0.txt`, in the same folder. Use of the model must follow the
-[Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy). Alfred is not affiliated with Google.
+[Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy). Juno is not affiliated with Google.
 
 ## Provider logos
 
-`alfred/assets/logos/` holds the Claude, Anthropic and OpenAI marks as SVGs from
+`juno/assets/logos/` holds the Claude, Anthropic and OpenAI marks as SVGs from
 [Simple Icons](https://simpleicons.org) (simple-icons 13.21.0, CC0 1.0). The logos are trademarks of their
-respective owners and are used only to identify which provider answers in Alfred; no endorsement is implied.
-`pc.svg` (the "On this PC" mark) was drawn for Alfred.
+respective owners and are used only to identify which provider answers in Juno; no endorsement is implied.
+`pc.svg` (the "On this PC" mark) was drawn for Juno.

@@ -1,4 +1,4 @@
-"""Answer check tests (alfred/proof.py, M5): the unit splitter, the value extractor and lookup, every citation outcome,
+"""Answer check tests (juno/proof.py, M5): the unit splitter, the value extractor and lookup, every citation outcome,
 every verdict, the refusals and the time budget. Pure: no model, no index, no files."""
 import sys
 import time
@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alfred import proof  # noqa: E402
+from juno import proof  # noqa: E402
 
 
 def source(text, filename='notes.txt', label='lines 1–5', parts=None, kind='text'):

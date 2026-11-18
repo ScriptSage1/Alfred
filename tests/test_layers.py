@@ -16,8 +16,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from alfred import extract, ocr, power  # noqa: E402
-from alfred.index import Index, connect  # noqa: E402
+from juno import extract, ocr, power  # noqa: E402
+from juno.index import Index, connect  # noqa: E402
 from test_pipeline import Base, FakeEmbedder, make_docx, make_text_image  # noqa: E402
 
 
@@ -251,7 +251,7 @@ class PictureSearchTests(Base):
         self.settings['embed_enabled'] = True
         embedder = Angle(0.75)
         self.assertEqual(self.index.layer_status()['pictures'], [0, 0])  # no files yet
-        with mock.patch('alfred.ai.Embedder.signature', lambda self: 'angle'):
+        with mock.patch('juno.ai.Embedder.signature', lambda self: 'angle'):
             self.index.update(embedder=embedder)
             status = self.index.layer_status()
         self.assertEqual(status['names'], [1, 1])
@@ -293,7 +293,7 @@ class BackgroundTests(Base):
         self.assertEqual(ocr.thread_plan(18), (4, 4))
         self.assertEqual(ocr.thread_plan(4), (1, 4))
         self.assertEqual(ocr.thread_plan(2), (1, 2))
-        from alfred import runtime
+        from juno import runtime
         self.assertEqual(runtime.index_threads({'index_threads': 4}), 4)
 
 

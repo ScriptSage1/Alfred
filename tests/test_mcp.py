@@ -1,7 +1,7 @@
 """MCP server tests: protocol, the two tools, consent per client, the call log, and what the module may touch.
 
 Run from the repository folder:  .venv\\Scripts\\python -m unittest discover -s tests -v
-Keyword mode, a fake embedder or the fake llama-server only, and every ALFRED_HOME is a temporary folder.
+Keyword mode, a fake embedder or the fake llama-server only, and every JUNO_HOME is a temporary folder.
 """
 import io
 import json
@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from alfred import config, mcp_server  # noqa: E402
+from juno import config, mcp_server  # noqa: E402
 from test_pipeline import Base, FakeEmbedder  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -40,7 +40,7 @@ class McpBase(Base):
         super().setUp()
         # No test here may start a real llama-server: a run from the repository has an engine in runtime\llama.
         from unittest import mock
-        from alfred import runtime
+        from juno import runtime
         patch = mock.patch.object(runtime, 'program_dir', lambda home=None: None)
         patch.start()
         self.addCleanup(patch.stop)
@@ -185,17 +185,17 @@ class SearchTests(McpBase):
 
 
 class EngineCheckTests(McpBase):
-    """Search by meaning runs on Alfred's llama.cpp runtime: the app's search server, or this process's own. A missing
+    """Search by meaning runs on Juno's llama.cpp runtime: the app's search server, or this process's own. A missing
     model, or a server not ready within SEARCH_START_WAIT, gives keyword matches with a note; the start goes on."""
 
     def setUp(self):
         super().setUp()
         from unittest import mock
-        from alfred import models, runtime
+        from juno import models, runtime
         self.runtime = runtime
         self.settings.update(embed_enabled=True)
         fake = [sys.executable, str(Path(__file__).resolve().parent / 'fake_llama.py')]
-        for patch in (mock.patch.dict(os.environ, {'ALFRED_HOME': str(self.home), 'FAKE_LLAMA_LOAD_SECONDS': '3'}),
+        for patch in (mock.patch.dict(os.environ, {'JUNO_HOME': str(self.home), 'FAKE_LLAMA_LOAD_SECONDS': '3'}),
                       mock.patch.object(runtime, 'PROGRAM_OVERRIDE', fake),
                       mock.patch.object(models, 'find', lambda key, home=None: self.home / f'{key}.gguf'),
                       mock.patch.object(mcp_server, 'SEARCH_START_WAIT', 1.0)):
@@ -303,7 +303,7 @@ class ConsentAndLogTests(McpBase):
 
     def test_no_environment_switch_skips_consent(self):
         self.answer = False
-        for name in ('ALFRED_MCP_ALLOW', 'ALFRED_MCP_ALLOW_ALL', 'ALFRED_MCP_NO_CONSENT'):
+        for name in ('JUNO_MCP_ALLOW', 'JUNO_MCP_ALLOW_ALL', 'JUNO_MCP_NO_CONSENT'):
             os.environ[name] = '1'
             self.addCleanup(os.environ.pop, name, None)
         self.assertTrue(self.search()['isError'])
@@ -340,7 +340,7 @@ class ConsentAndLogTests(McpBase):
         server = mcp_server.Server(self.settings, ask=lambda name: True)
         result = server.handle(call('search_files', {'query': 'harbour'}))['result']
         self.assertTrue(result['isError'])
-        self.assertIn('Open Alfred once', result['content'][0]['text'])
+        self.assertIn('Open Juno once', result['content'][0]['text'])
         con = sqlite3.connect(self.settings.db_path)
         self.assertEqual(con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], '1')
         con.close()
@@ -372,29 +372,29 @@ class ModuleRulesTests(unittest.TestCase):
         script.write_text(
             'import sys, tempfile\n'
             f'sys.path.insert(0, {str(REPO)!r})\n'
-            'from alfred import config, mcp_server\n'
+            'from juno import config, mcp_server\n'
             'home = tempfile.mkdtemp()\n'
             'settings = config.load(home)\n'
             'folder = tempfile.mkdtemp()\n'
             'open(folder + "/a.txt", "w").write("harbour pilot")\n'
             'settings["tracked_folders"] = [folder]\n'
-            'from alfred.index import Index\n'
+            'from juno.index import Index\n'
             'Index(settings).update()\n'
             'server = mcp_server.Server(settings, ask=lambda n: True)\n'
             'server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "c"}}})\n'
             'r = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "search_files", "arguments": {"query": "harbour"}}})\n'
             'assert not r["result"]["isError"], r\n'
-            'bad = [m for m in sys.modules if m.split(".")[0] in ("PySide6", "shiboken6") or m in ("alfred.ui", "alfred.rerank", "alfred.rag", "alfred.providers")]\n'
+            'bad = [m for m in sys.modules if m.split(".")[0] in ("PySide6", "shiboken6") or m in ("juno.ui", "juno.rerank", "juno.rag", "juno.providers")]\n'
             'print("BAD", bad)\n', encoding='utf-8')
-        env = dict(os.environ, ALFRED_HOME=tempfile.mkdtemp())
+        env = dict(os.environ, JUNO_HOME=tempfile.mkdtemp())
         done = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=120)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn('BAD []', done.stdout)
 
     def test_source_has_no_delete_or_open_calls(self):
-        source = (REPO / 'alfred' / 'mcp_server.py').read_text(encoding='utf-8')
+        source = (REPO / 'juno' / 'mcp_server.py').read_text(encoding='utf-8')
         for word in ('unlink', 'rmtree', 'os.remove', 'startfile', 'subprocess', 'shutil', 'webbrowser', 'os.system', 'Popen',
-                     'PySide6', 'alfred.ui', 'import rerank', 'import rag', 'import providers', 'from .ui', 'from .rerank', 'from .rag',
+                     'PySide6', 'juno.ui', 'import rerank', 'import rag', 'import providers', 'from .ui', 'from .rerank', 'from .rag',
                      'from .providers'):
             self.assertNotIn(word, source, word)
         opened = re.findall(r'(?<![\w.])open\(([^)]*)\)', source)
@@ -424,7 +424,7 @@ class StdioTests(unittest.TestCase):
             settings['tracked_folders'] = [str(folder)]
             settings['embed_enabled'] = False  # keyword only: no model server is started or asked
             settings.save()
-            from alfred.index import Index
+            from juno.index import Index
             index = Index(settings)
             index.update()
             index.close()
@@ -433,8 +433,8 @@ class StdioTests(unittest.TestCase):
             messages = [request('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'stdio-test'}}, 1),
                         {'jsonrpc': '2.0', 'method': 'notifications/initialized'}, request('tools/list', ident=2),
                         call('search_files', {'query': 'harbour pilot'}, ident=3)]
-            env = dict(os.environ, ALFRED_HOME=str(home), PYTHONIOENCODING='cp1252')  # the server must not depend on this
-            done = subprocess.run([sys.executable, '-m', 'alfred', '--mcp'], input=('\n'.join(json.dumps(m, ensure_ascii=False) for m in messages) + '\n').encode('utf-8'),
+            env = dict(os.environ, JUNO_HOME=str(home), PYTHONIOENCODING='cp1252')  # the server must not depend on this
+            done = subprocess.run([sys.executable, '-m', 'juno', '--mcp'], input=('\n'.join(json.dumps(m, ensure_ascii=False) for m in messages) + '\n').encode('utf-8'),
                                   capture_output=True, cwd=REPO, env=env, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr.decode('utf-8', 'replace'))
             lines = done.stdout.decode('utf-8').splitlines()

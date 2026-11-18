@@ -1,4 +1,4 @@
-"""Evaluate Ask Alfred on a folder of sample files (by default C:\\Users\\<you>\\AlfredSamples).
+"""Evaluate Ask Juno on a folder of sample files (by default C:\\Users\\<you>\\JunoSamples).
 
     .venv\\Scripts\\python tests\\eval_rag.py --home <scratch folder> [--answers local:gemma3:4b,claude_code:sonnet]
                                             [--rerankers none,bge-reranker-v2-m3] [--models <folder with reranker models>]
@@ -25,8 +25,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alfred import ai, config, providers, rag, rerank  # noqa: E402
-from alfred.index import Index, connect  # noqa: E402
+from juno import ai, config, providers, rag, rerank  # noqa: E402
+from juno.index import Index, connect  # noqa: E402
 
 # (question, history, expected file name fragment or None for out of scope, facts the answer should contain (any of))
 QUESTIONS = [
@@ -254,14 +254,14 @@ def answers(index, settings, embedder, reranker, spec):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--home', required=True)
-    parser.add_argument('--samples', default=str(Path.home() / 'AlfredSamples'))
+    parser.add_argument('--samples', default=str(Path.home() / 'JunoSamples'))
     parser.add_argument('--rerankers', default='none,' + rerank.DEFAULT)
     parser.add_argument('--answers', default='')
     parser.add_argument('--answer-reranker', default=rerank.DEFAULT)
     parser.add_argument('--models', default='', help='folder holding downloaded reranker models (default: under --home)')
     parser.add_argument('--out', default='')
     args = parser.parse_args()
-    os.environ['ALFRED_HOME'] = args.home
+    os.environ['JUNO_HOME'] = args.home
     if args.models:
         rerank.folder = lambda name: Path(args.models) / name
     settings, index, embedder = prepare(args.home, args.samples)

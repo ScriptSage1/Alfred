@@ -13,8 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alfred import config, extract, paths  # noqa: E402
-from alfred.index import Index  # noqa: E402
+from juno import config, extract, paths  # noqa: E402
+from juno.index import Index  # noqa: E402
 
 W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
 A = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
@@ -288,7 +288,7 @@ class IndexTests(Base):
 class RemovedSettingsTests(unittest.TestCase):
     def test_settings_of_picture_descriptions_load_and_are_not_written_back(self):
         import json
-        from alfred import ai
+        from juno import ai
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             old = {'start_with_windows_configured': True, 'contextual_chunks': True, 'vision_enabled': True,

@@ -20,9 +20,9 @@ from PySide6.QtCore import QEvent, QThreadPool, Qt  # noqa: E402
 from PySide6.QtGui import QKeyEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from alfred import config, extract, models, runtime  # noqa: E402
-from alfred.index import Index, connect  # noqa: E402
-from alfred.ui_kit import DRIVER  # noqa: E402
+from juno import config, extract, models, runtime  # noqa: E402
+from juno.index import Index, connect  # noqa: E402
+from juno.ui_kit import DRIVER  # noqa: E402
 
 _APP = QApplication.instance() or QApplication([])
 
@@ -55,10 +55,10 @@ class SetupBase(unittest.TestCase):
             (folder / f'{name.lower()}-notes.txt').write_text(f'{name} walrus ledger', encoding='utf-8')
             self.places[name] = folder
         (self.places['Documents'] / 'second.txt').write_text('another file', encoding='utf-8')
-        from alfred import ai, startup, ui
+        from juno import ai, startup, ui
         self.ui, self.startup = ui, startup
         self.started, self.startup_calls = [], []
-        patches = [mock.patch.dict(os.environ, {'ALFRED_HOME': str(self.base / 'home'), 'USERPROFILE': str(self.base / 'user')}),
+        patches = [mock.patch.dict(os.environ, {'JUNO_HOME': str(self.base / 'home'), 'USERPROFILE': str(self.base / 'user')}),
                    mock.patch.object(runtime, 'program_dir', lambda home=None: None),
                    mock.patch.object(runtime, 'PROGRAM_OVERRIDE', None),
                    mock.patch.object(ai.Embedder, 'from_settings', staticmethod(lambda settings: None)),
@@ -73,9 +73,9 @@ class SetupBase(unittest.TestCase):
             self.addCleanup(patch.stop)
         home = self.base / 'home'
         home.mkdir()
-        # No OCR in these runs (text files only; keeps the tests fast). The key marks the file as this Alfred's.
+        # No OCR in these runs (text files only; keeps the tests fast). The key marks the file as this Juno's.
         (home / 'settings.json').write_text(json.dumps({'start_with_windows_configured': False, 'ocr_enabled': False}), encoding='utf-8')
-        self.win = ui.AlfredWindow()
+        self.win = ui.JunoWindow()
         self.view = self.win.setup_view
 
     def tearDown(self):
@@ -108,7 +108,7 @@ class SetupFlowTests(SetupBase):
         self.assertEqual(self.win.mode, self.ui.SETUP)
         self.assertTrue(self.win.search.isHidden())
         self.assertTrue(self.win.modes.isHidden())
-        self.assertEqual(self.win.setup_title.text(), 'What should Alfred search?')
+        self.assertEqual(self.win.setup_title.text(), 'What should Juno search?')
         self.assertEqual(self.rows(), [('Documents', True, True), ('Desktop', True, True), ('Downloads', False, True), ('Pictures', False, True)])
         self.assertEqual([count.text() for _, _, count in self.view.rows], ['2 files', '1 file', '1 file', '1 file'])
         self.assertEqual(self.view.chooser.count, 3)
@@ -163,7 +163,7 @@ class SetupFlowTests(SetupBase):
             hide.assert_called_once()
             self.win.maybe_hide()  # losing focus does not hide setup
             hide.assert_called_once()
-        self.assertEqual((self.win.mode, self.view.step), (self.ui.SETUP, 1))  # opening Alfred again resumes here
+        self.assertEqual((self.win.mode, self.view.step), (self.ui.SETUP, 1))  # opening Juno again resumes here
         self.view.back()
         self.assertEqual(self.view.step, 0)
         self.assertEqual(self.rows()[:2], [('Documents', True, False), ('Desktop', True, False)])

@@ -1,5 +1,5 @@
-"""The build self-test (python -m alfred --selftest): it passes from the source tree, stays inside its own temporary
-folder and leaves ALFRED_HOME alone. No window, no llama.cpp server (it only looks for the engine), no download.
+"""The build self-test (python -m juno --selftest): it passes from the source tree, stays inside its own temporary
+folder and leaves JUNO_HOME alone. No window, no llama.cpp server (it only looks for the engine), no download.
 
 Run from the repository folder:  .venv\\Scripts\\python -m unittest discover -s tests -v
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from alfred import selftest  # noqa: E402
+from juno import selftest  # noqa: E402
 
 
 class SelfTestTests(unittest.TestCase):
@@ -22,15 +22,15 @@ class SelfTestTests(unittest.TestCase):
         self.assertEqual(selftest._arguments(['--selftest-log', 'D:/r.log', '--selftest']), (None, 'D:/r.log'))
         folder, log = selftest._arguments(['--selftest'])
         self.assertIsNone(folder)
-        self.assertTrue(log.endswith('alfred-selftest.log'))
+        self.assertTrue(log.endswith('juno-selftest.log'))
 
     def test_selftest_passes_and_stays_in_its_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             home, work, log = tmp / 'home', tmp / 'work', tmp / 'selftest.log'
             home.mkdir()
-            env = dict(os.environ, ALFRED_HOME=str(home), QT_QPA_PLATFORM='offscreen')
-            out = subprocess.run([sys.executable, '-m', 'alfred', '--selftest', str(work), '--selftest-log', str(log)],
+            env = dict(os.environ, JUNO_HOME=str(home), QT_QPA_PLATFORM='offscreen')
+            out = subprocess.run([sys.executable, '-m', 'juno', '--selftest', str(work), '--selftest-log', str(log)],
                                  cwd=str(REPO), env=env, capture_output=True, text=True, encoding='utf-8', errors='replace',
                                  timeout=600, stdin=subprocess.DEVNULL)
             text = log.read_text(encoding='utf-8')

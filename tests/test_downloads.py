@@ -1,7 +1,7 @@
-"""Model and engine downloads (alfred.models) and their Settings rows (alfred.ui).
+"""Model and engine downloads (juno.models) and their Settings rows (juno.ui).
 
 No internet: a small HTTP server on 127.0.0.1 serves fake files, with Range support. No test starts a llama-server
-(runtime.program_dir is patched, PROGRAM_OVERRIDE is None), and every ALFRED_HOME is a temporary folder.
+(runtime.program_dir is patched, PROGRAM_OVERRIDE is None), and every JUNO_HOME is a temporary folder.
 """
 import hashlib
 import io
@@ -18,7 +18,7 @@ from unittest import mock
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alfred import models, runtime  # noqa: E402
+from juno import models, runtime  # noqa: E402
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -80,14 +80,14 @@ class Base(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.stopped = []
-        env = {'ALFRED_HOME': str(self.home), 'OLLAMA_MODELS': str(self.root / 'ollama'), 'USERPROFILE': str(self.root / 'user')}
-        self.install = self.root / 'install'  # the folder Alfred.exe runs from (a build ships the search model there)
+        env = {'JUNO_HOME': str(self.home), 'OLLAMA_MODELS': str(self.root / 'ollama'), 'USERPROFILE': str(self.root / 'user')}
+        self.install = self.root / 'install'  # the folder Juno.exe runs from (a build ships the search model there)
         patches = [mock.patch.dict(os.environ, env), mock.patch.object(runtime, 'program_dir', lambda home=None: None),
                    mock.patch.object(models, 'install_dir', lambda: self.install),
                    mock.patch.object(runtime, 'PROGRAM_OVERRIDE', None), mock.patch.object(models, 'BLOCK', 1024),
                    mock.patch.object(runtime, 'stop', lambda role, settings=None: self.stopped.append(role))]
-        os.environ.pop('ALFRED_MODELS_DIR', None)
-        os.environ.pop('ALFRED_LLAMA_DIR', None)
+        os.environ.pop('JUNO_MODELS_DIR', None)
+        os.environ.pop('JUNO_LLAMA_DIR', None)
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
@@ -113,7 +113,7 @@ class DownloadTests(Base):
         self.assertFalse(path.with_name(path.name + '.part').exists())
         self.assertEqual(seen[-1], (len(self.content), len(self.content)))
         self.assertEqual(models.find('embed-text', self.home), path)
-        self.assertEqual(models.state('embed-text', self.home)['where'], 'alfred')
+        self.assertEqual(models.state('embed-text', self.home)['where'], 'juno')
 
     def test_cancel_keeps_the_part_file_and_the_next_download_resumes(self):
         self.use()
@@ -179,7 +179,7 @@ class LookupAndRemoveTests(Base):
         folder = self.root / 'dev-models'
         folder.mkdir()
         (folder / file.name).write_bytes(self.content)
-        with mock.patch.dict(os.environ, {'ALFRED_MODELS_DIR': str(folder)}):
+        with mock.patch.dict(os.environ, {'JUNO_MODELS_DIR': str(folder)}):
             found = models.find('embed-text', self.home)
             self.assertEqual(found, folder / file.name)
             self.assertEqual(models.state('embed-text', self.home)['where'], 'external')
@@ -199,7 +199,7 @@ class LookupAndRemoveTests(Base):
         folder = self.root / 'dev-models'
         folder.mkdir()
         (folder / file.name).write_bytes(self.content)
-        with mock.patch.dict(os.environ, {'ALFRED_MODELS_DIR': str(folder)}):
+        with mock.patch.dict(os.environ, {'JUNO_MODELS_DIR': str(folder)}):
             self.assertEqual(models.find('embed-text', self.home), folder / file.name)
 
     def test_remove_leaves_an_external_copy_alone(self):
@@ -207,7 +207,7 @@ class LookupAndRemoveTests(Base):
         folder = self.root / 'dev-models'
         folder.mkdir()
         (folder / file.name).write_bytes(self.content)
-        with mock.patch.dict(os.environ, {'ALFRED_MODELS_DIR': str(folder)}):
+        with mock.patch.dict(os.environ, {'JUNO_MODELS_DIR': str(folder)}):
             self.assertFalse(models.remove('embed-text', self.home))
             self.assertTrue((folder / file.name).exists())
             models.download('embed-text', self.home)
@@ -243,7 +243,7 @@ class EngineTests(Base):
         self.assertFalse((self.home / 'runtime' / models.BUILD['zip']).exists())
         self.assertEqual([p.name for p in (self.home / 'runtime').iterdir()], [models.BUILD['name']])  # no temporary folder left
         with mock.patch.object(runtime, 'program_dir', lambda home=None: folder):
-            self.assertEqual(models.state(models.ENGINE, self.home)['where'], 'alfred')
+            self.assertEqual(models.state(models.ENGINE, self.home)['where'], 'juno')
             self.assertTrue(models.remove_engine(self.home))
         self.assertFalse(folder.exists())
 
@@ -282,7 +282,7 @@ class EngineTests(Base):
 
 
 class IncludedModelTests(Base):
-    """A build ships the search model next to Alfred.exe (packaging/bundle_models.py), so nothing needs downloading."""
+    """A build ships the search model next to Juno.exe (packaging/bundle_models.py), so nothing needs downloading."""
 
     def ship(self, content=None):
         path = models.included_path('embed-text')
@@ -290,7 +290,7 @@ class IncludedModelTests(Base):
         path.write_bytes(self.content if content is None else content)
         return path
 
-    def test_the_copy_that_came_with_alfred_is_used(self):
+    def test_the_copy_that_came_with_juno_is_used(self):
         self.use()
         shipped = self.ship()
         self.assertEqual(shipped, self.install / 'models' / 'fake-model' / 'embed-text.gguf')
@@ -305,7 +305,7 @@ class IncludedModelTests(Base):
         self.assertIsNone(models.find('embed-text', self.home))
         self.assertIn('embed-text', models.first_run_needs(self.home))
 
-    def test_alfreds_own_copy_comes_first_and_removing_it_keeps_the_shipped_one(self):
+    def test_junos_own_copy_comes_first_and_removing_it_keeps_the_shipped_one(self):
         self.use()
         shipped = self.ship()
         own = models.download('embed-text', self.home)
@@ -325,17 +325,17 @@ class FirstRunTests(unittest.TestCase):
         self.app = QApplication.instance() or QApplication([])
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         base = Path(os.path.realpath(self.tmp.name))
-        self.patches = [mock.patch.dict(os.environ, {'ALFRED_HOME': str(base / 'home'), 'OLLAMA_MODELS': str(base / 'ollama'),
+        self.patches = [mock.patch.dict(os.environ, {'JUNO_HOME': str(base / 'home'), 'OLLAMA_MODELS': str(base / 'ollama'),
                                                      'USERPROFILE': str(base / 'user')}),
                         mock.patch.object(runtime, 'program_dir', lambda home=None: None),
                         mock.patch.object(runtime, 'PROGRAM_OVERRIDE', None)]
         for patch in self.patches:
             patch.start()
-        from alfred import ai, ui
+        from juno import ai, ui
         self.ui = ui
         self.patches.append(mock.patch.object(ai.Embedder, 'from_settings', staticmethod(lambda settings: None)))
         self.patches[-1].start()
-        self.win = ui.AlfredWindow()
+        self.win = ui.JunoWindow()
         self.started = []
         self.patches.append(mock.patch.object(ui.ModelDownloads, 'start', lambda downloads, key: self.started.append(key)))
         self.patches[-1].start()

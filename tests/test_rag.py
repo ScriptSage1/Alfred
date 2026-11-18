@@ -12,8 +12,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from alfred import extract, rag, render  # noqa: E402
-from alfred.providers import Provider  # noqa: E402
+from juno import extract, rag, render  # noqa: E402
+from juno.providers import Provider  # noqa: E402
 from test_pipeline import Base, FakeEmbedder, make_docx, make_pptx, make_xlsx  # noqa: E402
 
 COLORS = {'accent': '#0a84ff', 'chip': 'rgba(10,132,255,0.16)', 'fill': '#333', 'tag': '#333', 'secondary': '#999'}
@@ -169,7 +169,7 @@ class HeaderTests(Base):
         make_xlsx(self.folder / 'budget.xlsx', {'Costs': [['Item', 'Amount'], ['Laptop', 1200]]})
         embedder = FakeEmbedder()
         self.index.update(embedder=embedder)
-        from alfred.index import connect
+        from juno.index import connect
         con = connect(self.index.db_path)
         with con:  # pretend the index was built before headers existed
             con.execute("UPDATE meta SET value='old' WHERE key='search_signature'")
@@ -284,7 +284,7 @@ class PromptTests(unittest.TestCase):
 
     def test_small_talk_and_follow_ups(self):
         self.assertTrue(rag.is_small_talk('Thanks!'))
-        self.assertTrue(rag.is_small_talk('hello alfred'))
+        self.assertTrue(rag.is_small_talk('hello juno'))
         self.assertFalse(rag.is_small_talk('thanks, what was the budget?'))
         history = [{'role': 'user', 'content': 'How much were groceries?'}, {'role': 'assistant', 'content': '5400 [1].'}]
         self.assertTrue(rag.needs_rewrite('and electricity?', history))
@@ -334,7 +334,7 @@ class CitationTests(unittest.TestCase):
 
     def test_check_moves_misnumbered_and_drops_unsupported(self):
         """The cases the old verify_citations covered, now through proof.check (renumbered by first appearance)."""
-        from alfred import proof
+        from juno import proof
         sources = {1: {'text': 'Travel plan: flight departs Friday from Hyderabad.', 'filename': 'trip.txt'},
                    2: {'text': 'SwiftCart uses a layered three-tier design with a presentation layer.', 'filename': 'design.md'}}
         moved = proof.check('SwiftCart uses a layered three-tier design [1].', sources)

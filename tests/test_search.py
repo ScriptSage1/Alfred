@@ -15,8 +15,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from alfred import index as index_module  # noqa: E402
-from alfred.index import connect  # noqa: E402
+from juno import index as index_module  # noqa: E402
+from juno.index import connect  # noqa: E402
 from test_pipeline import Base, FakeEmbedder  # noqa: E402
 
 
@@ -221,7 +221,7 @@ class RelevanceFloorTests(Base):
         # Meaning: the model's calibrated floor.
         self.assertTrue(confident('vehicle upkeep', 'notes on the automobile', 0.80, Similar(0.8, 0.7)))
         self.assertFalse(confident('vehicle upkeep', 'notes on the automobile', 0.65, Similar(0.65, 0.7)))
-        from alfred import ai
+        from juno import ai
         gemma = ai.Embedder({'embed_model': 'embeddinggemma-2'})
         self.assertGreater(index_module.semantic_floor(gemma), gemma.min_similarity)
 

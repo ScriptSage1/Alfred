@@ -1,12 +1,12 @@
 """bundle_models.py DIST_FOLDER CACHE_FOLDER: put what search by meaning needs into a build, so it works without a download.
 
-Into DIST_FOLDER (the folder holding Alfred.exe) it puts
+Into DIST_FOLDER (the folder holding Juno.exe) it puts
   runtime\\llama\\                         the pinned llama.cpp build (llama-server.exe, its DLLs and licence files)
   models\\<folder>\\<name>                  each file in models.FIRST_RUN (the EmbeddingGemma 2 text model)
   models\\<folder>\\LICENSE-Apache-2.0.txt  the model's licence, which must travel with it
 Both are found there at run time (runtime.program_dir, models.find). Files are downloaded once into CACHE_FOLDER and
 checked by their pinned SHA-256 (models.BUILD, models.FILES) every time, so a changed or partial file never ships.
-The picture projector (about 1 GB) is not bundled: Alfred still offers it as a download in Settings.
+The picture projector (about 1 GB) is not bundled: Juno still offers it as a download in Settings.
 """
 import hashlib
 import shutil
@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alfred import models  # noqa: E402
+from juno import models  # noqa: E402
 
 # The model licence is an asset of the same release as the model file.
 LICENCE = ('LICENSE-Apache-2.0.txt', models.RELEASE + 'LICENSE-Apache-2.0.txt',
@@ -58,7 +58,7 @@ def licence_file(cache):
     name, url, digest = LICENCE
     target = Path(cache) / name
     if not target.is_file():
-        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Alfred'}), timeout=60) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Juno'}), timeout=60) as response:
             target.write_bytes(response.read())
     if sha256(target) != digest:
         target.unlink()
@@ -69,8 +69,8 @@ def licence_file(cache):
 def main(dist, cache):
     dist, cache = Path(dist).resolve(), Path(cache).resolve()
     cache.mkdir(parents=True, exist_ok=True)
-    if not (dist / 'Alfred.exe').is_file():
-        raise SystemExit(f'{dist} has no Alfred.exe')
+    if not (dist / 'Juno.exe').is_file():
+        raise SystemExit(f'{dist} has no Juno.exe')
 
     build = models.BUILD
     archive = cached(build['label'], build['urls'], build['size'], build['sha256'], cache / build['zip'])

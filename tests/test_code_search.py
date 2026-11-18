@@ -2,7 +2,7 @@
 in the MCP server.
 
 Run from the repository folder:  .venv\\Scripts\\python -m unittest discover -s tests -v
-No model: meaning search uses a fake embedder. Every ALFRED_HOME is a temporary folder.
+No model: meaning search uses a fake embedder. Every JUNO_HOME is a temporary folder.
 """
 import json
 import os
@@ -19,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np  # noqa: E402
 
-from alfred import code_search as cs, config, mcp_server  # noqa: E402
-from alfred.index import Index  # noqa: E402
+from juno import code_search as cs, config, mcp_server  # noqa: E402
+from juno.index import Index  # noqa: E402
 from test_mcp import McpBase, call  # noqa: E402
 
 SAMPLE = textwrap.dedent('''\

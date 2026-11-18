@@ -2,13 +2,13 @@
 
     python fake_llama.py <llama-server arguments>
 
-Speaks what Alfred uses: GET /health, GET /props, POST /v1/embeddings, POST /embeddings (pictures, with the media
+Speaks what Juno uses: GET /health, GET /props, POST /v1/embeddings, POST /embeddings (pictures, with the media
 marker), and POST /v1/chat/completions ("A fake answer.", streamed in three pieces when asked). Like the real server it wants the key from LLAMA_API_KEY,
 refuses an input longer than a slot reads with HTTP 500 "input (N tokens) is too large to process" (one character
 counts as one token here), and answers a picture request with a wrong marker with HTTP 400.
 
 Test hooks: --list-devices prints FAKE_LLAMA_DEVICES (lines separated by ';'); every start is appended, with its
-arguments, to ALFRED_HOME\\fake_starts.jsonl; POST /_test/marker gives the server a new marker; a server started with
+arguments, to JUNO_HOME\\fake_starts.jsonl; POST /_test/marker gives the server a new marker; a server started with
 --device FAKE_LLAMA_FAIL_DEVICE exits at once.
 """
 import hashlib
@@ -46,14 +46,14 @@ PICTURES = '--mmproj' in ARGS
 STATE = {'marker': f'<__media_{secrets.token_hex(4)}__>'}
 print(f'fake llama-server pid {os.getpid()}: {json.dumps(ARGS)}', flush=True)
 print(f'srv    load_model: initializing, n_slots = {SLOTS}, n_ctx_slot = {SLOT}', flush=True)
-home = os.environ.get('ALFRED_HOME')
+home = os.environ.get('JUNO_HOME')
 if home:
     with open(os.path.join(home, 'fake_starts.jsonl'), 'a', encoding='utf-8') as starts:
         starts.write(json.dumps({'pid': os.getpid(), 'args': ARGS}) + '\n')
 
 
 def vector(seed, scale=3.0):
-    """A deterministic vector, not of unit length (Alfred must scale it)."""
+    """A deterministic vector, not of unit length (Juno must scale it)."""
     numbers = []
     block = seed.encode('utf-8', 'replace')
     while len(numbers) < DIM:

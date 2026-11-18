@@ -23,15 +23,15 @@ class SearchViewTests(unittest.TestCase):
         base = Path(os.path.realpath(self.tmp.name))
         self.folder = base / 'Tracked'
         self.folder.mkdir()
-        self.patches = [mock.patch.dict(os.environ, {'ALFRED_HOME': str(base / 'home')})]
+        self.patches = [mock.patch.dict(os.environ, {'JUNO_HOME': str(base / 'home')})]
         for patch in self.patches:
             patch.start()
-        from alfred import ai, ui
+        from juno import ai, ui
         self.patches.append(mock.patch.object(ai.Embedder, 'from_settings', staticmethod(lambda settings: None)))
         self.patches[-1].start()
         (self.folder / 'harbour.txt').write_text('harbour pilot schedule for the northern quay', encoding='utf-8')
         (self.folder / 'partial.txt').write_text('the pilot arrived late', encoding='utf-8')
-        self.win = ui.AlfredWindow()
+        self.win = ui.JunoWindow()
         self.win.settings['tracked_folders'] = [str(self.folder)]
         self.win.index.update()
         self.view = self.win.search_view
@@ -58,7 +58,7 @@ class SearchViewTests(unittest.TestCase):
                [value.get('title') for kind, value in self.view.list.items if kind == 'row']
 
     def test_settings_lists_ai_tools_and_their_calls(self):
-        from alfred import mcp_server, ui
+        from juno import mcp_server, ui
         home, view = self.win.settings.home, self.win.settings_view
         mcp_server.set_allowed(home, 'some-tool', True)
         mcp_server.log_call(home, {'time': '2026-01-01 10:00:00', 'client': 'some-tool', 'tool': 'search_files', 'query': 'tides',
@@ -66,7 +66,7 @@ class SearchViewTests(unittest.TestCase):
         view.show_other_tools()
         holder = view.mcp_clients.parentWidget()
         command = view.mcp_command.text()
-        self.assertIn('-m alfred --mcp', command)
+        self.assertIn('-m juno --mcp', command)
         repo = os.path.dirname(os.path.dirname(os.path.abspath(ui.__file__)))
         self.assertIn(f'PYTHONPATH={repo}', command)  # AI tools start it outside the repo
         for tool in ui.connect.TOOLS:  # one row per AI tool, shown only when it is installed
@@ -78,7 +78,7 @@ class SearchViewTests(unittest.TestCase):
         self.assertEqual(mcp_server.list_clients(home), [])
 
     def test_connect_button_connects_and_removes_a_tool(self):
-        from alfred import connect
+        from juno import connect
         view = self.win.settings_view
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / '.cursor' / 'mcp.json'
@@ -92,13 +92,13 @@ class SearchViewTests(unittest.TestCase):
                 QThreadPool.globalInstance().waitForDone(10000)
                 QApplication.processEvents()
                 self.assertEqual((row.action.text(), row.caption.text()), ('Remove', 'Connected'))
-                self.assertIn('alfred', json.loads(path.read_text(encoding='utf-8'))['mcpServers'])
+                self.assertIn('juno', json.loads(path.read_text(encoding='utf-8'))['mcpServers'])
                 check.assert_called_once()
                 row.action.click()
                 QThreadPool.globalInstance().waitForDone(10000)
                 QApplication.processEvents()
                 self.assertEqual(row.action.text(), 'Connect')
-                self.assertNotIn('alfred', json.loads(path.read_text(encoding='utf-8'))['mcpServers'])
+                self.assertNotIn('juno', json.loads(path.read_text(encoding='utf-8'))['mcpServers'])
 
     def test_window_builds_and_search_lists_results(self):
         self.search('harbour pilot')
@@ -124,7 +124,7 @@ class SearchViewTests(unittest.TestCase):
             self.assertEqual(walk.call_count, 1)
 
     def test_filters_narrow_a_search_and_clear(self):
-        from alfred import ui
+        from juno import ui
         (self.folder / 'deck.md').write_text('harbour pilot notes in markdown', encoding='utf-8')
         os.utime(self.folder / 'harbour.txt', (time.time() - 400 * 86400,) * 2)
         self.win.index.update()

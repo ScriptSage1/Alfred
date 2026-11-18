@@ -1,4 +1,4 @@
-"""End-to-end check of Alfred's AI-tool connect, on a fresh, isolated profile (no real tool settings touched).
+"""End-to-end check of Juno's AI-tool connect, on a fresh, isolated profile (no real tool settings touched).
 
 Real Claude Code and Codex CLIs, pointed at empty config folders (CLAUDE_CONFIG_DIR, CODEX_HOME); JSON-config tools in
 a fake user profile (USERPROFILE, APPDATA, LOCALAPPDATA). Each connect also starts the server as the tool would.
@@ -14,18 +14,18 @@ from pathlib import Path
 
 repo = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, repo)
-root = Path(tempfile.mkdtemp(prefix='alfred e2e é '))  # a space and a non-ASCII letter, like many user names
+root = Path(tempfile.mkdtemp(prefix='juno e2e é '))  # a space and a non-ASCII letter, like many user names
 profile, roaming, local = root / 'User', root / 'User' / 'AppData' / 'Roaming', root / 'User' / 'AppData' / 'Local'
 for folder in (roaming, local):
     folder.mkdir(parents=True)
 # find the real CLIs before the profile is swapped (they are found under the real user folders)
-from alfred import providers  # noqa: E402
+from juno import providers  # noqa: E402
 claude, codex = providers.find_claude(), providers.find_codex()
 os.environ.update(USERPROFILE=str(profile), HOME=str(profile), APPDATA=str(roaming), LOCALAPPDATA=str(local),
-                  CLAUDE_CONFIG_DIR=str(root / 'claude-config'), CODEX_HOME=str(root / 'codex-home'), ALFRED_HOME=str(root / 'alfred-home'))
+                  CLAUDE_CONFIG_DIR=str(root / 'claude-config'), CODEX_HOME=str(root / 'codex-home'), JUNO_HOME=str(root / 'juno-home'))
 (root / 'claude-config').mkdir()
 (root / 'codex-home').mkdir()
-from alfred import connect  # noqa: E402
+from juno import connect  # noqa: E402
 connect.ClaudeCode.exe = lambda self: claude
 connect.Codex.exe = lambda self: codex
 
@@ -38,7 +38,7 @@ def report(name, ok, detail=''):
 
 
 spec = connect.server_spec()
-report('entry passes this Alfred\'s data folder', spec['env'].get('ALFRED_HOME') == str(root / 'alfred-home'), json.dumps(spec['env']))
+report('entry passes this Juno\'s data folder', spec['env'].get('JUNO_HOME') == str(root / 'juno-home'), json.dumps(spec['env']))
 
 # ---- fresh profile: the JSON tools' folders as their installers leave them
 (profile / '.cursor').mkdir()
@@ -69,23 +69,23 @@ for tool in connect.found_tools():
 env = dict(os.environ)
 out = subprocess.run([claude, 'mcp', 'list'], capture_output=True, text=True, encoding='utf-8', errors='replace', env=env,
                      cwd=str(root), timeout=120).stdout
-line = next((l for l in out.splitlines() if l.startswith('alfred')), '')
+line = next((l for l in out.splitlines() if l.startswith('juno')), '')
 report('claude mcp list (from another folder): Connected', 'Connected' in line and 'Failed' not in line, line.strip())
 out = subprocess.run([codex, 'mcp', 'list'], capture_output=True, text=True, encoding='utf-8', errors='replace', env=env, timeout=120).stdout
-report('codex mcp list shows alfred', 'alfred' in out, ' '.join(out.split())[:160])
+report('codex mcp list shows juno', 'juno' in out, ' '.join(out.split())[:160])
 desktop = json.loads((moved / 'claude_desktop_config.json').read_text(encoding='utf-8'))
-report('Claude Desktop: preferences kept, entry added', desktop.get('preferences') == {'keep': True} and 'alfred' in desktop.get('mcpServers', {}))
+report('Claude Desktop: preferences kept, entry added', desktop.get('preferences') == {'keep': True} and 'juno' in desktop.get('mcpServers', {}))
 report('Claude Desktop: nothing written to the folder it left', not (roaming / 'Claude' / 'claude_desktop_config.json').exists())
 vscode = json.loads((roaming / 'Code' / 'User' / 'mcp.json').read_text(encoding='utf-8'))
-report('VS Code: servers.alfred with type stdio', vscode['servers']['alfred'].get('type') == 'stdio')
+report('VS Code: servers.juno with type stdio', vscode['servers']['juno'].get('type') == 'stdio')
 report('VS Code: settings.json untouched', (roaming / 'Code' / 'User' / 'settings.json').read_text(encoding='utf-8') == '{"editor.fontSize": 14}')
 gemini = json.loads((profile / '.gemini' / 'settings.json').read_text(encoding='utf-8'))
-report('Gemini CLI: theme kept, entry added', gemini.get('theme') == 'Default' and 'alfred' in gemini['mcpServers'])
+report('Gemini CLI: theme kept, entry added', gemini.get('theme') == 'Default' and 'juno' in gemini['mcpServers'])
 
-# ---- update after Alfred moves (an old entry), JSON with comments, remove
+# ---- update after Juno moves (an old entry), JSON with comments, remove
 cursor = profile / '.cursor' / 'mcp.json'
 data = json.loads(cursor.read_text(encoding='utf-8'))
-data['mcpServers']['alfred']['command'] = r'C:\old\Alfred\.venv\Scripts\pythonw.exe'
+data['mcpServers']['juno']['command'] = r'C:\old\Juno\.venv\Scripts\pythonw.exe'
 cursor.write_text(json.dumps(data), encoding='utf-8')
 report('Cursor: an old entry shows as Update', connect.tool('cursor').status()['state'] == 'outdated')
 connect.tool('cursor').connect()
